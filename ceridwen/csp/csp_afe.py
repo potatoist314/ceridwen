@@ -226,7 +226,10 @@ class CSPBasis_afe:
         a precontracted ``(5, 13, 8, n_wave)`` basis. ``"B"`` contracts a
         flattened ``(5 * 13 * 8, n_wave)`` basis. Both variants require the
         published 5-by-13-by-107 SSP grid, eight static SFH nodes, constant
-        metallicity, step interpolation, and no age-dependent dust.
+        metallicity, step interpolation, and no age-dependent dust. If those
+        requirements are not met, selection warns and safely keeps the
+        reference implementation. A per-call lookback grid also uses the
+        reference implementation because its age weights are not static.
     """
 
     def __init__(
@@ -528,8 +531,9 @@ class CSPBasis_afe:
 
         ``None`` preserves the baseline. Variant ``"A"`` interpolates four
         alpha/metallicity corners. Variant ``"B"`` contracts one flattened
-        basis. The selection is Python-static and must happen before JIT
-        tracing.
+        basis. Unsupported model configurations warn and keep the reference
+        implementation. The selection is Python-static and must happen before
+        JIT tracing.
         """
         if selector not in (None, "A", "B"):
             raise ValueError(
@@ -537,36 +541,42 @@ class CSPBasis_afe:
                 f"got {selector!r}."
             )
 
-        self.sfh_basis_fastpath = selector
+        self.sfh_basis_fastpath = None
         self._sfh_basis = None
         self._sfh_basis_flat = None
         self._sfh_node_to_age = None
         if selector is None:
             return self
 
+        fallback_reason = None
         if (self._n_afe, self._n_z, self._n_age) != (5, 13, 107):
-            raise ValueError(
-                "The SFH-basis fast path requires the fixed SSP grid shape "
-                "(5, 13, 107, n_wave)."
+            fallback_reason = (
+                "the SSP grid shape is not (5, 13, 107, n_wave)"
             )
-        if self.n_time != 8 or self.sfh_per_bin:
-            raise ValueError(
-                "The SFH-basis fast path requires eight node-based SFH values."
+        elif self.n_time != 8 or self.sfh_per_bin:
+            fallback_reason = (
+                "the SFH is not eight node-based values"
             )
-        if not self.zh_const or self.sfh_interp != "step":
-            raise ValueError(
-                "The SFH-basis fast path requires zh_const=True and "
-                "sfh_interp='step'."
+        elif not self.zh_const or self.sfh_interp != "step":
+            fallback_reason = (
+                "zh_const=True and sfh_interp='step' are required"
             )
-        if self.track_zred_age:
-            raise ValueError(
-                "The SFH-basis fast path requires a static lookback-time grid."
+        elif self.track_zred_age:
+            fallback_reason = (
+                "track_zred_age requires non-static age weights"
             )
-        if self._has_age_dependent_dust or self._has_dust_emission:
-            raise ValueError(
-                "The SFH-basis fast path does not support age-dependent dust "
-                "or dust emission."
+        elif self._has_age_dependent_dust or self._has_dust_emission:
+            fallback_reason = (
+                "age-dependent dust and dust emission are not supported"
             )
+        if fallback_reason is not None:
+            warnings.warn(
+                f"SFH-basis fast path {selector!r} is unavailable because "
+                f"{fallback_reason}; using the reference implementation.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return self
 
         self._sfh_node_to_age = self._make_sfh_node_to_age_operator()
         basis = jnp.einsum(
@@ -578,6 +588,7 @@ class CSPBasis_afe:
             self._sfh_basis = basis
         else:
             self._sfh_basis_flat = basis.reshape((5 * 13 * 8, self.wave.size))
+        self.sfh_basis_fastpath = selector
         return self
 
     def _make_sfh_node_to_age_operator(self):
@@ -998,12 +1009,6 @@ class CSPBasis_afe:
 
     def _spectrum_from_sfh_basis(self, theta):
         """Evaluate the selected pure-JAX fixed-grid SFH-basis kernel."""
-        if "lookback_time" in theta:
-            raise ValueError(
-                "The SFH-basis fast path uses its construction-time "
-                "lookback grid. Remove theta['lookback_time']."
-            )
-
         sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
         afe_hi, afe_weight, z_hi, z_weight = self._sfh_basis_coords(theta)
         afe_weight = afe_weight.astype(jnp.float32)
@@ -1969,7 +1974,10 @@ class CSPBasis_afe:
         _ = include_lines
         attn, attn_diffuse = self.attenuate_dust(self.wave, theta)
 
-        if self.sfh_basis_fastpath is not None:
+        if (
+            self.sfh_basis_fastpath is not None
+            and "lookback_time" not in theta
+        ):
             spectrum = self._spectrum_from_sfh_basis(theta)
             spectrum *= jnp.exp(-attn_diffuse.astype(jnp.float32))
             return spectrum.reshape((-1,))
@@ -2026,7 +2034,10 @@ class CSPBasis_afe:
     def get_spectrum_nodattn_nodem_noneb(self, theta, *, include_lines=None):
         """Stellar continuum only — no dust, no nebular.  ``include_lines`` ignored."""
         _ = include_lines
-        if self.sfh_basis_fastpath is not None:
+        if (
+            self.sfh_basis_fastpath is not None
+            and "lookback_time" not in theta
+        ):
             return self._spectrum_from_sfh_basis(theta)
         flux     = self._flux_at_afe(theta)           # (n_z, n_age, n_wave)
         weights  = self.calculate_ssp_weights(theta=theta).astype(jnp.float32)

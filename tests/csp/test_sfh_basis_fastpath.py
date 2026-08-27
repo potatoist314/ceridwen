@@ -97,6 +97,32 @@ def test_fp32_variants_match_baseline_at_edges_and_between_knots(
         np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
 
 
+def test_alpha_free_variants_match_reference_solar_plane(models):
+    inputs = theta(0.0, -0.73)
+    inputs.pop("afe")
+    expected = models[None].get_spectrum(inputs)
+    for selector in ("A", "B"):
+        actual = models[selector].get_spectrum(inputs)
+        np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
+
+
+def test_diffuse_dust_variants_match_reference(fixed_ssp):
+    dust_models = {
+        selector: build_csp(
+            fixed_ssp,
+            selector,
+            add_diffuse_dust=True,
+        )
+        for selector in (None, "A", "B")
+    }
+    inputs = dict(dust_models[None].theta_init)
+    inputs.update(theta(0.13, -0.73))
+    expected = dust_models[None].get_spectrum(inputs)
+    for selector in ("A", "B"):
+        actual = dust_models[selector].get_spectrum(inputs)
+        np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
+
+
 def test_static_operator_matches_baseline_age_weights(models):
     sfh = jnp.array([0.3, 1.7, 0.2, 0.9, 2.1, 0.5, 1.2, 0.4])
     baseline_age_weights = models[None].calculate_ssp_weights(
@@ -109,6 +135,34 @@ def test_static_operator_matches_baseline_age_weights(models):
         rtol=2e-6,
         atol=16.0,
     )
+
+
+def test_operator_rows_are_trapezoid_time_weights_in_years(models):
+    times_yr = LOOKBACK_GYR * 1e9
+    widths_yr = jnp.diff(times_yr)
+    expected = jnp.concatenate(
+        (
+            0.5 * widths_yr[:1],
+            0.5 * (widths_yr[:-1] + widths_yr[1:]),
+            0.5 * widths_yr[-1:],
+        )
+    )
+    actual = models["A"]._sfh_node_to_age.sum(axis=1)
+    np.testing.assert_allclose(actual, expected, rtol=2e-7, atol=64.0)
+
+
+def test_constant_ssp_limit_is_sfh_time_integral_in_years(fixed_ssp):
+    data = vars(fixed_ssp).copy()
+    data["ssp_flux"] = np.ones_like(fixed_ssp.ssp_flux)
+    unit_ssp = SimpleNamespace(**data)
+    sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
+    expected = jnp.trapezoid(sfh, LOOKBACK_GYR * 1e9)
+
+    for selector in (None, "A", "B"):
+        actual = build_csp(unit_ssp, selector).get_spectrum(
+            theta(0.13, -0.73, sfh)
+        )
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=128.0)
 
 
 def test_gradients_match_away_from_alpha_and_metallicity_knots(models):
@@ -133,28 +187,34 @@ def test_gradients_match_away_from_alpha_and_metallicity_knots(models):
             )
 
 
-def test_runtime_lookback_grid_is_outside_static_contract(models):
+def test_runtime_lookback_grid_uses_reference_fallback(models):
     inputs = theta(0.13, -0.73)
-    inputs["lookback_time"] = LOOKBACK_GYR
-    with pytest.raises(ValueError, match="construction-time lookback grid"):
-        models["A"].get_spectrum(inputs)
+    inputs["lookback_time"] = jnp.array(
+        [0.0, 0.02, 0.08, 0.25, 0.8, 2.6, 4.8, 7.9]
+    )
+    expected = models[None].get_spectrum(inputs)
+    for selector in ("A", "B"):
+        actual = models[selector].get_spectrum(inputs)
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-3)
 
 
 @pytest.mark.parametrize("selector", ["A", "B"])
 def test_hlo_excludes_age_cube_shapes(models, selector):
     lowered = jax.jit(models[selector].get_spectrum).lower(theta(0.13, -0.73))
-    hlo = lowered.compiler_ir(dialect="hlo").as_hlo_text()
+    stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
     for excluded in (
-        "f32[5,13,107,11]",
-        "f32[13,107,11]",
-        "f32[107,11]",
-        "f32[13,107]",
+        "tensor<5x13x107x11xf32>",
+        "tensor<13x107x11xf32>",
+        "tensor<107x11xf32>",
+        "tensor<13x107xf32>",
     ):
-        assert excluded not in hlo
+        assert excluded not in stablehlo
     expected_basis_shape = (
-        "f32[5,13,8,11]" if selector == "A" else "f32[520,11]"
+        "tensor<5x13x8x11xf32>"
+        if selector == "A"
+        else "tensor<520x11xf32>"
     )
-    assert expected_basis_shape in hlo
+    assert expected_basis_shape in stablehlo
 
 
 @pytest.mark.parametrize(
@@ -162,12 +222,15 @@ def test_hlo_excludes_age_cube_shapes(models, selector):
     [
         ({"lookback_time": jnp.linspace(0.0, 8.4, 7), "theta": None}, "eight"),
         ({"sfh_interp": "linear"}, "sfh_interp='step'"),
-        ({"track_zred_age": True}, "static lookback"),
+        ({"track_zred_age": True}, "non-static age weights"),
         ({"add_dust": True}, "age-dependent dust"),
     ],
 )
-def test_selector_enforces_only_fixed_grid_contract(
+def test_selector_falls_back_outside_fixed_grid_contract(
     fixed_ssp, overrides, message
 ):
-    with pytest.raises(ValueError, match=message):
-        build_csp(fixed_ssp, "A", **overrides)
+    with pytest.warns(RuntimeWarning, match=message):
+        csp = build_csp(fixed_ssp, "A", **overrides)
+    assert csp.sfh_basis_fastpath is None
+    assert csp._sfh_basis is None
+    assert csp._sfh_basis_flat is None
