@@ -63,12 +63,9 @@ import math
 import os
 import warnings
 
-import numpy as np
 import jax.numpy as jnp
-from jax import jit, vmap
+import numpy as np
 import pprint
-
-import astropy.constants as const
 
 from sedpy_jax.smoothing import make_vel_smoother
 
@@ -223,6 +220,13 @@ class CSPBasis_afe:
         convention) instead of one per node (shape ``(n_time,)``).  Default
         False.  (With ``theta=`` the convention is inferred from the shape
         of ``theta['sfh']``.)
+    sfh_basis_fastpath : {None, "A", "B"}
+        Experimental fixed-grid SFH-basis selector. ``None`` keeps the
+        baseline kernel. ``"A"`` gathers four alpha/metallicity corners from
+        a precontracted ``(5, 13, 8, n_wave)`` basis. ``"B"`` contracts a
+        flattened ``(5 * 13 * 8, n_wave)`` basis. Both variants require the
+        published 5-by-13-by-107 SSP grid, eight static SFH nodes, constant
+        metallicity, step interpolation, and no age-dependent dust.
     """
 
     def __init__(
@@ -247,6 +251,7 @@ class CSPBasis_afe:
         track_zred_age=False,
         lookback_time=None,
         sfh_per_bin=False,
+        sfh_basis_fastpath=None,
         cosmo=None,
         **kwargs,
     ):
@@ -491,6 +496,8 @@ class CSPBasis_afe:
             )
         self.sfh_interp = sfh_interp
         self.zh_const = bool(zh_const)
+        self._has_age_dependent_dust = bool(add_dust)
+        self._has_dust_emission = bool(add_dust_emission)
         if zh_const:
             if sfh_interp == 'step':
                 self.calculate_ssp_weights = self.calculate_ssp_weights_const_zh_step
@@ -505,6 +512,7 @@ class CSPBasis_afe:
             print(f"SFH integration scheme : {sfh_interp}")
 
         self.initialize_model_structure(theta)
+        self.select_sfh_basis_fastpath(sfh_basis_fastpath)
 
         if verbose:
             print("\nCSPBasis (dict theta) — registered parameters:")
@@ -514,6 +522,80 @@ class CSPBasis_afe:
         # sit outside the interpolation grids (silent edge-clamping).  Cheap,
         # non-jitted; users can re-run check_param_ranges() on sampled theta.
         self.check_param_ranges(self.theta_init)
+
+    def select_sfh_basis_fastpath(self, selector=None):
+        """Select an experimental fixed-grid SFH-basis kernel.
+
+        ``None`` preserves the baseline. Variant ``"A"`` interpolates four
+        alpha/metallicity corners. Variant ``"B"`` contracts one flattened
+        basis. The selection is Python-static and must happen before JIT
+        tracing.
+        """
+        if selector not in (None, "A", "B"):
+            raise ValueError(
+                "sfh_basis_fastpath must be None, 'A', or 'B'; "
+                f"got {selector!r}."
+            )
+
+        self.sfh_basis_fastpath = selector
+        self._sfh_basis = None
+        self._sfh_basis_flat = None
+        self._sfh_node_to_age = None
+        if selector is None:
+            return self
+
+        if (self._n_afe, self._n_z, self._n_age) != (5, 13, 107):
+            raise ValueError(
+                "The SFH-basis fast path requires the fixed SSP grid shape "
+                "(5, 13, 107, n_wave)."
+            )
+        if self.n_time != 8 or self.sfh_per_bin:
+            raise ValueError(
+                "The SFH-basis fast path requires eight node-based SFH values."
+            )
+        if not self.zh_const or self.sfh_interp != "step":
+            raise ValueError(
+                "The SFH-basis fast path requires zh_const=True and "
+                "sfh_interp='step'."
+            )
+        if self.track_zred_age:
+            raise ValueError(
+                "The SFH-basis fast path requires a static lookback-time grid."
+            )
+        if self._has_age_dependent_dust or self._has_dust_emission:
+            raise ValueError(
+                "The SFH-basis fast path does not support age-dependent dust "
+                "or dust emission."
+            )
+
+        self._sfh_node_to_age = self._make_sfh_node_to_age_operator()
+        basis = jnp.einsum(
+            "na,pzaw->pznw",
+            self._sfh_node_to_age,
+            self.flux,
+        )
+        if selector == "A":
+            self._sfh_basis = basis
+        else:
+            self._sfh_basis_flat = basis.reshape((5 * 13 * 8, self.wave.size))
+        return self
+
+    def _make_sfh_node_to_age_operator(self):
+        """Return the exact static ``(8, 107)`` node-to-age operator."""
+        t_young = self.sfh_times[:-1]
+        t_old = self.sfh_times[1:]
+        dt = t_old - t_young
+        overlap = jnp.maximum(
+            0.0,
+            jnp.minimum(t_old[:, None], self._ssp_voronoi_hi[None, :])
+            - jnp.maximum(t_young[:, None], self._ssp_voronoi_lo[None, :]),
+        )
+        bin_to_age = (
+            overlap * (dt / overlap.sum(axis=1))[:, None]
+        ).astype(jnp.float32)
+        operator = jnp.zeros((8, 107), dtype=jnp.float32)
+        operator = operator.at[:-1].add(0.5 * bin_to_age)
+        return operator.at[1:].add(0.5 * bin_to_age)
 
 
 
@@ -894,6 +976,62 @@ class CSPBasis_afe:
         f_hi = jnp.take(self.flux, k,     axis=0)
         w32  = w.astype(jnp.float32)
         return (jnp.float32(1.0) - w32) * f_lo + w32 * f_hi
+
+    def _sfh_basis_coords(self, theta):
+        """Return scalar alpha and metallicity interpolation coordinates."""
+        if "afe" in theta:
+            afe_hi, afe_weight = self._afe_coords(theta)
+        else:
+            afe_hi = jnp.asarray(self._afe_solar_idx, dtype=jnp.int32)
+            afe_weight = jnp.asarray(0.0, dtype=jnp.float32)
+
+        target_z = jnp.ravel(theta["Z"])[0]
+        z_hi = jnp.clip(
+            jnp.searchsorted(self.zmet, target_z, side="left"),
+            1,
+            self._n_z - 1,
+        )
+        z0 = self.zmet[z_hi - 1]
+        z1 = self.zmet[z_hi]
+        z_weight = jnp.clip((target_z - z0) / (z1 - z0), 0.0, 1.0)
+        return afe_hi, afe_weight, z_hi, z_weight
+
+    def _spectrum_from_sfh_basis(self, theta):
+        """Evaluate the selected pure-JAX fixed-grid SFH-basis kernel."""
+        if "lookback_time" in theta:
+            raise ValueError(
+                "The SFH-basis fast path uses its construction-time "
+                "lookback grid. Remove theta['lookback_time']."
+            )
+
+        sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
+        afe_hi, afe_weight, z_hi, z_weight = self._sfh_basis_coords(theta)
+        afe_weight = afe_weight.astype(jnp.float32)
+        z_weight = z_weight.astype(jnp.float32)
+
+        if "afe" not in theta:
+            afe_lo = afe_hi
+        else:
+            afe_lo = afe_hi - 1
+
+        if self.sfh_basis_fastpath == "A":
+            basis00 = self._sfh_basis[afe_lo, z_hi - 1]
+            basis01 = self._sfh_basis[afe_lo, z_hi]
+            basis10 = self._sfh_basis[afe_hi, z_hi - 1]
+            basis11 = self._sfh_basis[afe_hi, z_hi]
+            lower = (1.0 - z_weight) * basis00 + z_weight * basis01
+            upper = (1.0 - z_weight) * basis10 + z_weight * basis11
+            node_basis = (1.0 - afe_weight) * lower + afe_weight * upper
+            return jnp.einsum("n,nw->w", sfh, node_basis)
+
+        afe_mix = jnp.zeros(5, dtype=jnp.float32)
+        afe_mix = afe_mix.at[afe_lo].add(1.0 - afe_weight)
+        afe_mix = afe_mix.at[afe_hi].add(afe_weight)
+        z_mix = jnp.zeros(13, dtype=jnp.float32)
+        z_mix = z_mix.at[z_hi - 1].add(1.0 - z_weight)
+        z_mix = z_mix.at[z_hi].add(z_weight)
+        coefficients = jnp.einsum("p,z,n->pzn", afe_mix, z_mix, sfh)
+        return coefficients.reshape((5 * 13 * 8,)) @ self._sfh_basis_flat
 
     def initialize_dust_components(
         self, add_dust, add_diffuse_dust, add_dust_emission,
@@ -1829,8 +1967,14 @@ class CSPBasis_afe:
         emission in this variant.
         """
         _ = include_lines
-        flux = self._flux_at_afe(theta)               # (n_z, n_age, n_wave)
         attn, attn_diffuse = self.attenuate_dust(self.wave, theta)
+
+        if self.sfh_basis_fastpath is not None:
+            spectrum = self._spectrum_from_sfh_basis(theta)
+            spectrum *= jnp.exp(-attn_diffuse.astype(jnp.float32))
+            return spectrum.reshape((-1,))
+
+        flux = self._flux_at_afe(theta)               # (n_z, n_age, n_wave)
 
         M       = self._age_bin_mix
         tau_age = jnp.einsum("ab,bw->aw", M, attn.astype(jnp.float32))
@@ -1882,6 +2026,8 @@ class CSPBasis_afe:
     def get_spectrum_nodattn_nodem_noneb(self, theta, *, include_lines=None):
         """Stellar continuum only — no dust, no nebular.  ``include_lines`` ignored."""
         _ = include_lines
+        if self.sfh_basis_fastpath is not None:
+            return self._spectrum_from_sfh_basis(theta)
         flux     = self._flux_at_afe(theta)           # (n_z, n_age, n_wave)
         weights  = self.calculate_ssp_weights(theta=theta).astype(jnp.float32)
         return jnp.einsum("za,zaw->w", weights, flux)
