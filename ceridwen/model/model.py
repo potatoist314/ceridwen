@@ -66,14 +66,19 @@ Usage::
 
 from __future__ import annotations
 
-import pprint
 from functools import cached_property
 from typing import Any, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 
-from ceridwen.observation.observation import Observation, Photometry, Spectrum, Lines
+from ceridwen.observation.observation import (
+    Lines,
+    Observation,
+    Photometry,
+    Spectrum,
+    StellarIndices,
+)
 
 Array = jax.Array
 
@@ -89,7 +94,7 @@ class SedModel:
         ``csp.wave``, ``csp.theta_init``, and
         ``csp.predict(theta, observations)``.
     observations : list of Observation
-        Data containers (Photometry, Spectrum, Lines).  Each must have a
+        Data containers (Photometry, Spectrum, Lines, StellarIndices). Each must have a
         unique ``.name`` attribute.
     priors : dict[str, Prior], optional
         Mapping from *free*-parameter name to a prior object implementing
@@ -214,7 +219,7 @@ class SedModel:
                 set(self.param_names) | set(self.priors) | set(self.transforms)
             )
 
-        # Precompute static projection matrices for Spectrum and Lines.
+        # Precompute static projection matrices for spectral observations.
         # This must happen once, at Python level, BEFORE any JIT trace of
         # predict().  Each observation's setup_for_model() stores a constant
         # JAX array (_H for Spectrum, _W for Lines) that XLA constant-folds
@@ -228,7 +233,7 @@ class SedModel:
         # :meth:`predict` injects into the CSP theta (see below) — both
         # things are needed for observed-frame calibration.
         for obs in self.observations:
-            if getattr(obs, "_kind", None) == "spectrum":
+            if getattr(obs, "_kind", None) in {"spectrum", "stellar_indices"}:
                 # Thread the SSP library resolution curve (schema 2.0)
                 # into the Spectrum projection so the library width is
                 # subtracted in quadrature from the instrumental
@@ -359,7 +364,8 @@ class SedModel:
 
         - ``Photometry`` → synthetic AB maggies via filter convolution
         - ``Spectrum``   → model F_ν interpolated onto observed wavelength grid
-        - ``Lines``      → Gaussian-aperture integrated line fluxes
+        - ``Lines``      → integrated nebular line fluxes
+        - ``StellarIndices`` → integrated stellar absorption indices
 
         **Mass scaling** — if ``"logmass"`` is present in ``theta``, the
         spectrum is multiplied by ``10 ** logmass`` inside ``csp.predict()``
@@ -634,6 +640,7 @@ class SedModel:
             phot_fc   = "#FFF4E6",  phot_ec = "#C95800",
             spec_fc   = "#EDFAED",  spec_ec = "#276929",
             line_fc   = "#F5EEFF",  line_ec = "#6A22A8",
+            index_fc  = "#E9F7F7",  index_ec = "#176B6B",
             # observed data nodes (filled = conditioned on)
             data_fc   = "#37474F",
             data_ec   = "#1A252B",
@@ -653,12 +660,15 @@ class SedModel:
                     return (C["spec_fc"], C["spec_ec"])
                 if isinstance(obs, Lines):
                     return (C["line_fc"], C["line_ec"])
+                if isinstance(obs, StellarIndices):
+                    return (C["index_fc"], C["index_ec"])
             except Exception:
                 pass
             return {
                 "Photometry": (C["phot_fc"], C["phot_ec"]),
                 "Spectrum":   (C["spec_fc"], C["spec_ec"]),
                 "Lines":      (C["line_fc"], C["line_ec"]),
+                "StellarIndices": (C["index_fc"], C["index_ec"]),
             }.get(type(obs).__name__, (C["param_fc"], C["param_ec"]))
 
         # ── label helpers ──────────────────────────────────────────────────
@@ -700,13 +710,16 @@ class SedModel:
             p   = prior.params
             try:
                 if cls in ("Uniform", "TopHat"):
-                    lo = float(p["low"]);  hi = float(p["high"])
+                    lo = float(p["low"])
+                    hi = float(p["high"])
                     return rf"$\mathcal{{U}}({lo:.3g},\,{hi:.3g})$"
                 if cls == "Normal":
-                    mu = float(p["mean"]); sg = float(p["sigma"])
+                    mu = float(p["mean"])
+                    sg = float(p["sigma"])
                     return rf"$\mathcal{{N}}({mu:.3g},\,{sg:.3g})$"
                 if cls == "ClippedNormal":
-                    mu = float(p["mean"]); sg = float(p["sigma"])
+                    mu = float(p["mean"])
+                    sg = float(p["sigma"])
                     return rf"$\mathcal{{N}}_c({mu:.3g},\,{sg:.3g})$"
                 if cls == "LogNormal":
                     return r"$\mathrm{LogNorm}$"
@@ -746,6 +759,8 @@ class SedModel:
                     return rf"$n_{{\mathrm{{pix}}}}={n}$"
                 if isinstance(obs, Lines):
                     return rf"$n_{{\mathrm{{lines}}}}={n}$"
+                if isinstance(obs, StellarIndices):
+                    return rf"$n_{{\mathrm{{indices}}}}={n}$"
                 # fallback: match by class name substring
                 cls = type(obs).__name__
                 if "Phot" in cls:
@@ -757,7 +772,7 @@ class SedModel:
                 return rf"$n={n}$"
             except Exception:
                 pass
-            return rf"$\hat{{y}}$"
+            return r"$\hat{y}$"
 
         # ── transform colour ───────────────────────────────────────────────
         C["tr_fc"] = "#FFF8E1"   # warm amber fill
@@ -998,6 +1013,9 @@ class SedModel:
             elif isinstance(obs, Lines):
                 obs_type_lbl = "Lines"
                 proj_lbl     = r"$\mathbf{W}\!\cdot\!f_\nu$"
+            elif isinstance(obs, StellarIndices):
+                obs_type_lbl = "Stellar indices"
+                proj_lbl     = r"$\mathcal{I}[f_\lambda]$"
             else:
                 obs_type_lbl = type(obs).__name__
                 proj_lbl     = r"$\hat{y}$"

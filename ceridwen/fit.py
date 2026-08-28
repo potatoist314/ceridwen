@@ -45,10 +45,9 @@ This writes ``my_fit/ceridwen_result.h5`` with subgroups::
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -181,7 +180,14 @@ def fitSED(
         # z ~ 2.7 that produces 10-20 sigma photometric residuals
         # because the filters sample the wrong intrinsic wavelengths.
         for obs in model.observations:
-            obs.setup_for_model(model.csp.wave, zred=model.zred)
+            if getattr(obs, "_kind", None) in {"spectrum", "stellar_indices"}:
+                obs.setup_for_model(
+                    model.csp.wave,
+                    zred=model.zred,
+                    lib_resolution=getattr(model.csp, "lib_resolution", None),
+                )
+            else:
+                obs.setup_for_model(model.csp.wave, zred=model.zred)
 
     if not model.observations:
         raise ValueError("No observations attached to model.")
@@ -231,7 +237,7 @@ def fitSED(
         _backend = jax.default_backend().upper()   # 'CPU', 'GPU', or 'TPU'
         _device_str = ", ".join(str(d) for d in _devices)
 
-        logger.info(f"ceridwen.fitSED")
+        logger.info("ceridwen.fitSED")
         logger.info(f"  Device      : {_backend}  ({_device_str})")
         if _backend == "CPU":
             logger.info(
@@ -267,7 +273,7 @@ def fitSED(
         _t_h5 = time.perf_counter() - _t0_h5
 
         _t_total = _t_likelihood + _t_adapter + _t_sampler + _t_h5
-        logger.info(f"\n  fitSED timing breakdown:")
+        logger.info("\n  fitSED timing breakdown:")
         logger.info(f"    Likelihood build : {_t_likelihood:>8.3f} s")
         logger.info(f"    Adapter build    : {_t_adapter:>8.3f} s")
         logger.info(f"    Sampler run      : {_t_sampler:>8.1f} s")
@@ -441,6 +447,14 @@ def write_result_h5(
                 og.attrs["line_names"] = json.dumps(list(obs.line_names))
             if hasattr(obs, "line_ind") and obs.line_ind is not None:
                 og.create_dataset("line_ind", data=np.asarray(obs.line_ind))
+            if hasattr(obs, "index_names"):
+                og.attrs["index_names"] = json.dumps(list(obs.index_names))
+                og.attrs["index_kinds"] = json.dumps(list(obs.index_kinds))
+                og.attrs["index_units"] = json.dumps(list(obs.index_units))
+                og.create_dataset(
+                    "bandpasses_vacuum",
+                    data=np.asarray(obs.bandpasses_vacuum),
+                )
 
         # ── /model ────────────────────────────────────────────────────
         mod_grp = f.create_group("model")
@@ -644,12 +658,7 @@ def read_result_h5(path: str | Path) -> dict:
         # ── obs ───────────────────────────────────────────────────────
         for obs_name in f["obs"]:
             og = f["obs"][obs_name]
-            obs_data = {
-                "flux": np.array(og["flux"]),
-                "uncertainty": np.array(og["uncertainty"]),
-                "wavelength": np.array(og["wavelength"]),
-                "mask": np.array(og["mask"]),
-            }
+            obs_data = {name: np.array(og[name]) for name in og}
             for attr_name in og.attrs:
                 obs_data[attr_name] = og.attrs[attr_name]
             out["obs"][obs_name] = obs_data

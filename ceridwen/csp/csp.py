@@ -32,12 +32,9 @@ import math
 import os
 import warnings
 
-import numpy as np
 import jax.numpy as jnp
-from jax import jit, vmap
+import numpy as np
 import pprint
-
-import astropy.constants as const
 
 from sedpy_jax.smoothing import make_vel_smoother
 
@@ -1333,6 +1330,7 @@ class CSPBasis:
         from ..observation.observation import (
             Photometry as _Photometry,
             Spectrum   as _Spectrum,
+            StellarIndices as _StellarIndices,
         )
         from ..observation.lines import Lines as _Lines
         # Direct grid-based line fluxes (2026-07-21): predicting Lines by
@@ -1388,8 +1386,14 @@ class CSPBasis:
                     # no nebular module: line component is identically zero
                     out[obs.name] = obs.predict(line_slit, self.wave)
                 continue
-            spec_for_obs = (spectrum_phot if isinstance(obs, _Photometry)
-                            else spectrum_slit)
+            if isinstance(obs, _Photometry):
+                spec_for_obs = spectrum_phot
+            elif isinstance(obs, _StellarIndices):
+                # Released stellar indices are measured after subtracting
+                # the fitted nebular emission-line model.
+                spec_for_obs = spectrum_slit - line_slit
+            else:
+                spec_for_obs = spectrum_slit
             if (isinstance(obs, _Photometry)
                     and getattr(obs, "free_z", False)
                     and free_z_in_theta):
@@ -1435,7 +1439,9 @@ class CSPBasis:
             return rows
         pos = np.asarray(self.neb.nebem_line_pos, dtype=float)
         lam = np.asarray(obs.wavelength, dtype=float)
-        idx = np.array([int(np.argmin(np.abs(pos - l))) for l in lam])
+        idx = np.array(
+            [int(np.argmin(np.abs(pos - wavelength))) for wavelength in lam]
+        )
         dmax = float(np.max(np.abs(pos[idx] - lam)))
         if dmax > 1.0:
             worst = int(np.argmax(np.abs(pos[idx] - lam)))
