@@ -1,4 +1,4 @@
-"""Fixed-grid tests for the experimental eight-node SFH-basis kernels."""
+"""Contracts for the automatic eight-node SFH-basis fast path."""
 
 from types import SimpleNamespace
 
@@ -28,7 +28,7 @@ def fixed_ssp():
     )
 
 
-def build_csp(ssp, selector=None, **overrides):
+def build_csp(ssp, *, reference=False, **overrides):
     options = {
         "theta": {
             "lookback_time": LOOKBACK_GYR,
@@ -43,17 +43,21 @@ def build_csp(ssp, selector=None, **overrides):
         "add_dust_emission": False,
         "sigma_losvd_kms": 0.0,
         "verbose": False,
-        "sfh_basis_fastpath": selector,
     }
     options.update(overrides)
-    return CSPBasis_afe(ssp, **options)
+    csp = CSPBasis_afe(ssp, **options)
+    if reference:
+        csp.sfh_basis_fastpath = False
+        csp._sfh_basis = None
+        csp._sfh_node_to_age = None
+    return csp
 
 
 @pytest.fixture(scope="module")
 def models(fixed_ssp):
     return {
-        selector: build_csp(fixed_ssp, selector)
-        for selector in (None, "A", "B")
+        "reference": build_csp(fixed_ssp, reference=True),
+        "automatic": build_csp(fixed_ssp),
     }
 
 
@@ -67,12 +71,11 @@ def theta(afe, metallicity, sfh=None):
     }
 
 
-def test_baseline_is_default_and_operator_shapes(models):
-    assert models[None].sfh_basis_fastpath is None
-    assert models[None]._sfh_node_to_age is None
-    assert models["A"]._sfh_node_to_age.shape == (8, 107)
-    assert models["A"]._sfh_basis.shape == (5, 13, 8, 11)
-    assert models["B"]._sfh_basis_flat.shape == (5 * 13 * 8, 11)
+def test_supported_model_uses_fastpath_by_default(models):
+    automatic = models["automatic"]
+    assert automatic.sfh_basis_fastpath
+    assert automatic._sfh_node_to_age.shape == (8, 107)
+    assert automatic._sfh_basis.shape == (5, 13, 8, 11)
 
 
 @pytest.mark.parametrize(
@@ -85,53 +88,43 @@ def test_baseline_is_default_and_operator_shapes(models):
         (0.13, -0.73),
     ],
 )
-def test_fp32_variants_match_baseline_at_edges_and_between_knots(
+def test_fastpath_matches_reference_at_edges_and_between_knots(
     models, afe, metallicity
 ):
     inputs = theta(afe, metallicity)
-    expected = models[None].get_spectrum(inputs)
-    assert expected.dtype == jnp.float32
-    for selector in ("A", "B"):
-        actual = models[selector].get_spectrum(inputs)
-        assert actual.dtype == jnp.float32
-        np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
+    expected = models["reference"].get_spectrum(inputs)
+    actual = models["automatic"].get_spectrum(inputs)
+    assert actual.dtype == jnp.float32
+    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
 
 
-def test_alpha_free_variants_match_reference_solar_plane(models):
+def test_alpha_free_fastpath_matches_reference_solar_plane(models):
     inputs = theta(0.0, -0.73)
     inputs.pop("afe")
-    expected = models[None].get_spectrum(inputs)
-    for selector in ("A", "B"):
-        actual = models[selector].get_spectrum(inputs)
-        np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
+    expected = models["reference"].get_spectrum(inputs)
+    actual = models["automatic"].get_spectrum(inputs)
+    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
 
 
-def test_diffuse_dust_variants_match_reference(fixed_ssp):
-    dust_models = {
-        selector: build_csp(
-            fixed_ssp,
-            selector,
-            add_diffuse_dust=True,
-        )
-        for selector in (None, "A", "B")
-    }
-    inputs = dict(dust_models[None].theta_init)
+def test_diffuse_dust_fastpath_matches_reference(fixed_ssp):
+    reference = build_csp(fixed_ssp, reference=True, add_diffuse_dust=True)
+    automatic = build_csp(fixed_ssp, add_diffuse_dust=True)
+    inputs = dict(reference.theta_init)
     inputs.update(theta(0.13, -0.73))
-    expected = dust_models[None].get_spectrum(inputs)
-    for selector in ("A", "B"):
-        actual = dust_models[selector].get_spectrum(inputs)
-        np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
+    expected = reference.get_spectrum(inputs)
+    actual = automatic.get_spectrum(inputs)
+    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-2)
 
 
-def test_static_operator_matches_baseline_age_weights(models):
+def test_static_operator_matches_reference_age_weights(models):
     sfh = jnp.array([0.3, 1.7, 0.2, 0.9, 2.1, 0.5, 1.2, 0.4])
-    baseline_age_weights = models[None].calculate_ssp_weights(
+    reference_age_weights = models["reference"].calculate_ssp_weights(
         theta(0.13, -0.73, sfh)
     ).sum(axis=0)
-    fast_age_weights = sfh @ models["A"]._sfh_node_to_age
+    fast_age_weights = sfh @ models["automatic"]._sfh_node_to_age
     np.testing.assert_allclose(
         fast_age_weights,
-        baseline_age_weights,
+        reference_age_weights,
         rtol=2e-6,
         atol=16.0,
     )
@@ -147,7 +140,7 @@ def test_operator_rows_are_trapezoid_time_weights_in_years(models):
             0.5 * widths_yr[-1:],
         )
     )
-    actual = models["A"]._sfh_node_to_age.sum(axis=1)
+    actual = models["automatic"]._sfh_node_to_age.sum(axis=1)
     np.testing.assert_allclose(actual, expected, rtol=2e-7, atol=64.0)
 
 
@@ -158,49 +151,46 @@ def test_constant_ssp_limit_is_sfh_time_integral_in_years(fixed_ssp):
     sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
     expected = jnp.trapezoid(sfh, LOOKBACK_GYR * 1e9)
 
-    for selector in (None, "A", "B"):
-        actual = build_csp(unit_ssp, selector).get_spectrum(
+    for reference in (True, False):
+        actual = build_csp(unit_ssp, reference=reference).get_spectrum(
             theta(0.13, -0.73, sfh)
         )
         np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=128.0)
 
 
-def test_gradients_match_away_from_alpha_and_metallicity_knots(models):
+def test_gradients_match_reference(models):
     sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
 
     def objective(csp, afe, metallicity, sfh_values):
         return jnp.sum(csp.get_spectrum(theta(afe, metallicity, sfh_values)))
 
     expected = jax.grad(objective, argnums=(1, 2, 3))(
-        models[None], 0.13, -0.73, sfh
+        models["reference"], 0.13, -0.73, sfh
     )
-    for selector in ("A", "B"):
-        actual = jax.grad(objective, argnums=(1, 2, 3))(
-            models[selector], 0.13, -0.73, sfh
+    actual = jax.grad(objective, argnums=(1, 2, 3))(
+        models["automatic"], 0.13, -0.73, sfh
+    )
+    for actual_part, expected_part in zip(actual, expected):
+        np.testing.assert_allclose(
+            actual_part,
+            expected_part,
+            rtol=8e-5,
+            atol=3e-2,
         )
-        for actual_part, expected_part in zip(actual, expected):
-            np.testing.assert_allclose(
-                actual_part,
-                expected_part,
-                rtol=8e-5,
-                atol=3e-2,
-            )
 
 
-def test_runtime_lookback_grid_uses_reference_fallback(models):
+def test_runtime_lookback_grid_uses_general_path(models):
     inputs = theta(0.13, -0.73)
     inputs["lookback_time"] = jnp.array(
         [0.0, 0.02, 0.08, 0.25, 0.8, 2.6, 4.8, 7.9]
     )
-    expected = models[None].get_spectrum(inputs)
-    for selector in ("A", "B"):
-        actual = models[selector].get_spectrum(inputs)
-        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-3)
+    expected = models["reference"].get_spectrum(inputs)
+    actual = models["automatic"].get_spectrum(inputs)
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-3)
 
 
-@pytest.mark.parametrize("selector", ["A", "B"])
-def test_hlo_excludes_age_cube_shapes(models, selector):
-    lowered = jax.jit(models[selector].get_spectrum).lower(theta(0.13, -0.73))
+def test_fastpath_hlo_excludes_age_cube_shapes(models):
+    lowered = jax.jit(models["automatic"].get_spectrum).lower(theta(0.13, -0.73))
     stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
     for excluded in (
         "tensor<5x13x107x11xf32>",
@@ -209,28 +199,20 @@ def test_hlo_excludes_age_cube_shapes(models, selector):
         "tensor<13x107xf32>",
     ):
         assert excluded not in stablehlo
-    expected_basis_shape = (
-        "tensor<5x13x8x11xf32>"
-        if selector == "A"
-        else "tensor<520x11xf32>"
-    )
-    assert expected_basis_shape in stablehlo
+    assert "tensor<5x13x8x11xf32>" in stablehlo
 
 
 @pytest.mark.parametrize(
-    "overrides, message",
+    "overrides",
     [
-        ({"lookback_time": jnp.linspace(0.0, 8.4, 7), "theta": None}, "eight"),
-        ({"sfh_interp": "linear"}, "sfh_interp='step'"),
-        ({"track_zred_age": True}, "non-static age weights"),
-        ({"add_dust": True}, "age-dependent dust"),
+        {"lookback_time": jnp.linspace(0.0, 8.4, 7), "theta": None},
+        {"sfh_interp": "linear"},
+        {"track_zred_age": True},
+        {"add_dust": True},
     ],
 )
-def test_selector_falls_back_outside_fixed_grid_contract(
-    fixed_ssp, overrides, message
-):
-    with pytest.warns(RuntimeWarning, match=message):
-        csp = build_csp(fixed_ssp, "A", **overrides)
-    assert csp.sfh_basis_fastpath is None
+def test_unsupported_model_uses_general_path(fixed_ssp, overrides):
+    csp = build_csp(fixed_ssp, **overrides)
+    assert not csp.sfh_basis_fastpath
     assert csp._sfh_basis is None
-    assert csp._sfh_basis_flat is None
+    assert csp._sfh_node_to_age is None
