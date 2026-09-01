@@ -15,6 +15,9 @@ from sedpy_jax.smoothing import (
 )
 from .base import Observation
 
+# One FilterSet per filter-name tuple per process; see set_filters.
+_FILTERSET_CACHE: dict = {}
+
 
 class Photometry(Observation):
     """
@@ -101,7 +104,16 @@ class Photometry(Observation):
         except (AttributeError, TypeError):
             self.filternames = list(filters)
 
-        self.filterset = FilterSet(self.filternames)
+        # Loading one filter costs about a second of small JIT compiles in
+        # sedpy, and a joint fit builds two Photometry objects with the same
+        # filter list (aperture transfer + fit). Filters are immutable after
+        # construction, so share one FilterSet per name tuple per process.
+        key = tuple(self.filternames)
+        cached = _FILTERSET_CACHE.get(key)
+        if cached is None:
+            cached = FilterSet(self.filternames)
+            _FILTERSET_CACHE[key] = cached
+        self.filterset = cached
         self.filters   = list(self.filterset.filters)
         self.wave_eff = [f.wave_effective for f in self.filters]
 

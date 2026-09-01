@@ -453,7 +453,12 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             disable=not self.verbose,
         ) as pbar:
             _iter = 0
-            while float(_get_logZ_live(live) - _get_logZ(live)) >= self.logZ_tol:
+            # One device sync per iteration: read logZ and logZ_live once and
+            # reuse the floats for the loop condition, the verbose line, the
+            # progress bar, and the checkpoint tag.
+            _logZ = _get_logZ(live)
+            _logZ_live = _get_logZ_live(live)
+            while float(_logZ_live - _logZ) >= self.logZ_tol:
                 rng_key, subkey = jax.random.split(rng_key)
                 if _iter == 0 and self.verbose:
                     print("  [step_fn] Compiling the step kernel (one-time JIT) "
@@ -467,12 +472,12 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
                 _dt_iter = time.perf_counter() - _t_iter
                 _iter += 1
+                _logZ = _get_logZ(live)
+                _logZ_live = _get_logZ_live(live)
                 if self.verbose:
-                    _logZ = _get_logZ(live)
-                    _dlogZ = _get_logZ_live(live) - _logZ
                     print(
                         f"  [iter {_iter:>4d}]  {_dt_iter:6.1f} s  "
-                        f"logZ={_logZ:+.3f}  ΔlogZ={_dlogZ:.3f}  "
+                        f"logZ={_logZ:+.3f}  ΔlogZ={_logZ_live - _logZ:.3f}  "
                         f"dead={num_delete * _iter}",
                         flush=True,
                     )
@@ -481,8 +486,8 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 pbar.update(num_delete)
                 try:
                     pbar.set_description(
-                        f"NS  logZ={_get_logZ(live):.2f}  "
-                        f"ΔlogZ={_get_logZ_live(live) - _get_logZ(live):.2f}"
+                        f"NS  logZ={_logZ:.2f}  "
+                        f"ΔlogZ={_logZ_live - _logZ:.2f}"
                     )
                 except AttributeError:
                     pass
@@ -493,7 +498,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                                  >= self.checkpoint_interval_s):
                     _p = self._dump_snapshot(
                         _ckpt_dir, live, dead_list, ns_utils,
-                        _get_logZ(live), tag="checkpoint", partial=True)
+                        _logZ, tag="checkpoint", partial=True)
                     _last_ckpt = time.perf_counter()
                     if _p and self.verbose:
                         print(f"  [checkpoint] iter {_iter}: {_p}", flush=True)
