@@ -13,6 +13,7 @@ from sedpy_jax.smoothing import (
     make_wave_smoother,
     make_lsf_smoother,
 )
+from ._smoothing import combined_sigma_lambda, make_static_smoother
 from .base import Observation, _CKMS
 
 # FWHM = 2 sqrt(2 ln 2) sigma for a Gaussian kernel.
@@ -365,6 +366,29 @@ class Spectrum(Observation):
                 f"is over-broadened by the (unknown) library width.",
                 stacklevel=3)
 
+    @property
+    def _H(self):
+        """Dense (n_pix, n_wave) interpolation matrix, built on first access.
+
+        Only the no-smoothing projection path reads this.  Building it eagerly
+        in ``setup_for_model`` costs a large device allocation that a smoothed
+        Spectrum never uses, so it is deferred until something asks for it.
+        """
+        if getattr(self, "_H_cached", None) is None:
+            if getattr(self, "_H_factors", None) is None:
+                raise RuntimeError(
+                    "Spectrum._H is unavailable before setup_for_model(): the "
+                    "projection grids have not been computed. Call "
+                    "spec.setup_for_model(wave_model) first."
+                )
+            j_lo, j_hi, alpha, n_pix, n_wave = self._H_factors
+            H = np.zeros((n_pix, n_wave), dtype=np.float32)
+            rows = np.arange(n_pix)
+            H[rows, j_lo] += (1.0 - alpha).astype(np.float32)
+            H[rows, j_hi] += alpha.astype(np.float32)
+            self._H_cached = jnp.array(H)
+        return self._H_cached
+
     def setup_for_model(self, wave_model, zred: float = 0.0,
                         lib_resolution=None):
         """
@@ -427,8 +451,11 @@ class Spectrum(Observation):
         n_wave = len(wm)
         n_pix  = len(wo)
 
-        # ── Always build the dense interpolation matrix _H ────────────────
-        # (used by the no-smoothing fast path)
+        # ── Record the interpolation matrix _H, but do not build it ───────
+        # _H is dense, (n_pix, n_wave), and only the no-smoothing path reads
+        # it.  For a typical joint fit that is 271 MB of device memory the
+        # smoothing closure never touches, so the factors are stored here and
+        # the matrix is materialised on first access (see the _H property).
         j_hi = np.searchsorted(wm, wo, side='right')
         j_hi = np.clip(j_hi, 1, n_wave - 1)
         j_lo = j_hi - 1
@@ -437,11 +464,8 @@ class Spectrum(Observation):
         alpha = np.where(dw > 0, (wo - wm[j_lo]) / dw, 0.0)
         alpha = np.clip(alpha, 0.0, 1.0)
 
-        H = np.zeros((n_pix, n_wave), dtype=np.float32)
-        rows = np.arange(n_pix)
-        H[rows, j_lo] += (1.0 - alpha).astype(np.float32)
-        H[rows, j_hi] += alpha.astype(np.float32)
-        self._H = jnp.array(H)
+        self._H_factors = (j_lo, j_hi, alpha, n_pix, n_wave)
+        self._H_cached = None
 
         # ── Build _predict_fn ──────────────────────────────────────────────
         st         = self.smoothtype
@@ -455,9 +479,8 @@ class Spectrum(Observation):
         fit_lo     = self.fit_sigma_smooth and has_losvd
 
         if not has_instr and not has_losvd:
-            # No smoothing: pure interpolation via _H.
-            _H = self._H
-            self._predict_fn = lambda spec: _H @ spec
+            # No smoothing: pure interpolation via _H, materialised on first call.
+            self._predict_fn = lambda spec: self._H @ spec
 
         else:
             # ── Trim model grid to observed wavelength range ────────────
@@ -585,6 +608,8 @@ class Spectrum(Observation):
                     sigma_v_t = self._resolution_as_sigma()
                     if not auto or all_nan:
                         _in = 0.0 if all_nan else float(self.inres)
+                        _sig_tgt_lam = sigma_v_t * _sig_lam
+                        _sig_lib_lam = _in * _sig_lam
                         _instr_sm = make_vel_smoother(
                             _wm_trim, wo, inres=_in)
                         _apply_instr = (lambda spec_trim, _sm=_instr_sm,
@@ -593,6 +618,8 @@ class Spectrum(Observation):
                                          np.full(1, _in), "km/s")
                     elif _flat(sig_v_lib):
                         _in = float(sig_v_lib[np.isfinite(sig_v_lib)][0])
+                        _sig_tgt_lam = sigma_v_t * _sig_lam
+                        _sig_lib_lam = _in * _sig_lam
                         _instr_sm = make_vel_smoother(_wm_trim, wo, inres=_in)
                         _apply_instr = (lambda spec_trim, _sm=_instr_sm,
                                         _sv=sigma_v_t: _sm(spec_trim, _sv))
@@ -604,6 +631,7 @@ class Spectrum(Observation):
                         # and library.
                         tgt = sigma_v_t * _sig_lam
                         lib = sig_v_lib * _sig_lam
+                        _sig_tgt_lam, _sig_lib_lam = tgt, lib
                         _instr_sm = make_lsf_smoother(
                             _wm_trim, tgt, wo, inres=lib)
                         _apply_instr = (lambda spec_trim, _sm=_instr_sm:
@@ -615,6 +643,8 @@ class Spectrum(Observation):
                     sigma_l_t = self._resolution_as_sigma()
                     if not auto or all_nan:
                         _in = 0.0 if all_nan else float(self.inres)
+                        _sig_tgt_lam = np.full_like(_wm_trim, sigma_l_t)
+                        _sig_lib_lam = np.full_like(_wm_trim, _in)
                         _instr_sm = make_wave_smoother(
                             _wm_trim, wo, inres=_in)
                         _apply_instr = (lambda spec_trim, _sm=_instr_sm,
@@ -626,6 +656,7 @@ class Spectrum(Observation):
                         # → always wavelength-dependent in λ: LSF route.
                         tgt = np.full_like(_wm_trim, sigma_l_t)
                         lib = sig_v_lib * _sig_lam
+                        _sig_tgt_lam, _sig_lib_lam = tgt, lib
                         _instr_sm = make_lsf_smoother(
                             _wm_trim, tgt, wo, inres=lib)
                         _apply_instr = (lambda spec_trim, _sm=_instr_sm:
@@ -639,6 +670,8 @@ class Spectrum(Observation):
                     sigma_lsf_trim = np.interp(_wm_trim, wo, res_obs)
                     if not auto or all_nan:
                         lib = 0.0 if all_nan else float(self.inres)
+                        _sig_tgt_lam = sigma_lsf_trim
+                        _sig_lib_lam = np.full_like(_wm_trim, lib)
                         _instr_sm = make_lsf_smoother(
                             _wm_trim, sigma_lsf_trim, wo, inres=lib)
                         self._warn_floor(sigma_lsf_trim,
@@ -646,6 +679,7 @@ class Spectrum(Observation):
                                          "AA", _wm_trim)
                     else:
                         lib = sig_v_lib * _sig_lam
+                        _sig_tgt_lam, _sig_lib_lam = sigma_lsf_trim, lib
                         _instr_sm = make_lsf_smoother(
                             _wm_trim, sigma_lsf_trim, wo, inres=lib)
                         self._warn_floor(sigma_lsf_trim, lib, "AA", _wm_trim)
@@ -653,22 +687,19 @@ class Spectrum(Observation):
                                     _sm(spec_trim))
 
                 # ── One wrapper set for every smoothtype ──────────────────
+                # With a free LOSVD the total width is traced, so the two
+                # stages stay chained.  Otherwise every width is known now and
+                # the whole chain collapses into one Gaussian (see _smoothing).
                 if fit_lo:
                     _Lrt = _apply_losvd_rt
                     self._predict_fn = (
                         lambda spec, sigma_lo, _A=_apply_instr, _L=_Lrt:
                             _A(_L(spec[_idx], sigma_lo))
                     )
-                elif has_losvd:
-                    _L = _apply_losvd
-                    self._predict_fn = (
-                        lambda spec, _A=_apply_instr, _L=_L:
-                            _A(_L(spec[_idx]))
-                    )
                 else:
-                    self._predict_fn = (
-                        lambda spec, _A=_apply_instr: _A(spec[_idx])
-                    )
+                    _S = self._build_static_smoother(
+                        _wm_trim, wo, _sig_tgt_lam, _sig_lib_lam, has_losvd)
+                    self._predict_fn = lambda spec, _S=_S: _S(spec[_idx])
 
             else:
                 # LOSVD only (no instrumental smoothing); _apply_losvd
@@ -680,8 +711,32 @@ class Spectrum(Observation):
                             _L(spec[_idx], sigma_lo)
                     )
                 else:
-                    _L = _apply_losvd
-                    self._predict_fn = lambda spec, _L=_L: _L(spec[_idx])
+                    _S = self._build_static_smoother(
+                        _wm_trim, wo, None, None, has_losvd)
+                    self._predict_fn = lambda spec, _S=_S: _S(spec[_idx])
+
+    def _build_static_smoother(self, wave_trim, wave_out, sigma_target,
+                               sigma_library, has_losvd):
+        """Collapse the whole static smoothing chain into one Gaussian.
+
+        Gaussians compose in quadrature, so a LOSVD followed by an
+        instrumental LSF is one Gaussian of the combined width at each
+        wavelength.  Doing it in one convolution removes a resample -> FFT ->
+        resample round trip, and is measurably closer to a direct dense
+        convolution than chaining the two stages.
+
+        Records ``self.smoother_grid_size`` for diagnostics.
+        """
+        sigma_total = combined_sigma_lambda(
+            wave_trim,
+            sigma_target,
+            self.sigma_losvd if has_losvd else None,
+            sigma_library,
+        )
+        smoother = make_static_smoother(wave_trim, sigma_total, wave_out)
+        self.smoother_grid_size = smoother.grid_size
+        self.smoother_sigma_lambda = sigma_total
+        return smoother
 
     def predict(self, spectrum, wave_model, sigma_smooth=None):
         """
