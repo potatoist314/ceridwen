@@ -900,8 +900,13 @@ class CSPBasis_afe:
         never drift out of sync with the flux cube.
         """
         target_afe = jnp.ravel(theta["afe"])[0]
+        # method='compare_all': identical result by the jnp.searchsorted
+        # contract, but lowers to one fused compare-reduce instead of a
+        # sequential while loop (4 kernels for a 5-element grid).
         k = jnp.clip(
-            jnp.searchsorted(self.afe_grid, target_afe, side='left'),
+            jnp.searchsorted(
+                self.afe_grid, target_afe, side='left', method='compare_all'
+            ),
             1, self._n_afe - 1,
         )
         a0 = self.afe_grid[k - 1]
@@ -951,7 +956,9 @@ class CSPBasis_afe:
 
         target_z = jnp.ravel(theta["Z"])[0]
         z_hi = jnp.clip(
-            jnp.searchsorted(self.zmet, target_z, side="left"),
+            jnp.searchsorted(
+                self.zmet, target_z, side="left", method="compare_all"
+            ),
             1,
             self._n_z - 1,
         )

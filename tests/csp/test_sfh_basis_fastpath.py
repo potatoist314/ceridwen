@@ -200,6 +200,9 @@ def test_fastpath_hlo_excludes_age_cube_shapes(models):
     ):
         assert excluded not in stablehlo
     assert "tensor<5x13x8x11xf32>" in stablehlo
+    # compare_all searchsorted and the corner dynamic_slice must not lower
+    # to sequential loops.
+    assert "stablehlo.while" not in stablehlo
 
 
 @pytest.mark.parametrize(
