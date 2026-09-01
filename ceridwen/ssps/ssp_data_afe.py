@@ -367,7 +367,11 @@ class SSPDataAfe:
             ssp_lgmet      = jnp.array(f['ssp_lgmet'][:])
             ssp_lg_age_gyr = jnp.array(f['ssp_lg_age_gyr'][:])
             ssp_wave       = jnp.array(f['ssp_wave'][:])
-            ssp_flux       = jnp.array(f['ssp_flux'][:])
+            # Host NumPy, deliberately: under x64 a jnp.array here puts the
+            # full float64 cube (611 MB for the published grid) on the
+            # device, where nothing ever reads it -- the CSP keeps only a
+            # float32 copy. save() round-trips float64 unchanged.
+            ssp_flux       = np.asarray(f['ssp_flux'][:])
             ssp_resolution = np.asarray(f['ssp_resolution'][:],
                                         dtype=np.float64)
 

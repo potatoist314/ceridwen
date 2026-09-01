@@ -324,7 +324,10 @@ class CSPBasis_afe:
         # grid (n_afe == 1, AFE_FLAG=0 null model) is still valid; the
         # static self._n_afe == 1 branch in _flux_at_afe then compiles the
         # interpolation away entirely.
-        _flux_in = jnp.asarray(SSPData.ssp_flux)
+        # Host NumPy on purpose: jnp.asarray would put the float64 cube on
+        # the device only for the float32 cast below to copy it again. The
+        # cast happens on the host and one 306 MB float32 cube is uploaded.
+        _flux_in = np.asarray(SSPData.ssp_flux)
         _afe_in  = getattr(SSPData, "ssp_afe", None)
         if _flux_in.ndim != 4 or _afe_in is None:
             raise TypeError(
