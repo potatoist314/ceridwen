@@ -760,7 +760,7 @@ class CSPBasis_afe:
         # runtime-only scalars read by predict / get_line_spec.
         self._known_theta_keys = set(self.param_names) | {
             'lookback_time', 'Z', 'zh', 'afe',
-            'logmass', 'zred', 'igm_factor',
+            'logmass', 'zred', 'igm_factor', 'flux_factor',
             'sigma_smooth', 'frac_obrun', 'spectrum_scaling',
         }
 
@@ -1306,7 +1306,12 @@ class CSPBasis_afe:
         if "zred" in theta:
             from ..cosmology import flux_factor_maggies
             z_scalar = jnp.ravel(theta["zred"])[0]
-            ff = jnp.float32(flux_factor_maggies(z_scalar, self.cosmo))
+            if "flux_factor" in theta:
+                # Hoisted constant for a fixed redshift (SedModel injects
+                # it); skips the per-call luminosity-distance quadrature.
+                ff = jnp.ravel(theta["flux_factor"])[0].astype(jnp.float32)
+            else:
+                ff = jnp.float32(flux_factor_maggies(z_scalar, self.cosmo))
             spectrum_phot = spectrum_phot * ff
             spectrum_slit = spectrum_slit * ff
             line_slit     = line_slit     * ff

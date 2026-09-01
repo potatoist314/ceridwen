@@ -291,6 +291,22 @@ class SedModel:
             except Exception:
                 # Non-fatal: fall through to the native backend.
                 self.flux_factor_astropy = None
+        # For a fixed redshift the flux factor is a constant, so the
+        # 129-node quadrature inside flux_factor_maggies must not run in
+        # the compiled hot path (~10 kernels per likelihood call).
+        # Compute it once here with the native backend through jit, so the
+        # value matches a compiled per-call evaluation, and inject it into
+        # theta in predict(). The free-z path never sees this constant.
+        self._flux_factor_fixed = None
+        if self._zred_fixed is not None:
+            import jax
+
+            from ..cosmology import flux_factor_maggies
+
+            ff_native = jax.jit(
+                lambda z: flux_factor_maggies(z, self.cosmo)
+            )(self._zred_fixed[0])
+            self._flux_factor_fixed = jnp.float32(ff_native)
 
     # ------------------------------------------------------------------
     # Cosmology (read-only view onto the CSP)
@@ -402,6 +418,10 @@ class SedModel:
             if model_theta is theta:          # apply_transforms may not copy
                 model_theta = dict(model_theta)
             model_theta["zred"] = self._zred_fixed
+            if self._flux_factor_fixed is not None:
+                # Constant flux factor for the fixed redshift; the CSP
+                # skips the per-call quadrature when this key is present.
+                model_theta["flux_factor"] = self._flux_factor_fixed
         # Mass scaling is handled inside csp.predict() — the spectrum is
         # scaled once before projection, rather than per-observation.
         return self.csp.predict(model_theta, self.observations)
