@@ -8,8 +8,20 @@ from .stellar_indices import (
     StellarIndices,
 )
 from .gp import GaussianProcess
+from .absorption_features import (
+    ABSORPTION_FEATURES,
+    AbsorptionFeature,
+    absorption_feature_mask,
+    feature_windows,
+    select_features,
+)
 
 __all__ = [
+    "ABSORPTION_FEATURES",
+    "AbsorptionFeature",
+    "absorption_feature_mask",
+    "feature_windows",
+    "select_features",
     "Observation",
     "Photometry",
     "Spectrum",

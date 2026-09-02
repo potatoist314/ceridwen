@@ -871,6 +871,83 @@ class Spectrum(Observation):
             dlam     = lam0_obs * dv / c_kms
             self.mask_wavelength_range(lam0_obs - dlam, lam0_obs + dlam)
 
+    def select_absorption_features(self, features=None, zred=0.0,
+                                   window_kms=1000.0, mode="drop",
+                                   downweight=10.0):
+        """
+        Restrict the likelihood to stellar absorption features.
+
+        Builds an observed-frame pixel mask from
+        ``ceridwen.observation.absorption_features`` (rest-frame Lick
+        bandpasses and line centres, converted to vacuum and redshifted by
+        ``1 + zred``) and applies it in one of two ways:
+
+        ``mode="drop"``
+            Pixels outside every feature window leave the likelihood:
+            ``self.mask &= in_feature``.  Continuum-shape information is
+            removed from the spectrum entirely.
+        ``mode="downweight"``
+            Every pixel stays, but ``self.uncertainty`` outside the windows
+            is multiplied by ``downweight`` (> 1), so each continuum pixel
+            counts ``1 / downweight**2`` as much.  A fitted fractional
+            calibration term (``DiagonalNoiseModel(use_fractional=True)``)
+            still adds in quadrature on top of the inflated sigma.
+
+        Parameters
+        ----------
+        features : iterable of str or AbsorptionFeature, optional
+            Feature names, group names (``"balmer"``, ``"fe"``, ...) or
+            feature objects.  Default: the whole catalogue.
+        zred : float
+            Redshift applied to the rest-frame windows.
+        window_kms : float
+            Half-width [km/s] of the window around a line-centre entry.
+            Band entries use their bandpass and ignore it.
+        mode : {"drop", "downweight"}
+        downweight : float
+            Sigma inflation factor for ``mode="downweight"``; must be > 1.
+
+        Returns
+        -------
+        in_feature : np.ndarray of bool, shape (n_pix,)
+            True for pixels inside a feature window (before combination with
+            the existing mask).  Also stored as ``self.feature_mask``; the
+            settings are stored in ``self.pixel_selection``.
+        """
+        from .absorption_features import absorption_feature_mask, select_features
+
+        if mode not in {"drop", "downweight"}:
+            raise ValueError(f"mode must be 'drop' or 'downweight', got {mode!r}")
+        if mode == "downweight" and not float(downweight) > 1.0:
+            raise ValueError(f"downweight must be > 1, got {downweight!r}")
+        if self._wavelength is None:
+            raise RuntimeError("select_absorption_features needs a wavelength grid")
+        resolved = select_features(features)
+        in_feature = absorption_feature_mask(
+            np.asarray(self._wavelength), zred=zred, features=resolved,
+            window_kms=window_kms,
+        )
+        if mode == "drop":
+            new_mask = np.asarray(self.mask) & in_feature
+            if not new_mask.any():
+                raise ValueError(
+                    "select_absorption_features: no fitted pixels fall inside "
+                    "an absorption-feature window at this redshift"
+                )
+            self.mask = jnp.asarray(new_mask)
+        else:
+            factor = np.where(in_feature, 1.0, float(downweight))
+            self.uncertainty = self.uncertainty * jnp.asarray(factor)
+        self.feature_mask = in_feature
+        self.pixel_selection = {
+            "mode": mode,
+            "window_kms": float(window_kms),
+            "downweight": float(downweight) if mode == "downweight" else None,
+            "features": [f.name for f in resolved],
+            "n_feature_pixels": int(np.sum(np.asarray(self.mask) & in_feature)),
+        }
+        return in_feature
+
     # ------------------------------------------------------------------
     def _sky_corrected_data(self):
         """Return sky-subtracted flux (or raw flux if no sky is set)."""
