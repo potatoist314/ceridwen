@@ -1013,17 +1013,21 @@ class Spectrum(Observation):
 
     def fit_polynomial_calibration(self, model_flux, order: int = 3):
         """
-        Analytically fit a Chebyshev multiplicative calibration polynomial
-        P(λ) such that ``data ≈ P(λ) × model_flux``.
+        Fit a Chebyshev multiplicative calibration polynomial
+        P(λ) such that ``data ≈ P(λ) × model_flux`` (post-hoc helper).
 
-        The polynomial coefficients are solved at each call via weighted
-        linear least squares, making this suitable for marginalising out the
-        calibration at every likelihood evaluation without a parameter-space
-        penalty.
+        This is the same weighted least-squares solve that
+        :class:`ceridwen.likelihood.PolynomialCalibration` performs inside
+        the jitted likelihood when it is passed as
+        ``DiagonalGaussianLikelihood(calibration=...)``; use that for
+        marginalising the calibration during sampling, and this method for
+        inspecting a finished fit.  The constant term is fitted here
+        (``fit_constant=True``), so the returned polynomial also carries any
+        overall normalisation offset.
 
         The polynomial is evaluated in a normalised wavelength coordinate
-        :math:`x \\in [-1, 1]` using Chebyshev basis functions
-        :math:`T_n(x)`, which are numerically stable for high orders.
+        :math:`x \\in [-1, 1]` over the *unmasked* pixel range using
+        Chebyshev basis functions :math:`T_n(x)`.
 
         Parameters
         ----------
@@ -1035,7 +1039,7 @@ class Spectrum(Observation):
         Returns
         -------
         coeffs : np.ndarray, shape (order + 1,)
-            Chebyshev polynomial coefficients.
+            Chebyshev coefficients ``c_n`` of ``P(x) = sum_n c_n T_n(x)``.
         calibrated_flux : jnp.ndarray, shape (n_pix,)
             ``P(λ) × model_flux`` — the calibration-corrected model
             prediction to be compared with ``self.flux``.
@@ -1045,36 +1049,19 @@ class Spectrum(Observation):
         Only unmasked pixels enter the least-squares fit.  The returned
         ``calibrated_flux`` is evaluated over the full pixel grid.
         """
-        mf     = np.asarray(model_flux, dtype=np.float64)
-        data   = np.asarray(self._sky_corrected_data(), dtype=np.float64)
-        sigma  = np.asarray(self.uncertainty, dtype=np.float64)
-        wav    = np.asarray(self._wavelength,  dtype=np.float64)
-        mask   = np.asarray(self.mask,         dtype=bool)
+        from ..likelihood.calibration import PolynomialCalibration
 
-        # Normalise wavelength axis to [-1, 1] for numerical stability
-        wav_mid  = 0.5 * (wav.max() + wav.min())
-        wav_half = 0.5 * (wav.max() - wav.min())
-        x        = (wav - wav_mid) / (wav_half if wav_half > 0 else 1.0)
-
-        # Chebyshev design matrix: A[i, n] = T_n(x_i)
-        A = np.polynomial.chebyshev.chebvander(x, order)  # (n_pix, order+1)
-
-        # Weight by model flux and 1/sigma so we minimise
-        # sum_mask ((data_i - P(x_i) * model_i) / sigma_i)^2
-        A_w = (A * mf[:, None]) / sigma[:, None]   # (n_pix, order+1)
-        y_w = data / sigma                          # (n_pix,)
-
-        # Apply mask
-        A_wm = A_w[mask]
-        y_wm = y_w[mask]
-
-        # Solve linear least squares
-        coeffs, _, _, _ = np.linalg.lstsq(A_wm, y_wm, rcond=None)
-
-        # Evaluate calibration polynomial on the full pixel grid
-        poly_vals       = A @ coeffs                      # (n_pix,)
-        calibrated_flux = jnp.asarray(poly_vals * mf)
-
+        cal = PolynomialCalibration.from_spectrum(
+            self, order=order, fit_constant=True
+        )
+        calibrated_flux, deviations, _ = cal.calibrate(
+            self._sky_corrected_data(), jnp.asarray(model_flux, dtype=float),
+            self.uncertainty, self.mask,
+        )
+        # ``calibrate`` parametrises P = 1 + sum_n a_n T_n; report the
+        # absolute Chebyshev coefficients c_n (c_0 = 1 + a_0).
+        coeffs = np.asarray(deviations, dtype=np.float64).copy()
+        coeffs[0] += 1.0
         return coeffs, calibrated_flux
 
     # ------------------------------------------------------------------
