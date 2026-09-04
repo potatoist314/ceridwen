@@ -139,6 +139,17 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         ``checkpoint_dir`` → ``$CERIDWEN_CHECKPOINT_DIR`` →
         ``$CERIDWEN_RESCUE_DIR``; when none is set, checkpointing is
         silently skipped (no surprise writes).
+    checkpoint_frame_fn : callable, optional
+        Function that receives a bounded, equal-weight posterior sample and
+        returns a compact serialisable visualization payload.  Periodic and
+        final frames are retained separately from the overwritten recovery
+        checkpoint, so a later tool can show the actual inference history.
+    checkpoint_frame_draws : int, optional
+        Maximum equal-weight posterior draws retained per frame.  Default 128.
+    checkpoint_frame_limit : int, optional
+        Maximum compact frames retained for one process.  Default 64.
+    checkpoint_frame_max_bytes : int, optional
+        Maximum serialised size of one compact frame.  Default 2 MiB.
     """
 
     def __init__(
@@ -151,6 +162,10 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         verbose         : bool  = True,
         checkpoint_interval_s : float = 1200.0,
         checkpoint_dir        : Optional[str] = None,
+        checkpoint_frame_fn   : Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+        checkpoint_frame_draws: int = 128,
+        checkpoint_frame_limit: int = 64,
+        checkpoint_frame_max_bytes: int = 2 * 1024 * 1024,
     ):
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
@@ -171,6 +186,10 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         # pickle, so :meth:`load_checkpoint` recovers either.
         self.checkpoint_interval_s = float(checkpoint_interval_s)
         self._checkpoint_dir       = checkpoint_dir
+        self.checkpoint_frame_fn   = checkpoint_frame_fn
+        self.checkpoint_frame_draws = int(checkpoint_frame_draws)
+        self.checkpoint_frame_limit = int(checkpoint_frame_limit)
+        self.checkpoint_frame_max_bytes = int(checkpoint_frame_max_bytes)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -260,16 +279,91 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 or os.environ.get("CERIDWEN_CHECKPOINT_DIR")
                 or os.environ.get("CERIDWEN_RESCUE_DIR"))
 
+    @staticmethod
+    def _equal_weight_checkpoint_draws(snapshot, max_draws):
+        """Return a deterministic, bounded posterior sample and its ESS."""
+        import numpy as _np
+        from anesthetic import NestedSamples
+
+        names = list(snapshot["positions"])
+        blocks = [
+            _np.asarray(snapshot["positions"][name]).reshape(
+                snapshot["n_dead"], -1
+            )
+            for name in names
+        ]
+        nested = NestedSamples(
+            data=_np.hstack(blocks),
+            logL=_np.asarray(snapshot["loglikelihood"]),
+            logL_birth=_np.asarray(snapshot["loglikelihood_birth"]),
+            logzero=float("nan"),
+        )
+        log_weights = _np.asarray(nested.logw(), dtype=float)
+        weights = _np.exp(log_weights - _np.max(log_weights))
+        weights /= weights.sum()
+        count = min(int(max_draws), snapshot["n_dead"])
+        targets = (_np.arange(count, dtype=float) + 0.5) / count
+        indices = _np.searchsorted(_np.cumsum(weights), targets, side="left")
+        draws = {
+            name: _np.asarray(values)[indices]
+            for name, values in snapshot["positions"].items()
+        }
+        ess = float(1.0 / _np.sum(weights**2))
+        return draws, ess
+
+    def _dump_checkpoint_frame(self, ckpt_dir, snapshot, progress, *, partial):
+        """Write one compact, size-limited posterior frame for visualization."""
+        import glob as _glob
+        import pickle as _pickle
+
+        if self.checkpoint_frame_draws <= 0 or self.checkpoint_frame_limit <= 0:
+            return None
+        draws, ess = self._equal_weight_checkpoint_draws(
+            snapshot, self.checkpoint_frame_draws
+        )
+        frame = {
+            "schema_version": 1,
+            "partial": bool(partial),
+            "positions": draws,
+            "n_draws": len(next(iter(draws.values()))),
+            "ess": ess,
+            "progress": dict(progress),
+        }
+        if self.checkpoint_frame_fn is not None:
+            frame["spectrum"] = self.checkpoint_frame_fn(draws)
+        encoded = _pickle.dumps(frame, protocol=_pickle.HIGHEST_PROTOCOL)
+        if len(encoded) > self.checkpoint_frame_max_bytes:
+            raise ValueError(
+                "checkpoint visualization frame is "
+                f"{len(encoded)} bytes; limit is {self.checkpoint_frame_max_bytes}"
+            )
+        state = "partial" if partial else "final"
+        path = os.path.join(
+            ckpt_dir,
+            f"ns_checkpoint_frame_{os.getpid()}_"
+            f"{int(progress['iteration']):06d}_{state}.pkl",
+        )
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as handle:
+            handle.write(encoded)
+        os.replace(tmp, path)
+
+        pattern = os.path.join(
+            ckpt_dir, f"ns_checkpoint_frame_{os.getpid()}_*.pkl"
+        )
+        for old_path in sorted(_glob.glob(pattern))[:-self.checkpoint_frame_limit]:
+            os.remove(old_path)
+        return path
+
     def _dump_snapshot(self, ckpt_dir, live, dead_list, ns_utils, logZ,
-                       *, tag, partial):
+                       *, tag, partial, progress):
         """Atomically pickle a finalised snapshot of the run so far.
 
-        Format matches the end-of-run rescue pickle:
-        ``{positions, loglikelihood, loglikelihood_birth, logZ, n_dead,
-        partial}``.  ``partial=True`` marks a mid-run checkpoint (the run had
-        not converged).  Best-effort: never let a checkpoint break the run.
-        Atomic via write-to-temp + os.replace so a kill mid-write cannot
-        corrupt an existing checkpoint.
+        Schema 2 adds progress metadata to the legacy recovery keys.  A
+        ``partial=True`` snapshot marks a run that had not converged.
+        Best-effort: never let a checkpoint break the run.  Atomic via
+        write-to-temp + os.replace so a kill mid-write cannot corrupt an
+        existing checkpoint.
         """
         try:
             import pickle as _pickle
@@ -282,15 +376,24 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             path = os.path.join(ckpt_dir, fname)
             tmp = path + ".tmp"
             with open(tmp, "wb") as fh:
-                _pickle.dump({
+                snapshot = {
+                    "schema_version": 2,
                     "positions": {k: _np.asarray(v) for k, v in pos.items()},
                     "loglikelihood": _np.asarray(logl),
                     "loglikelihood_birth": _np.asarray(logl_birth),
                     "logZ": float(logZ),
                     "n_dead": int(_np.asarray(logl).shape[0]),
                     "partial": bool(partial),
-                }, fh)
+                    "progress": dict(progress),
+                }
+                _pickle.dump(snapshot, fh)
             os.replace(tmp, path)
+            try:
+                self._dump_checkpoint_frame(
+                    ckpt_dir, snapshot, progress, partial=partial
+                )
+            except Exception as exc:                              # noqa: BLE001
+                print(f"  [{tag}] WARNING: visualization frame failed: {exc}")
             return path
         except Exception as exc:                                  # noqa: BLE001
             print(f"  [{tag}] WARNING: snapshot failed: {exc}")
@@ -496,9 +599,22 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 # wall-time kill / node crash mid-run is recoverable.
                 if _ckpt_on and (time.perf_counter() - _last_ckpt
                                  >= self.checkpoint_interval_s):
+                    _progress = {
+                        "iteration": _iter,
+                        "n_likelihood_calls": n_like_calls,
+                        "n_discarded": num_delete * _iter,
+                        "n_live": self.num_live,
+                        "num_delete": num_delete,
+                        "num_inner_steps": num_inner_steps,
+                        "logZ": _logZ,
+                        "logZ_live": _logZ_live,
+                        "delta_logZ": _logZ_live - _logZ,
+                        "elapsed_s": time.perf_counter() - t_start,
+                    }
                     _p = self._dump_snapshot(
                         _ckpt_dir, live, dead_list, ns_utils,
-                        _logZ, tag="checkpoint", partial=True)
+                        _logZ, tag="checkpoint", partial=True,
+                        progress=_progress)
                     _last_ckpt = time.perf_counter()
                     if _p and self.verbose:
                         print(f"  [checkpoint] iter {_iter}: {_p}", flush=True)
@@ -528,8 +644,21 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         # fully-converged snapshot.
         _rescue_dir = self._resolve_ckpt_dir()
         if _rescue_dir:
+            _progress = {
+                "iteration": _iter,
+                "n_likelihood_calls": n_like_calls,
+                "n_discarded": num_delete * _iter,
+                "n_live": self.num_live,
+                "num_delete": num_delete,
+                "num_inner_steps": num_inner_steps,
+                "logZ": _get_logZ(live),
+                "logZ_live": _get_logZ_live(live),
+                "delta_logZ": _get_logZ_live(live) - _get_logZ(live),
+                "elapsed_s": wall_time,
+            }
             self._dump_snapshot(_rescue_dir, live, dead_list, ns_utils,
-                                _get_logZ(live), tag="rescue", partial=False)
+                                _get_logZ(live), tag="rescue", partial=False,
+                                progress=_progress)
 
         # ── Evidence & importance weights (anesthetic preferred) ─────────
         log_Z        = float(_get_logZ(live))

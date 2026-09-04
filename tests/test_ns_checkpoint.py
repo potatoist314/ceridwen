@@ -53,17 +53,25 @@ def test_periodic_checkpoint_and_rescue(tmp_path):
     res = ad.run(loglike, logprior, theta_init, jax.random.PRNGKey(0))
     assert np.isfinite(float(res.log_evidence))
 
-    ckpts = glob.glob(os.path.join(tmp_path, "ns_checkpoint_*.pkl"))
+    ckpts = glob.glob(os.path.join(tmp_path, "ns_checkpoint_[0-9]*.pkl"))
     rescues = glob.glob(os.path.join(tmp_path, "ns_raw_dead_*.pkl"))
     assert ckpts, "no periodic checkpoint written"
     assert rescues, "no end-of-run rescue pickle written"
 
     # Partial checkpoint is a complete, loadable snapshot.
     d = BlackJAXNestedSamplerAdapter.load_checkpoint(ckpts[0])
+    assert d["schema_version"] == 2
     assert d["partial"] is True
     assert d["n_dead"] > 0
     assert set(d["positions"]) == {"x", "y", "z"}
     assert np.isfinite(d["logZ"])
+    assert d["progress"]["iteration"] > 0
+    assert d["progress"]["n_likelihood_calls"] > 0
+    frames = glob.glob(os.path.join(tmp_path, "ns_checkpoint_frame_*.pkl"))
+    assert frames
+    frame = BlackJAXNestedSamplerAdapter.load_checkpoint(frames[0])
+    assert frame["n_draws"] <= 128
+    assert np.isfinite(frame["ess"])
     # Rescue is the same format, flagged converged.
     assert BlackJAXNestedSamplerAdapter.load_checkpoint(rescues[0])["partial"] is False
 
@@ -79,7 +87,7 @@ def test_checkpoint_recovers_a_posterior(tmp_path):
     ad.run(loglike, logprior, theta_init, jax.random.PRNGKey(0))
 
     ck = BlackJAXNestedSamplerAdapter.load_checkpoint(
-        glob.glob(os.path.join(tmp_path, "ns_checkpoint_*.pkl"))[0])
+        glob.glob(os.path.join(tmp_path, "ns_checkpoint_[0-9]*.pkl"))[0])
     data = np.column_stack([ck["positions"][k].reshape(ck["n_dead"], -1)
                             for k in ("x", "y", "z")])
     ns = anesthetic.NestedSamples(
@@ -100,6 +108,28 @@ def test_checkpoint_disabled_when_no_dir(tmp_path, monkeypatch):
     ad.run(loglike, logprior, theta_init, jax.random.PRNGKey(0))
     assert ad._resolve_ckpt_dir() is None
     assert not glob.glob(os.path.join(tmp_path, "*.pkl"))
+
+
+def test_load_checkpoint_accepts_legacy_snapshot(tmp_path):
+    import pickle
+
+    path = tmp_path / "legacy.pkl"
+    legacy = {
+        "positions": {"x": np.zeros((2, 1))},
+        "loglikelihood": np.zeros(2),
+        "loglikelihood_birth": np.full(2, -1.0),
+        "logZ": 0.0,
+        "n_dead": 2,
+        "partial": True,
+    }
+    with path.open("wb") as handle:
+        pickle.dump(legacy, handle)
+
+    loaded = BlackJAXNestedSamplerAdapter.load_checkpoint(path)
+    assert loaded.keys() == legacy.keys()
+    assert loaded["partial"] is True
+    assert loaded["n_dead"] == 2
+    np.testing.assert_array_equal(loaded["positions"]["x"], legacy["positions"]["x"])
 
 
 if __name__ == "__main__":
