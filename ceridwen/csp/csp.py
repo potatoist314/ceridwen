@@ -1400,13 +1400,20 @@ class CSPBasis:
                 out[obs.name] = obs.predict_at_redshift(
                     spec_for_obs, self.wave, jnp.ravel(theta["zred"])[0]
                 )
-            elif (isinstance(obs, _Spectrum)
-                  and getattr(obs, "fit_sigma_smooth", False)
-                  and "sigma_smooth" in theta):
-                pred = obs.predict(
-                    spec_for_obs, self.wave,
-                    sigma_smooth=jnp.ravel(theta["sigma_smooth"])[0],
-                )
+            elif isinstance(obs, _Spectrum) and (
+                    (getattr(obs, "fit_sigma_smooth", False)
+                     and "sigma_smooth" in theta)
+                    or (getattr(obs, "free_z", False) and free_z_in_theta)):
+                # Runtime LOSVD and/or runtime redshift for the Spectrum.
+                # Both flags are static Python attributes, so the kwargs
+                # dict is fixed at trace time.
+                kw = {}
+                if (getattr(obs, "fit_sigma_smooth", False)
+                        and "sigma_smooth" in theta):
+                    kw["sigma_smooth"] = jnp.ravel(theta["sigma_smooth"])[0]
+                if getattr(obs, "free_z", False) and free_z_in_theta:
+                    kw["zred"] = jnp.ravel(theta["zred"])[0]
+                pred = obs.predict(spec_for_obs, self.wave, **kw)
                 out[obs.name] = (pred * spectrum_scaling.astype(pred.dtype)
                                  if spectrum_scaling is not None else pred)
             else:

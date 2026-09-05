@@ -158,6 +158,7 @@ class Spectrum(Observation):
         noise_floor  = 0.0,
         sigma_losvd  = None,
         fit_sigma_smooth = False,
+        free_z       = False,
         **kwargs,
     ):
         """
@@ -216,6 +217,17 @@ class Spectrum(Observation):
             expert override, ALWAYS a Gaussian σ (never FWHM), in km/s for
             "vel"/"R" and Å for "lambda"/"lsf"; 0.0 disables the
             subtraction entirely.
+
+        free_z : bool, optional
+            Let ``predict`` take a runtime ``zred``.  The redshift given to
+            ``setup_for_model`` stays baked into the projection; a
+            different ``zred`` is applied afterwards by reading the baked
+            prediction at the stretched observed wavelength
+            ``λ_obs (1 + z_setup) / (1 + zred)``.  Every kernel in
+            ``setup_for_model`` is velocity-shift-invariant, so this is the
+            exact prediction at ``zred`` up to linear interpolation between
+            observed pixels.  ``CSPBasis.predict`` threads ``theta["zred"]``
+            in when this flag is set.
         """
         # Store wavelength via the property setter so subclasses can override.
         self._wavelength    = (
@@ -278,6 +290,7 @@ class Spectrum(Observation):
             sigma_losvd = 200.0
         self.sigma_losvd     = (None if sigma_losvd is None
                                 else float(sigma_losvd))
+        self.free_z          = bool(free_z)
 
         super().__init__(
             flux        = flux,
@@ -446,6 +459,7 @@ class Spectrum(Observation):
             )
         wm_rest = np.asarray(wave_model, dtype=np.float64)
         opz = 1.0 + float(zred)
+        self._zred_setup = float(zred)
         wm = opz * wm_rest
         wo = np.asarray(self._wavelength, dtype=np.float64)
         n_wave = len(wm)
@@ -738,7 +752,7 @@ class Spectrum(Observation):
         self.smoother_sigma_lambda = sigma_total
         return smoother
 
-    def predict(self, spectrum, wave_model, sigma_smooth=None):
+    def predict(self, spectrum, wave_model, sigma_smooth=None, zred=None):
         """
         Project the model spectrum onto the observed pixel grid, applying
         instrumental smoothing if configured.
@@ -772,6 +786,12 @@ class Spectrum(Observation):
             ``sigma_losvd`` baked at ``setup_for_model`` time is used
             instead).  Passing the value from ``theta`` makes the LOSVD
             differentiable and fittable inside JIT/SVI/NUTS.
+        zred : jax.Array scalar, optional
+            Runtime redshift.  Only accepted when this Spectrum was
+            constructed with ``free_z=True``.  The prediction baked at the
+            ``setup_for_model`` redshift is read at the stretched observed
+            wavelength ``λ_obs (1 + z_setup) / (1 + zred)``; the two
+            outermost pixels on each side hold the edge value.
 
         Returns
         -------
@@ -801,8 +821,24 @@ class Spectrum(Observation):
             # Forcing float32 here would round-trip-degrade the smoother
             # output even when the user is fitting in double precision.
             sv = jnp.asarray(sigma_smooth).reshape(())
-            return self._predict_fn(spectrum, sv)
-        return self._predict_fn(spectrum)
+            mu = self._predict_fn(spectrum, sv)
+        else:
+            mu = self._predict_fn(spectrum)
+        if zred is None:
+            return mu
+        if not self.free_z:
+            raise TypeError(
+                "Spectrum.predict() got zred= but this Spectrum was built "
+                "with free_z=False; pass free_z=True at construction to "
+                "move the spectral lines with a sampled redshift."
+            )
+        # Redshift is a multiplicative stretch of the wavelength axis, and
+        # the smoothing kernels are velocity-shift-invariant, so the
+        # prediction at ``zred`` is the baked prediction sampled at the
+        # rescaled observed wavelengths.
+        wo = self._wavelength
+        stretch = (1.0 + self._zred_setup) / (1.0 + jnp.asarray(zred).reshape(()))
+        return jnp.interp(wo * stretch, wo, mu)
 
     # ------------------------------------------------------------------
     def synthetic_photometry(self, filterset):
