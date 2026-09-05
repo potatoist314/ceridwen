@@ -188,7 +188,7 @@ class Spectrum(Observation):
                 inside ``setup_for_model``.
             ``None`` (default)
                 No smoothing applied; ``predict`` performs pure linear
-                interpolation (``_H @ spectrum``).  ``resolution`` is stored
+                interpolation (two weighted gathers).  ``resolution`` is stored
                 but unused in this mode.
 
         res_convention : {"sigma", "fwhm"} or None
@@ -370,9 +370,8 @@ class Spectrum(Observation):
     def _H(self):
         """Dense (n_pix, n_wave) interpolation matrix, built on first access.
 
-        Only the no-smoothing projection path reads this.  Building it eagerly
-        in ``setup_for_model`` costs a large device allocation that a smoothed
-        Spectrum never uses, so it is deferred until something asks for it.
+        Retained for diagnostics and compatibility. Prediction uses its two
+        nonzero coefficients per row directly, without allocating this matrix.
         """
         if getattr(self, "_H_cached", None) is None:
             if getattr(self, "_H_factors", None) is None:
@@ -402,8 +401,8 @@ class Spectrum(Observation):
         Two behaviours depending on ``self.smoothtype``:
 
         **No smoothing** (``smoothtype=None``)
-            Builds the dense (n_pix, n_wave) linear-interpolation matrix
-            ``_H`` and sets ``_predict_fn(spec) = _H @ spec``.
+            Stores two indices and weights per observed pixel. Prediction
+            gathers and combines the two neighbouring model values.
 
         **With instrumental smoothing** (``smoothtype`` in
         ``{"vel", "R", "lambda", "lsf"}``)
@@ -411,8 +410,7 @@ class Spectrum(Observation):
             precompute all FFT grid transforms.  The returned closure is
             fully JAX-JIT-compilable with respect to the spectrum.
             ``_predict_fn(spec)`` applies smoothing *and* interpolation to
-            the observed pixel grid in one call.  ``_H`` is also built (used
-            only by the no-smoothing fast path).
+            the observed pixel grid in one call. ``_H`` remains lazy.
 
         Parameters
         ----------
@@ -452,10 +450,8 @@ class Spectrum(Observation):
         n_pix  = len(wo)
 
         # ── Record the interpolation matrix _H, but do not build it ───────
-        # _H is dense, (n_pix, n_wave), and only the no-smoothing path reads
-        # it.  For a typical joint fit that is 271 MB of device memory the
-        # smoothing closure never touches, so the factors are stored here and
-        # the matrix is materialised on first access (see the _H property).
+        # _H is retained for callers that explicitly request the dense matrix.
+        # Both prediction paths avoid allocating it.
         j_hi = np.searchsorted(wm, wo, side='right')
         j_hi = np.clip(j_hi, 1, n_wave - 1)
         j_lo = j_hi - 1
@@ -479,8 +475,11 @@ class Spectrum(Observation):
         fit_lo     = self.fit_sigma_smooth and has_losvd
 
         if not has_instr and not has_losvd:
-            # No smoothing: pure interpolation via _H, materialised on first call.
-            self._predict_fn = lambda spec: self._H @ spec
+            # Preserve the dense matrix's independently rounded coefficients.
+            lo, hi = jnp.asarray(j_lo), jnp.asarray(j_hi)
+            w_lo = jnp.asarray((1.0 - alpha).astype(np.float32))
+            w_hi = jnp.asarray(alpha.astype(np.float32))
+            self._predict_fn = lambda spec: w_lo * spec[lo] + w_hi * spec[hi]
 
         else:
             # ── Trim model grid to observed wavelength range ────────────
@@ -746,7 +745,7 @@ class Spectrum(Observation):
         Calls ``_predict_fn(spectrum[, sigma_smooth])`` which was constructed
         by ``setup_for_model``.  Depending on ``self.smoothtype``:
 
-        * ``None``  — pure linear interpolation (``_H @ spectrum``).
+        * ``None``  — pure linear interpolation using two weighted gathers.
         * ``"vel"`` / ``"R"`` — constant-velocity FFT broadening then
           interpolation to observed pixels.
         * ``"lambda"`` — constant-wavelength FFT broadening then interpolation.
