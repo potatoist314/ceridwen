@@ -93,6 +93,7 @@ from typing import Any, Callable, Optional
 import jax
 import jax.numpy as jnp
 
+from .calibration import PolynomialCalibration
 from .noise_model import DiagonalNoiseModel, NoiseModelBase, NoiseModelOutput
 
 # Type alias matching the ceridwen codebase convention.
@@ -472,6 +473,16 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
     noise_model : DiagonalNoiseModel
         Noise model instance.  Defaults to a plain observational-uncertainty-
         only model (no jitter, no fractional error).
+    calibration : PolynomialCalibration, optional
+        Analytic spectrophotometric calibration polynomial.  When set, the
+        model ``mu`` is replaced by ``P(x) * mu`` inside the Gaussian
+        kernel -- the Chebyshev coefficients of ``P`` are solved by
+        weighted least squares at every call, with the noise model's
+        effective sigma (evaluated at the uncalibrated ``mu``) as weights
+        -- and the coefficient prior plus, by default, the Occam factor of
+        the analytic marginalisation are added to the returned
+        log-likelihood.  ``None`` (default) leaves every existing fit
+        bit-for-bit unchanged.  Meant for ``Spectrum`` observations only.
 
     Examples
     --------
@@ -509,6 +520,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
     noise_model: DiagonalNoiseModel = field(
         default_factory=DiagonalNoiseModel
     )
+    calibration: Optional[PolynomialCalibration] = None
 
     # ------------------------------------------------------------------
     def __call__(
@@ -539,12 +551,21 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         lnl_total : Array, scalar
         aux : LikelihoodOutput
         """
+        # The noise model is evaluated once, at the uncalibrated model, so the
+        # polynomial is solved with the same effective sigma the Gaussian
+        # kernel then uses (see PolynomialCalibration).
         noise_out: NoiseModelOutput = self.noise_model.compute(
             sigma_obs, mu, mask, params, data=y
         )
-        return lnlike_diag_gaussian(
+        ln_extra = jnp.zeros(())
+        if self.calibration is not None:
+            mu, _, ln_extra = self.calibration.calibrate(
+                y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask
+            )
+        lnl, aux = lnlike_diag_gaussian(
             y, mu, noise_out.inv_var, noise_out.log_det, mask
         )
+        return lnl + ln_extra, aux
 
     # ------------------------------------------------------------------
     def make_lnprobfn(
@@ -592,6 +613,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         sigma_obs : Array = observations.uncertainty
         mask      : Array = observations.mask
         noise_model       = self.noise_model
+        calibration       = self.calibration
 
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
@@ -601,25 +623,36 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
             # ignored.  This avoids conditional dict construction inside the
             # JIT-compiled hot path and is safe for any noise model subclass.
             noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
-            lnl, _    = lnlike_diag_gaussian(
+            lnl = jnp.zeros(())
+            if calibration is not None:
+                # Static Python branch: the calibration polynomial (weighted
+                # least squares in-graph, weights = the noise model's
+                # effective sigma) rescales mu before the Gaussian kernel.
+                mu, _, ln_extra = calibration.calibrate(
+                    y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask
+                )
+                lnl = lnl + ln_extra
+            lnl_k, _  = lnlike_diag_gaussian(
                 y, mu, noise_out.inv_var, noise_out.log_det, mask
             )
             lnp = prior.log_prob(theta)
-            return lnl + lnp
+            return lnl + lnl_k + lnp
 
         return lnprobfn
 
     # ------------------------------------------------------------------
     def __repr__(self) -> str:
-        return f"DiagonalGaussianLikelihood(noise_model={self.noise_model!r})"
+        cal = ("" if self.calibration is None
+               else f", calibration={self.calibration!r}")
+        return f"DiagonalGaussianLikelihood(noise_model={self.noise_model!r}{cal})"
 
 
 # PyTree: no dynamic leaves; the frozen dataclass config is all auxiliary.
 jax.tree_util.register_pytree_node(
     DiagonalGaussianLikelihood,
-    flatten_func   = lambda lh: ([], (lh.noise_model,)),
+    flatten_func   = lambda lh: ([], (lh.noise_model, lh.calibration)),
     unflatten_func = lambda aux, _: DiagonalGaussianLikelihood(
-        noise_model=aux[0]
+        noise_model=aux[0], calibration=aux[1]
     ),
 )
 

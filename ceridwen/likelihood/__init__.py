@@ -5,6 +5,7 @@ from .noise_model import (
     NoiseModelBase,
     DiagonalNoiseModel,
 )
+from .calibration import PolynomialCalibration
 
 from .likelihood import (
     LikelihoodOutput,
@@ -27,6 +28,8 @@ __all__ = [
     "NoiseModelOutput",
     "NoiseModelBase",
     "DiagonalNoiseModel",
+    # calibration
+    "PolynomialCalibration",
     # likelihood
     "LikelihoodOutput",
     "LikelihoodBase",
