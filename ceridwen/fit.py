@@ -542,6 +542,7 @@ def write_result_h5(
         samp_grp.attrs["sampler_name"] = result.sampler_name
         samp_grp.attrs["wall_time_s"] = result.wall_time_s
         samp_grp.attrs["n_likelihood_calls"] = result.n_likelihood_calls
+        samp_grp.attrs["likelihood_count_kind"] = result.likelihood_count_kind
         samp_grp.attrs["n_samples"] = int(result.log_likelihoods.shape[0])
         # Persist chain layout so post-hoc trace plots can reshape the
         # flat (n_chains * n_per_chain, ...) sample arrays back into
@@ -626,6 +627,7 @@ def load_result_h5(path: str | Path):
             log_likelihoods       = log_likelihoods,
             param_names           = param_names,
             n_likelihood_calls    = int(samp.attrs.get("n_likelihood_calls", -1)),
+            likelihood_count_kind = str(samp.attrs.get("likelihood_count_kind", "legacy_estimate")),
             wall_time_s           = float(samp.attrs.get("wall_time_s", float("nan"))),
             sampler_name          = str(samp.attrs.get("sampler_name", "unknown")),
             log_likelihoods_birth = llb,

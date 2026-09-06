@@ -150,6 +150,10 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         Maximum compact frames retained for one process.  Default 64.
     checkpoint_frame_max_bytes : int, optional
         Maximum serialised size of one compact frame.  Default 2 MiB.
+    iteration_callback : callable, optional
+        Called after each completed step with ``(iteration, key, incoming,
+        outgoing, info, compiled_step, elapsed_seconds)``. Default None.
+        Intended for profiling; the callback must not modify the sampler state.
     """
 
     def __init__(
@@ -166,6 +170,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         checkpoint_frame_draws: int = 128,
         checkpoint_frame_limit: int = 64,
         checkpoint_frame_max_bytes: int = 2 * 1024 * 1024,
+        iteration_callback: Optional[Callable] = None,
     ):
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
@@ -173,6 +178,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self._num_delete      = num_delete         # None → max(1, num_live // 5)
         self.logZ_tol        = float(logZ_tol)
         self.verbose         = bool(verbose)
+        self.iteration_callback = iteration_callback
         # Periodic checkpointing.  Every ``checkpoint_interval_s`` seconds
         # (default 1200 = 20 min; <= 0 disables) the accumulated dead points
         # are finalised against the current live ensemble and dumped to disk,
@@ -417,6 +423,27 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
     # Main entry point
     # ------------------------------------------------------------------
 
+    def _build_nested_sampler(self, loglike_fn, logprior_fn,
+                              num_inner_steps, num_delete):
+        """Construct the unchanged BlackJAX NSS transition kernel."""
+        import blackjax
+        return blackjax.nss(
+            logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn,
+            num_delete=num_delete, num_inner_steps=num_inner_steps,
+        )
+
+    @staticmethod
+    def _logical_likelihood_calls(info):
+        """Per-particle evaluations for the pinned stepping-out slice kernel.
+
+        Each expansion loop evaluates its terminating condition once more
+        than its body runs. The two endpoints therefore add two calls per
+        slice. This counts logical evaluations, not redundant GPU lanes in
+        a vectorized while loop.
+        """
+        return jnp.sum(info.update_info.num_expansions
+                       + info.update_info.num_shrink + 2)
+
     def run(
         self,
         loglike_fn  : Callable[[dict[str, Array]], Array],
@@ -475,12 +502,8 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         # ── Build NSS kernel ──────────────────────────────────────────────
         # loglike_fn / logprior_fn operate on a SINGLE particle (un-batched).
         # The NSS step_fn vmaps internally over the live-point ensemble.
-        nested_sampler = blackjax.nss(
-            logprior_fn      = logprior_fn,
-            loglikelihood_fn = loglike_fn,
-            num_delete       = num_delete,
-            num_inner_steps  = num_inner_steps,
-        )
+        nested_sampler = self._build_nested_sampler(
+            loglike_fn, logprior_fn, num_inner_steps, num_delete)
         init_fn = jax.jit(nested_sampler.init)
         step_fn = jax.jit(nested_sampler.step)
 
@@ -533,7 +556,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
         # ── NS run loop ───────────────────────────────────────────────────
         dead_list    = []
-        n_like_calls = 0
+        n_like_calls = self.num_live
         t_start      = time.perf_counter()
 
         # Periodic-checkpoint bookkeeping (see __init__).
@@ -556,9 +579,8 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             disable=not self.verbose,
         ) as pbar:
             _iter = 0
-            # One device sync per iteration: read logZ and logZ_live once and
-            # reuse the floats for the loop condition, the verbose line, the
-            # progress bar, and the checkpoint tag.
+            # Reuse evidence reads for the stop condition and progress output.
+            # Slice counters are read separately for logical call accounting.
             _logZ = _get_logZ(live)
             _logZ_live = _get_logZ_live(live)
             while float(_logZ_live - _logZ) >= self.logZ_tol:
@@ -571,12 +593,16 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                           flush=True)
                 _t_iter = time.perf_counter()
 
-                live, dead_info = step_fn(subkey, live)
-
-                _dt_iter = time.perf_counter() - _t_iter
+                incoming = live
+                live, dead_info = step_fn(subkey, incoming)
                 _iter += 1
                 _logZ = _get_logZ(live)
                 _logZ_live = _get_logZ_live(live)
+                _dt_iter = time.perf_counter() - _t_iter
+                if self.iteration_callback is not None:
+                    self.iteration_callback(
+                        _iter, subkey, incoming, live, dead_info,
+                        step_fn, _dt_iter)
                 if self.verbose:
                     print(
                         f"  [iter {_iter:>4d}]  {_dt_iter:6.1f} s  "
@@ -585,7 +611,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                         flush=True,
                     )
                 dead_list.append(dead_info)
-                n_like_calls += num_delete * num_inner_steps
+                n_like_calls += int(self._logical_likelihood_calls(dead_info))
                 pbar.update(num_delete)
                 try:
                     pbar.set_description(
@@ -734,6 +760,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             n_likelihood_calls    = n_like_calls,
             wall_time_s           = wall_time,
             sampler_name          = "blackjax.nss",
+            likelihood_count_kind = "logical_including_initialization",
             raw                   = {
                 "positions": _dead_positions,
                 "loglikelihood": _dead_logl,

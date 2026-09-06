@@ -423,3 +423,23 @@ def test_repr_states_marginalisation_and_prior():
     cal = PolynomialCalibration.from_wavelength(WAVE, order=3, prior_sigma=[0.1, 0.1, 0.1])
     text = repr(cal)
     assert "order=3" in text and "marginalize=True" in text and "0.1" in text
+
+
+@pytest.mark.parametrize('order', [1, 3, 7])
+def test_calibration_reduction_preserves_gram_matrix_and_gradient(order):
+    from ceridwen.likelihood import PolynomialCalibration
+    wave = np.linspace(6000., 9000., 321)
+    mask = np.arange(len(wave)) % 5 != 0
+    calibration = PolynomialCalibration.from_wavelength(
+        wave, order=order, mask=mask, prior_sigma=.1)
+    sigma = jnp.geomspace(.001, 1., len(wave))
+    def reference(flux):
+        design = calibration.design(flux, sigma, mask)
+        return design.T @ design + calibration._precision()
+    def candidate(flux):
+        return calibration.normal_matrix(flux, sigma, mask)
+    flux = jnp.stack([jnp.linspace(.1, scale, len(wave)) for scale in (.5, 1., 2.)])
+    for function in (lambda f: f, lambda f: jax.grad(lambda x:jnp.linalg.slogdet(f(x))[1])):
+        a = jax.jit(jax.vmap(function(reference)))(flux)
+        b = jax.jit(jax.vmap(function(candidate)))(flux)
+        np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-10)

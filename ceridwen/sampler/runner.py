@@ -104,7 +104,10 @@ class SamplingResult:
         Ordered list of free-parameter names (same order as
         ``model.param_names``).
     n_likelihood_calls : int
-        Approximate total number of likelihood evaluations.
+        For NSS, logical per-particle likelihood evaluations, including
+        initial live points and slice expansion/shrinkage. Excludes redundant
+        GPU lanes executed by vectorized loops. Older files stored a slice-
+        transition estimate instead. Other backends may report an estimate.
     wall_time_s : float
         Wall-clock run time in seconds.
     sampler_name : str
@@ -126,6 +129,7 @@ class SamplingResult:
     sampler_name          : str
     log_likelihoods_birth : Optional[Array] = None
     raw                   : Any = None
+    likelihood_count_kind : str = "legacy_estimate"
 
     # ------------------------------------------------------------------
     def to_anesthetic(self, labels: Optional[dict[str, str]] = None):

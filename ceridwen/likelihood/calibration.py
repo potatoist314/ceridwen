@@ -235,7 +235,9 @@ class PolynomialCalibration:
     def normal_matrix(self, mu, sigma, mask) -> Array:
         """``D^T D + Sigma_p^{-1}`` -- the posterior precision of the coefficients."""
         design = self.design(mu, sigma, mask)
-        normal = design.T @ design
+        # Expose each coefficient pair as a pixel reduction. Under NSS vmap,
+        # this avoids a separate, poorly occupied tiny GEMM for every chain.
+        normal = jnp.sum(design[:, :, None] * design[:, None, :], axis=0)
         precision = self._precision()
         return normal if precision is None else normal + precision
 
