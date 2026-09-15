@@ -7,12 +7,14 @@ The grid gains one leading axis:
     ssp_flux : (n_afe, n_met, n_ages, n_wave)      [Lsun / Hz / Msun]
     ssp_afe  : (n_afe,)                            [alpha/Fe] values
 
-Check the grid provenance for the physical meaning of ``ssp_lgmet``.
-For the published ``amist_c3k_hr_krou_afe`` grid, it stores
-[Fe/H] + log10(0.0185), and ``theta["Z"]`` uses this coordinate directly.
-Changing ``afe`` at fixed ``Z`` therefore holds iron abundance fixed,
-not the physical total metal mass fraction. See ``scripts_afe/build_afe_hr_grid.py``
-for the conversion and Park et al., Alpha-MC, Sections 2.1-2.2 for the mixture:
+For our ``amist_c3k_hr_krou_afe`` grid, there are two abundance controls.
+``Z`` controls how much iron there is relative to hydrogen. ``afe`` controls
+how much of the alpha elements, such as oxygen and magnesium, there is per iron atom.
+Increasing ``afe`` while keeping ``Z`` unchanged adds alpha elements at the
+same iron abundance. The total amount of metals therefore depends on both.
+The parameter descriptions below explain the numerical scales.
+See ``scripts_afe/build_afe_hr_grid.py`` for how the grid is stored.
+For the model's abundance definitions, see Alpha-MC, Sections 2.1-2.2:
 https://arxiv.org/html/2410.21375v1#S2.SS1
 
 Library resolution (schema 2.1)
@@ -89,38 +91,49 @@ class SSPDataAfe:
     Attributes
     ----------
     ssp_lgmet : jnp.ndarray, shape (n_met,)
-        Metallicity interpolation coordinate, also used by ``theta["Z"]``.
-        For ``amist_c3k_hr_krou_afe``: [Fe/H] + log10(0.0185), in dex.
-        Recover [Fe/H] as ``theta["Z"] + 1.7328283``. Here [Fe/H] is
-        log10 of the Fe/H number ratio relative to the solar ratio.
-        This offset alone does not give the total metal mass fraction
-        when alpha abundance varies. Other grids require their own provenance.
+        The iron-abundance values available in our ``amist_c3k_hr_krou_afe`` grid.
+        The fit's ``Z`` parameter chooses a value along this list.
+        Larger values mean more iron per hydrogen atom.
+        Astronomers usually call this abundance [Fe/H]: 0 means the same
+        iron-to-hydrogen ratio as the Sun, and -1 means one tenth as much.
+        This grid stores those numbers with 1.7328283 subtracted. So a fitted
+        Z of about -1.733 means solar iron abundance. Add 1.7328283 to get [Fe/H].
+        Despite its name, Z alone does not tell us the total amount of metals:
+        the alpha elements below also contribute. Check the source information
+        before applying this conversion to a different grid.
     ssp_afe : jnp.ndarray, shape (n_afe,)
-        [alpha/Fe] grid, strictly increasing.  aMIST/C3K: -0.2 .. +0.6
-        in steps of 0.2 dex. Each of O, Ne, Mg, Si, S, Ar, Ca and Ti has
-        its element/Fe number ratio scaled by ``10**afe`` relative to solar.
+        The alpha-to-iron ratios available in the grid, chosen by ``afe``.
+        Alpha elements here are oxygen, neon, magnesium, silicon, sulfur,
+        argon, calcium and titanium. The model changes all eight together.
+        Zero means their ratios to iron match the Sun's. A value of +0.3
+        means about twice as many atoms of each alpha element per iron atom.
+        The exact multiplier is ``10**afe``. Available values run from
+        -0.2 to +0.6 in steps of 0.2, listed from lowest to highest.
     ssp_lg_age_gyr : jnp.ndarray, shape (n_ages,)
-        ``log10(age / Gyr)``: 0 means 1 Gyr; -1 means 0.1 Gyr.
+        Ages of the single-age stellar populations in the grid.
+        Stored as ``log10(age / Gyr)``: 0 means one billion years,
+        -1 means 100 million years, and +1 means ten billion years.
     ssp_wave : jnp.ndarray, shape (n_wave,)
-        Wavelength grid in Angstroms.  NB: for alpha grids this is the
-        C3K wavelength sampling, NOT the MILES sampling of older ceridwen
-        grids — the stored ``ssp_resolution`` curve (derived from THIS
-        wavelength array) is what the observation layer subtracts, so the
-        bookkeeping follows the grid automatically.
+        Wavelengths at which each model spectrum is stored, in Angstroms.
+        These come from the C3K grid. Use its own ``ssp_resolution`` values
+        when broadening the spectra to compare them with observations.
     ssp_flux : jnp.ndarray, shape (n_afe, n_met, n_ages, n_wave)
-        SSP flux density in ``Lsun / Hz`` per Msun of initial stellar
-        mass, with the [alpha/Fe] axis LEADING.
+        The model spectra: emitted light per unit frequency, for one solar
+        mass of stars at birth. Units are ``Lsun / Hz / Msun``.
+        Choose alpha abundance, iron abundance and age, in that order,
+        to get a spectrum with one value for each wavelength.
     ssp_resolution : np.ndarray or None, shape (n_wave,)
-        Library resolution sigma_v(lambda) [km/s] on ``ssp_wave`` (NaN =
-        unknown at that pixel).  Optional at the CONSTRUCTOR level only;
-        :meth:`save` / :meth:`load` REQUIRE it (schema 2.1).
+        How much the model spectrum is already broadened at each wavelength.
+        Given as a Gaussian width in km/s; NaN means the width is unknown.
+        The value can be omitted when creating this object, but it must be
+        supplied before saving. Loading a saved grid also requires it.
     resolution_source : str or None
-        Free-text provenance for the resolution curve.
+        A note explaining where the spectrum's broadening values came from.
 
     Provenance fields are identical in meaning to ``SSPData``.
     """
 
-    ssp_lgmet: jnp.ndarray          # (n_met,) metallicity coordinate; see grid provenance
+    ssp_lgmet: jnp.ndarray          # (n_met,) iron-abundance values for our alpha-MC grid
     ssp_afe: jnp.ndarray            # (n_afe,) [alpha/Fe]
     ssp_lg_age_gyr: jnp.ndarray     # (n_ages,) log10(age / Gyr)
     ssp_wave: jnp.ndarray           # (n_wave,) Angstrom
@@ -320,8 +333,8 @@ class SSPDataAfe:
 
             f.attrs['description']        = ('FSPS alpha-enhanced SSP '
                                              'interpolation grids')
-            # Legacy schema label; for the HR alpha-MC grid this is shifted [Fe/H].
-            # Use the provenance and class docstring for the physical definition.
+            # This old file label is misleading for our alpha-MC grid: it stores
+            # iron abundance with a fixed offset. See the descriptions above.
             f.attrs['units_lgmet']        = 'log10(absolute_total_metallicity)'
             f.attrs['units_afe']          = '[alpha/Fe] (dex)'
             f.attrs['units_lg_age_gyr']   = 'log10(age/Gyr)'

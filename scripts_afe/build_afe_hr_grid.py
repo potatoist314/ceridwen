@@ -24,15 +24,18 @@ This script maps that onto the CERIDWEN ``SSPDataAfe`` schema-2.0 container
     ssp_wave       (n_wave,)  Angstrom                             = ext0
     ssp_flux       (n_afe, n_met, n_ages, n_wave)  L_sun/Hz/Msun   = ext1, reordered
 
-Here [Fe/H] = log10((n_Fe/n_H) / (n_Fe/n_H)_sun), using number abundances.
-The fitted ``theta["Z"]`` uses the same coordinate as ``ssp_lgmet``:
-    theta["Z"] = [Fe/H] + log10(0.0185) = [Fe/H] - 1.7328283.
-Thus solar iron abundance corresponds to Z = -1.7328283 on every alpha plane.
-The 0.0185 reference preserves the published low-resolution grid's offset.
-It does not convert iron abundance into the physical total metal mass fraction
-for an arbitrary alpha mixture. Alpha-MC varies alpha abundance at fixed
-[Fe/H], so total metallicity also depends on ``afe``.
-Abundance definitions: Park et al., Alpha-MC, Sections 2.1-2.2:
+What does the metallicity parameter mean?
+[Fe/H] describes how much iron there is per hydrogen atom, compared with the Sun.
+Zero means the Sun's ratio; -1 means one tenth of that ratio.
+Ceridwen calls its fitted parameter ``Z``, but stores it on a shifted scale:
+    Z = [Fe/H] - 1.7328283.
+So Z = -1.7328283 means solar iron abundance. The shift comes from log10(0.0185)
+and keeps this grid on the same numerical scale as the older low-resolution grid.
+
+``afe`` separately controls elements such as oxygen and magnesium relative to iron.
+Increasing it adds more of those elements while leaving the iron abundance unchanged.
+The total amount of metals therefore depends on both parameters, despite the name Z.
+For the model's abundance definitions, see Alpha-MC, Sections 2.1-2.2:
 https://arxiv.org/html/2410.21375v1#S2.SS1
 
 Run in an environment with astropy + h5py + ceridwen (NOT FSPS -- this
@@ -55,8 +58,8 @@ import math
 import numpy as np
 
 
-# Reference for the stored coordinate; not an alpha-dependent total-Z conversion.
-# Pinned from amist_c3k_lr_chab_afe.h5: ssp_lgmet - [Fe/H] = -1.732828266.
+# Use the same reference number as the older low-resolution grid.
+# Its logarithm gives the shift between [Fe/H] and the fitted Z parameter.
 ZSUN_MIST = 0.0185
 LGMET_OFFSET = math.log10(ZSUN_MIST)          # = -1.7328282657...
 
@@ -127,11 +130,13 @@ def main() -> None:
     if not np.isfinite(cube).all():
         raise SystemExit("non-finite flux values after assembly")
 
-    # afe scales O, Ne, Mg, Si, S, Ar, Ca and Ti together, at fixed [Fe/H].
-    ssp_afe        = afe_u                                   # [alpha/Fe], dex
-    # theta["Z"] interpolates this axis directly: [Fe/H] = Z - offset.
-    ssp_lgmet      = feh_u + offset                          # shifted [Fe/H], dex
-    ssp_lg_age_gyr = logt_u - 9.0                            # log10(age/Gyr); 0 = 1 Gyr
+    # Keep the alpha-to-iron ratios. Zero means the same ratios as the Sun.
+    ssp_afe        = afe_u
+    # Shift the iron-abundance numbers to the scale used by the fitted Z parameter.
+    # With the default offset, add 1.7328283 to a fitted Z to recover [Fe/H].
+    ssp_lgmet      = feh_u + offset
+    # Change the age unit from years to billions of years, keeping a logarithmic scale.
+    ssp_lg_age_gyr = logt_u - 9.0
 
     ssp = SSPDataAfe(
         ssp_lgmet, ssp_afe, ssp_lg_age_gyr, wave, cube,
@@ -143,7 +148,7 @@ def main() -> None:
             "source_fits": args.fits.split("/")[-1],
             "provider": "M. J. Park (2025-07-22)",
             "zsun_reference": args.zsun,
-            # Historical metadata wording; the coordinate is defined above.
+            # Keep the old file label. Here "log10 Z" means the shifted iron abundance above.
             "feh_to_logZ": "log10 Z = [Fe/H] + log10(Zsun)",
             "imf_name": IMF_NAMES.get(int(args.imf_type), str(args.imf_type)),
         },

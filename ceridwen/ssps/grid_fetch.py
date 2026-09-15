@@ -100,13 +100,14 @@ REGISTRY: dict[str, dict] = {
                  "'amist_c3k_hr_krou_afe' (schema 2.1, published in v5).",
     },
     # Grid used by the Astro project's Ceridwen fitting notebooks:
-    # aMIST v2.5 isochrones + C3K v2.3 spectra, Kroupa IMF (imf_type=2).
-    # Built from M. J. Park's alpha-MC FITS, rather than local FSPS at fit time.
-    # Axes: (afe, metallicity coordinate, log10(age/Gyr), wavelength [Angstrom]).
-    # theta["Z"] = ssp_lgmet = [Fe/H] + log10(0.0185); afe = [alpha/Fe].
-    # Holding Z fixed across alpha planes holds [Fe/H] fixed, not total metals.
-    # See scripts_afe/build_afe_hr_grid.py for the conversion, and
-    # ssps/ssp_data_afe.py::SSPDataAfe for axis definitions and flux units.
+    # aMIST v2.5 describes how stars evolve; C3K v2.3 supplies their spectra.
+    # The Kroupa IMF sets the relative numbers of stars born at different masses.
+    # These spectra were already calculated and supplied by M. J. Park.
+    # Each fit loads them from this file; it does not run FSPS again.
+    # Z controls iron relative to hydrogen. afe controls alpha elements relative to iron.
+    # Both affect the total amount of metals. Z alone is not the total metal content.
+    # For what each stored value means, read SSPDataAfe in ssps/ssp_data_afe.py.
+    # For how the original values are converted, read scripts_afe/build_afe_hr_grid.py.
     "amist_c3k_hr_krou_afe": {
         # Published 2026-08-17 in v5 of the ceridwen-grids deposit
         # (record 21977508); schema 2.1 (ssp_resolution = grid
