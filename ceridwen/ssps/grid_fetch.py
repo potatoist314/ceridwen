@@ -99,13 +99,14 @@ REGISTRY: dict[str, dict] = {
                  "scripts/convert_grids_schema2.py, or use "
                  "'amist_c3k_hr_krou_afe' (schema 2.1, published in v5).",
     },
-    # High-resolution alpha-enhanced grid (schema 2.0, 4-D, n_afe=5).  Same
-    # (afe, [Fe/H], age) node grid as amist_c3k_lr_chab_afe -- and the SAME
-    # log10 Z axis (Z = 0.0185 * 10**[Fe/H]) -- but the high-res C3K spectra
-    # (10992 lambda pts, R up to ~65000 in the optical) that are too large to
-    # ship in FSPS/python-FSPS.  Kroupa IMF (imf_type=2; the LR grid is
-    # Chabrier).  Built from M. J. Park's alpha-MC FITS via
-    # scripts_afe/build_afe_hr_grid.py.
+    # Grid used by the Astro project's Ceridwen fitting notebooks:
+    # aMIST v2.5 isochrones + C3K v2.3 spectra, Kroupa IMF (imf_type=2).
+    # Built from M. J. Park's alpha-MC FITS, rather than local FSPS at fit time.
+    # Axes: (afe, metallicity coordinate, log10(age/Gyr), wavelength [Angstrom]).
+    # theta["Z"] = ssp_lgmet = [Fe/H] + log10(0.0185); afe = [alpha/Fe].
+    # Holding Z fixed across alpha planes holds [Fe/H] fixed, not total metals.
+    # See scripts_afe/build_afe_hr_grid.py for the conversion, and
+    # ssps/ssp_data_afe.py::SSPDataAfe for axis definitions and flux units.
     "amist_c3k_hr_krou_afe": {
         # Published 2026-08-17 in v5 of the ceridwen-grids deposit
         # (record 21977508); schema 2.1 (ssp_resolution = grid

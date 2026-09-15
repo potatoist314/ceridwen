@@ -7,11 +7,13 @@ The grid gains one leading axis:
     ssp_flux : (n_afe, n_met, n_ages, n_wave)      [Lsun / Hz / Msun]
     ssp_afe  : (n_afe,)                            [alpha/Fe] values
 
-Everything else (units, conventions, provenance philosophy, the FSPS
-kwarg whitelist) is inherited unchanged from ``ssp_data.py``:
-``ssp_lgmet`` remains log10 of the *absolute total* metallicity Z — the
-alpha axis re-partitions that Z between the Fe-peak and alpha elements
-at fixed total Z (the aMIST/C3K convention), it does not change it.
+Check the grid provenance for the physical meaning of ``ssp_lgmet``.
+For the published ``amist_c3k_hr_krou_afe`` grid, it stores
+[Fe/H] + log10(0.0185), and ``theta["Z"]`` uses this coordinate directly.
+Changing ``afe`` at fixed ``Z`` therefore holds iron abundance fixed,
+not the physical total metal mass fraction. See ``scripts_afe/build_afe_hr_grid.py``
+for the conversion and Park et al., Alpha-MC, Sections 2.1-2.2 for the mixture:
+https://arxiv.org/html/2410.21375v1#S2.SS1
 
 Library resolution (schema 2.1)
 -------------------------------
@@ -87,14 +89,18 @@ class SSPDataAfe:
     Attributes
     ----------
     ssp_lgmet : jnp.ndarray, shape (n_met,)
-        ``log10`` of the absolute TOTAL metallicity grid (mass fraction of
-        all elements heavier than He) — same convention as
-        :class:`ceridwen.ssps.ssp_data.SSPData`, NOT [Fe/H].
+        Metallicity interpolation coordinate, also used by ``theta["Z"]``.
+        For ``amist_c3k_hr_krou_afe``: [Fe/H] + log10(0.0185), in dex.
+        Recover [Fe/H] as ``theta["Z"] + 1.7328283``. Here [Fe/H] is
+        log10 of the Fe/H number ratio relative to the solar ratio.
+        This offset alone does not give the total metal mass fraction
+        when alpha abundance varies. Other grids require their own provenance.
     ssp_afe : jnp.ndarray, shape (n_afe,)
         [alpha/Fe] grid, strictly increasing.  aMIST/C3K: -0.2 .. +0.6
-        in steps of 0.2.
+        in steps of 0.2 dex. Each of O, Ne, Mg, Si, S, Ar, Ca and Ti has
+        its element/Fe number ratio scaled by ``10**afe`` relative to solar.
     ssp_lg_age_gyr : jnp.ndarray, shape (n_ages,)
-        ``log10(age / Gyr)``.
+        ``log10(age / Gyr)``: 0 means 1 Gyr; -1 means 0.1 Gyr.
     ssp_wave : jnp.ndarray, shape (n_wave,)
         Wavelength grid in Angstroms.  NB: for alpha grids this is the
         C3K wavelength sampling, NOT the MILES sampling of older ceridwen
@@ -114,7 +120,7 @@ class SSPDataAfe:
     Provenance fields are identical in meaning to ``SSPData``.
     """
 
-    ssp_lgmet: jnp.ndarray          # (n_met,) log10 absolute total Z
+    ssp_lgmet: jnp.ndarray          # (n_met,) metallicity coordinate; see grid provenance
     ssp_afe: jnp.ndarray            # (n_afe,) [alpha/Fe]
     ssp_lg_age_gyr: jnp.ndarray     # (n_ages,) log10(age / Gyr)
     ssp_wave: jnp.ndarray           # (n_wave,) Angstrom
@@ -314,6 +320,8 @@ class SSPDataAfe:
 
             f.attrs['description']        = ('FSPS alpha-enhanced SSP '
                                              'interpolation grids')
+            # Legacy schema label; for the HR alpha-MC grid this is shifted [Fe/H].
+            # Use the provenance and class docstring for the physical definition.
             f.attrs['units_lgmet']        = 'log10(absolute_total_metallicity)'
             f.attrs['units_afe']          = '[alpha/Fe] (dex)'
             f.attrs['units_lg_age_gyr']   = 'log10(age/Gyr)'

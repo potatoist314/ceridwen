@@ -19,19 +19,21 @@ This script maps that onto the CERIDWEN ``SSPDataAfe`` schema-2.0 container
 (``ceridwen.ssps.ssp_data_afe``), whose axes are:
 
     ssp_afe        (n_afe,)                    [alpha/Fe]           = afe
-    ssp_lgmet      (n_met,)   log10 ABSOLUTE total Z               = feh + log10(Zsun)
+    ssp_lgmet      (n_met,)   metallicity interpolation coordinate = feh + log10(Zsun)
     ssp_lg_age_gyr (n_ages,)  log10(age/Gyr)                       = logt - 9
     ssp_wave       (n_wave,)  Angstrom                             = ext0
     ssp_flux       (n_afe, n_met, n_ages, n_wave)  L_sun/Hz/Msun   = ext1, reordered
 
-The metallicity convention is the one the existing ceridwen alpha grid
-(amist_c3k_lr_chab_afe.h5) uses: FSPS stores the C3K total metal mass
-fraction as  Z = Zsun * 10**[Fe/H]  with the MIST protosolar reference
-Zsun = 0.0185, so  log10 Z = [Fe/H] + log10(0.0185) = [Fe/H] - 1.7328283.
-This offset was verified to be constant to 1e-16 across all 13 [Fe/H]
-nodes of the published low-resolution grid, so the high-res metallicity
-axis reproduces the low-res one bit-for-bit -- the two grids are drop-in
-interchangeable and share the same ``Z`` prior bounds.
+Here [Fe/H] = log10((n_Fe/n_H) / (n_Fe/n_H)_sun), using number abundances.
+The fitted ``theta["Z"]`` uses the same coordinate as ``ssp_lgmet``:
+    theta["Z"] = [Fe/H] + log10(0.0185) = [Fe/H] - 1.7328283.
+Thus solar iron abundance corresponds to Z = -1.7328283 on every alpha plane.
+The 0.0185 reference preserves the published low-resolution grid's offset.
+It does not convert iron abundance into the physical total metal mass fraction
+for an arbitrary alpha mixture. Alpha-MC varies alpha abundance at fixed
+[Fe/H], so total metallicity also depends on ``afe``.
+Abundance definitions: Park et al., Alpha-MC, Sections 2.1-2.2:
+https://arxiv.org/html/2410.21375v1#S2.SS1
 
 Run in an environment with astropy + h5py + ceridwen (NOT FSPS -- this
 reads spectra straight from the FITS)::
@@ -53,8 +55,8 @@ import math
 import numpy as np
 
 
-# MIST protosolar reference used by the C3K/FSPS zlegend (Z = Zsun*10**[Fe/H]).
-# Pinned from amist_c3k_lr_chab_afe.h5: log10 Z - [Fe/H] = -1.732828266 (const).
+# Reference for the stored coordinate; not an alpha-dependent total-Z conversion.
+# Pinned from amist_c3k_lr_chab_afe.h5: ssp_lgmet - [Fe/H] = -1.732828266.
 ZSUN_MIST = 0.0185
 LGMET_OFFSET = math.log10(ZSUN_MIST)          # = -1.7328282657...
 
@@ -125,9 +127,11 @@ def main() -> None:
     if not np.isfinite(cube).all():
         raise SystemExit("non-finite flux values after assembly")
 
-    ssp_afe        = afe_u                                   # [alpha/Fe]
-    ssp_lgmet      = feh_u + offset                          # log10 absolute total Z
-    ssp_lg_age_gyr = logt_u - 9.0                            # log10(age/Gyr)
+    # afe scales O, Ne, Mg, Si, S, Ar, Ca and Ti together, at fixed [Fe/H].
+    ssp_afe        = afe_u                                   # [alpha/Fe], dex
+    # theta["Z"] interpolates this axis directly: [Fe/H] = Z - offset.
+    ssp_lgmet      = feh_u + offset                          # shifted [Fe/H], dex
+    ssp_lg_age_gyr = logt_u - 9.0                            # log10(age/Gyr); 0 = 1 Gyr
 
     ssp = SSPDataAfe(
         ssp_lgmet, ssp_afe, ssp_lg_age_gyr, wave, cube,
@@ -139,6 +143,7 @@ def main() -> None:
             "source_fits": args.fits.split("/")[-1],
             "provider": "M. J. Park (2025-07-22)",
             "zsun_reference": args.zsun,
+            # Historical metadata wording; the coordinate is defined above.
             "feh_to_logZ": "log10 Z = [Fe/H] + log10(Zsun)",
             "imf_name": IMF_NAMES.get(int(args.imf_type), str(args.imf_type)),
         },
