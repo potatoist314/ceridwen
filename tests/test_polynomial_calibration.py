@@ -305,6 +305,28 @@ def test_marginalised_likelihood_matches_brute_force_integration():
     assert abs(lnl_marg - expected) < 1e-3
 
 
+def test_order_ten_marginal_matches_closed_form_gaussian_integral():
+    """Order 10 (the 2026-09-15 calibration-order arms): the marginal ln L equals
+    ln L(a=0) + b^T N^{-1} b / 2 - ln|N| / 2 + ln|S^{-1}| / 2 with b = D^T t and
+    N = D^T D + S^{-1}, evaluated independently in numpy."""
+    mu, y, sigma, mask = _mock(seed=13)
+    prior_sigma = 0.1
+    cal = PolynomialCalibration.from_wavelength(WAVE, order=10, prior_sigma=prior_sigma,
+                                                marginalize=True)
+    assert cal.n_coeff == 10 and np.asarray(cal.basis).shape == (WAVE.size, 10)
+    lhood = DiagonalGaussianLikelihood(calibration=cal)
+    lnl_marg = float(lhood(y, mu, sigma, mask)[0])
+    design = np.asarray(cal.basis) * (mu / sigma)[:, None]
+    t = (y - mu) / sigma
+    precision = np.eye(10) / prior_sigma ** 2
+    normal = design.T @ design + precision
+    b = design.T @ t
+    expected = (_gaussian_lnl(y, mu, sigma) + 0.5 * b @ np.linalg.solve(normal, b)
+                - 0.5 * np.linalg.slogdet(normal)[1] + 0.5 * np.linalg.slogdet(precision)[1])
+    assert np.isfinite(lnl_marg)
+    assert abs(lnl_marg - expected) < 1e-6 * abs(expected)
+
+
 def test_marginalised_flat_prior_is_the_lebesgue_integral():
     """Without a prior the marginal is exp(lnL(a_hat)) (2 pi)^{k/2} |D^T D|^{-1/2}."""
     mu, y, sigma, mask = _mock(seed=12)
