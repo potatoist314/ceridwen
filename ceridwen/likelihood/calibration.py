@@ -41,8 +41,13 @@ two are the Occam factor of the marginalisation.  ``marginalize=True``
 (default) returns the full expression; ``False`` returns the profile.
 Without a prior the flat-prior integral is used,
 :math:`\\ln \\mathcal{L}(\\hat a) + \\tfrac{k}{2}\\ln 2\\pi - \\tfrac12 \\ln|D^T D|`.
-Either way the polynomial costs one ``(k x k)`` solve per likelihood
-call and adds no sampled dimension.
+Either way the polynomial adds no sampled dimension.  Per likelihood
+call it costs one weighted moment vector of the pixels and one ``(k x k)``
+Cholesky factorisation: the Gram matrix :math:`D^T D` is formed from the
+Chebyshev product identity :math:`T_m T_n = \\tfrac12 (T_{m+n} + T_{|m-n|})`,
+so :math:`(D^T D)_{mn} = \\tfrac12 (M_{m+n} + M_{|m-n|})` with moments
+:math:`M_j = \\sum_i w_i T_j(x_i)`, :math:`w_i = \\mu_i^2 / \\sigma_i^2`,
+:math:`j = 0 \\dots 2k`.  That is linear in the order instead of quadratic.
 
 Two static choices:
 
@@ -69,6 +74,7 @@ from typing import Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsl
 import numpy as np
 from numpy.polynomial.chebyshev import chebvander
 
@@ -98,6 +104,11 @@ class PolynomialCalibration:
     basis : Array, shape (n_pix, n_coeff)
         Columns ``T_n(x)`` for ``n = 1..order`` (``fit_constant=False``) or
         ``n = 0..order`` (``fit_constant=True``).
+    moment_basis : Array, shape (n_pix, 2 * order + 1)
+        Columns ``T_j(x)`` for ``j = 0..2 order``; the Gram matrix is read
+        off the weighted column sums (module docstring).
+    pair_plus, pair_minus : ndarray of int, shape (n_coeff, n_coeff)
+        Static degree indices ``m + n`` and ``|m - n|`` of each coefficient pair.
     order : int
         Polynomial order.
     fit_constant : bool
@@ -123,6 +134,9 @@ class PolynomialCalibration:
 
     x: Array
     basis: Array
+    moment_basis: Array
+    pair_plus: np.ndarray
+    pair_minus: np.ndarray
     order: int
     fit_constant: bool = False
     prior_sigma: Optional[tuple[float, ...]] = None
@@ -174,10 +188,14 @@ class PolynomialCalibration:
         lo, hi = float(wave[keep].min()), float(wave[keep].max())
         mid, half = 0.5 * (hi + lo), 0.5 * (hi - lo)
         x = (wave - mid) / (half if half > 0.0 else 1.0)
-        basis = chebvander(x, order)                 # (n_pix, order + 1)
+        moment_basis = chebvander(x, 2 * order)      # (n_pix, 2 order + 1)
+        basis = moment_basis[:, :order + 1]          # (n_pix, order + 1)
         if not fit_constant:
             basis = basis[:, 1:]
         n_coeff = basis.shape[1]
+        degrees = np.arange(order + 1 - n_coeff, order + 1)
+        pair_plus = degrees[:, None] + degrees[None, :]
+        pair_minus = np.abs(degrees[:, None] - degrees[None, :])
         widths: Optional[tuple[float, ...]] = None
         if prior_sigma is not None:
             values = np.atleast_1d(np.asarray(prior_sigma, dtype=float))
@@ -194,6 +212,9 @@ class PolynomialCalibration:
         return cls(
             x=jnp.asarray(x),
             basis=jnp.asarray(basis),
+            moment_basis=jnp.asarray(moment_basis),
+            pair_plus=pair_plus,
+            pair_minus=pair_minus,
             order=order,
             fit_constant=bool(fit_constant),
             prior_sigma=widths,
@@ -232,14 +253,38 @@ class PolynomialCalibration:
         weight = jnp.where(mask, jnp.asarray(mu) / safe_sigma, 0.0)
         return self.basis * weight[:, None]
 
+    def _weights(self, mu, sigma, mask) -> Array:
+        """Masked pixel weights ``w_i = mu_i^2 / sigma_i^2`` (zero outside the mask)."""
+        mask = jnp.asarray(mask, dtype=bool)
+        safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
+        return jnp.where(mask, (jnp.asarray(mu) / safe_sigma) ** 2, 0.0)
+
+    def _gram(self, weights) -> Array:
+        """``D^T D`` from the Chebyshev moments ``M_j = sum_i w_i T_j(x_i)``.
+
+        ``T_m T_n = (T_{m+n} + T_{|m-n|}) / 2`` turns the ``(n_pix, k, k)``
+        reduction into one ``(n_pix, 2k + 1)`` matvec, linear in the order.
+        """
+        moments = weights @ self.moment_basis
+        return 0.5 * (moments[self.pair_plus] + moments[self.pair_minus])
+
     def normal_matrix(self, mu, sigma, mask) -> Array:
         """``D^T D + Sigma_p^{-1}`` -- the posterior precision of the coefficients."""
-        design = self.design(mu, sigma, mask)
-        # Expose each coefficient pair as a pixel reduction. Under NSS vmap,
-        # this avoids a separate, poorly occupied tiny GEMM for every chain.
-        normal = jnp.sum(design[:, :, None] * design[:, None, :], axis=0)
+        normal = self._gram(self._weights(mu, sigma, mask))
         precision = self._precision()
         return normal if precision is None else normal + precision
+
+    def _rhs(self, y, mu, sigma, mask) -> Array:
+        """``D^T t`` with ``t_i = (y_i - mu_i) / sigma_i`` (zero outside the mask)."""
+        mask = jnp.asarray(mask, dtype=bool)
+        mu = jnp.asarray(mu)
+        safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
+        target = jnp.where(mask, mu * (jnp.asarray(y) - mu) / safe_sigma ** 2, 0.0)
+        return target @ self.basis
+
+    def _factor(self, mu, sigma, mask) -> Array:
+        """Lower Cholesky factor of the (symmetric positive definite) normal matrix."""
+        return jnp.linalg.cholesky(self.normal_matrix(mu, sigma, mask))
 
     def solve(self, y, mu, sigma, mask) -> Array:
         """
@@ -248,13 +293,8 @@ class PolynomialCalibration:
 
         Pure JAX (jit/grad safe).  Masked pixels carry zero weight.
         """
-        mask = jnp.asarray(mask, dtype=bool)
-        mu = jnp.asarray(mu)
-        safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
-        design = self.design(mu, safe_sigma, mask)
-        target = jnp.where(mask, (jnp.asarray(y) - mu) / safe_sigma, 0.0)
-        rhs = design.T @ target
-        return jnp.linalg.solve(self.normal_matrix(mu, safe_sigma, mask), rhs)
+        return jsl.cho_solve((self._factor(mu, sigma, mask), True),
+                             self._rhs(y, mu, sigma, mask))
 
     def covariance(self, mu, sigma, mask) -> Array:
         """Posterior covariance of the coefficients given ``theta``: ``N^{-1}``."""
@@ -279,10 +319,14 @@ class PolynomialCalibration:
         ``+0.5 ln|Sigma_p^{-1}| - 0.5 ln|N|`` with a prior, or
         ``+(k/2) ln 2 pi - 0.5 ln|N|`` for the flat-prior integral.
         """
+        _, log_det_normal = jnp.linalg.slogdet(normal)
+        return self._marginal_terms(coeffs, log_det_normal)
+
+    def _marginal_terms(self, coeffs, log_det_normal) -> Array:
+        """:meth:`log_marginal_terms` given ``ln|N|`` directly."""
         total = self.log_prior(coeffs)
         if not self.marginalize:
             return total
-        _, log_det_normal = jnp.linalg.slogdet(normal)
         total = total - 0.5 * log_det_normal
         if self.prior_sigma is None:
             return total + 0.5 * self.n_coeff * _LOG_2PI
@@ -301,15 +345,12 @@ class PolynomialCalibration:
         ln_extra : Array, scalar
             :meth:`log_marginal_terms` at ``a_hat``; the likelihood adds it.
         """
-        mask = jnp.asarray(mask, dtype=bool)
         mu = jnp.asarray(mu)
-        safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
-        normal = self.normal_matrix(mu, safe_sigma, mask)
-        design = self.design(mu, safe_sigma, mask)
-        target = jnp.where(mask, (jnp.asarray(y) - mu) / safe_sigma, 0.0)
-        coeffs = jnp.linalg.solve(normal, design.T @ target)
+        factor = self._factor(mu, sigma, mask)
+        coeffs = jsl.cho_solve((factor, True), self._rhs(y, mu, sigma, mask))
+        log_det_normal = 2.0 * jnp.sum(jnp.log(jnp.diagonal(factor)))
         return (self.polynomial(coeffs) * mu, coeffs,
-                self.log_marginal_terms(coeffs, normal))
+                self._marginal_terms(coeffs, log_det_normal))
 
     def posterior_draws(self, y, mu_draws, sigma_draws, mask, key,
                         draws_per_sample: int = 1) -> tuple[Array, Array]:

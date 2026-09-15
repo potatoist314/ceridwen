@@ -447,7 +447,7 @@ def test_repr_states_marginalisation_and_prior():
     assert "order=3" in text and "marginalize=True" in text and "0.1" in text
 
 
-@pytest.mark.parametrize('order', [1, 3, 7])
+@pytest.mark.parametrize('order', [1, 3, 7, 10, 24])
 def test_calibration_reduction_preserves_gram_matrix_and_gradient(order):
     from ceridwen.likelihood import PolynomialCalibration
     wave = np.linspace(6000., 9000., 321)
@@ -465,3 +465,28 @@ def test_calibration_reduction_preserves_gram_matrix_and_gradient(order):
         a = jax.jit(jax.vmap(function(reference)))(flux)
         b = jax.jit(jax.vmap(function(candidate)))(flux)
         np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize('order', [10, 24])
+def test_calibrate_matches_explicit_solve_and_slogdet(order):
+    """Cholesky path == explicit LU solve + slogdet of the explicit Gram matrix."""
+    from ceridwen.likelihood import PolynomialCalibration
+    wave = np.linspace(6000., 9000., 1500)
+    mask = np.arange(len(wave)) % 7 != 0
+    calibration = PolynomialCalibration.from_wavelength(
+        wave, order=order, mask=mask, prior_sigma=.1)
+    mu, y, sigma, _ = _mock(3, snr=30)
+    mu, y, sigma = mu[:1500], y[:1500], sigma[:1500]
+    y = y * (1. + .03 * np.cos(4. * np.pi * calibration.x))
+    mu_cal, coeffs, ln_extra = jax.jit(calibration.calibrate)(y, mu, sigma, mask)
+    design = calibration.design(mu, sigma, mask)
+    target = jnp.where(mask, (y - mu) / sigma, 0.)
+    normal = design.T @ design + calibration._precision()
+    ref_coeffs = jnp.linalg.solve(normal, design.T @ target)
+    ref_extra = (calibration.log_prior(ref_coeffs)
+                 - .5 * jnp.linalg.slogdet(normal)[1]
+                 - jnp.sum(jnp.log(jnp.asarray(calibration.prior_sigma))))
+    np.testing.assert_allclose(coeffs, ref_coeffs, rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(mu_cal, calibration.polynomial(ref_coeffs) * mu, rtol=1e-9)
+    np.testing.assert_allclose(ln_extra, ref_extra, rtol=1e-9)
+    assert calibration.moment_basis.shape == (1500, 2 * order + 1)
