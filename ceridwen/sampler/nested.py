@@ -73,6 +73,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Callable, Optional
@@ -154,6 +155,13 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         Called after each completed step with ``(iteration, key, incoming,
         outgoing, info, compiled_step, elapsed_seconds)``. Default None.
         Intended for profiling; the callback must not modify the sampler state.
+    progress_path : str, optional
+        JSON-lines file that receives one record per completed iteration:
+        the checkpoint ``progress`` fields plus ``iteration_s``,
+        ``dead_per_s`` and ``likelihood_calls_per_s`` (both cumulative over
+        ``elapsed_s``).  Written whether or not ``verbose`` is set, appended
+        and flushed per line so a killed run keeps its history.  Default None
+        writes nothing.
     """
 
     def __init__(
@@ -171,6 +179,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         checkpoint_frame_limit: int = 64,
         checkpoint_frame_max_bytes: int = 2 * 1024 * 1024,
         iteration_callback: Optional[Callable] = None,
+        progress_path: Optional[str] = None,
     ):
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
@@ -179,6 +188,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self.logZ_tol        = float(logZ_tol)
         self.verbose         = bool(verbose)
         self.iteration_callback = iteration_callback
+        self.progress_path = progress_path
         # Periodic checkpointing.  Every ``checkpoint_interval_s`` seconds
         # (default 1200 = 20 min; <= 0 disables) the accumulated dead points
         # are finalised against the current live ensemble and dumped to disk,
@@ -567,6 +577,23 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             print(f"  [checkpoint] every {self.checkpoint_interval_s:.0f} s "
                   f"-> {_ckpt_dir}", flush=True)
 
+        def _progress_record(logZ, logZ_live, elapsed_s):
+            return {
+                "iteration": _iter,
+                "n_likelihood_calls": n_like_calls,
+                "n_discarded": num_delete * _iter,
+                "n_live": self.num_live,
+                "num_delete": num_delete,
+                "num_inner_steps": num_inner_steps,
+                "logZ": logZ,
+                "logZ_live": logZ_live,
+                "delta_logZ": logZ_live - logZ,
+                "elapsed_s": elapsed_s,
+            }
+
+        _progress_file = (open(self.progress_path, "a", encoding="utf-8")
+                          if self.progress_path else None)
+
         desc = "NS  (starting)"
         try:
             desc = f"NS  logZ={_get_logZ(live):.1f}"
@@ -612,6 +639,14 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                     )
                 dead_list.append(dead_info)
                 n_like_calls += int(self._logical_likelihood_calls(dead_info))
+                if _progress_file is not None:
+                    _elapsed = time.perf_counter() - t_start
+                    _record = _progress_record(_logZ, _logZ_live, _elapsed)
+                    _record["iteration_s"] = _dt_iter
+                    _record["dead_per_s"] = _record["n_discarded"] / _elapsed
+                    _record["likelihood_calls_per_s"] = n_like_calls / _elapsed
+                    _progress_file.write(json.dumps(_record) + "\n")
+                    _progress_file.flush()
                 pbar.update(num_delete)
                 try:
                     pbar.set_description(
@@ -625,18 +660,8 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 # wall-time kill / node crash mid-run is recoverable.
                 if _ckpt_on and (time.perf_counter() - _last_ckpt
                                  >= self.checkpoint_interval_s):
-                    _progress = {
-                        "iteration": _iter,
-                        "n_likelihood_calls": n_like_calls,
-                        "n_discarded": num_delete * _iter,
-                        "n_live": self.num_live,
-                        "num_delete": num_delete,
-                        "num_inner_steps": num_inner_steps,
-                        "logZ": _logZ,
-                        "logZ_live": _logZ_live,
-                        "delta_logZ": _logZ_live - _logZ,
-                        "elapsed_s": time.perf_counter() - t_start,
-                    }
+                    _progress = _progress_record(
+                        _logZ, _logZ_live, time.perf_counter() - t_start)
                     _p = self._dump_snapshot(
                         _ckpt_dir, live, dead_list, ns_utils,
                         _logZ, tag="checkpoint", partial=True,
@@ -646,6 +671,8 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                         print(f"  [checkpoint] iter {_iter}: {_p}", flush=True)
 
         wall_time = time.perf_counter() - t_start
+        if _progress_file is not None:
+            _progress_file.close()
         if self.verbose:
             print(
                 f"  Converged  logZ = {_get_logZ(live):.3f}  "
@@ -670,18 +697,8 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         # fully-converged snapshot.
         _rescue_dir = self._resolve_ckpt_dir()
         if _rescue_dir:
-            _progress = {
-                "iteration": _iter,
-                "n_likelihood_calls": n_like_calls,
-                "n_discarded": num_delete * _iter,
-                "n_live": self.num_live,
-                "num_delete": num_delete,
-                "num_inner_steps": num_inner_steps,
-                "logZ": _get_logZ(live),
-                "logZ_live": _get_logZ_live(live),
-                "delta_logZ": _get_logZ_live(live) - _get_logZ(live),
-                "elapsed_s": wall_time,
-            }
+            _progress = _progress_record(
+                _get_logZ(live), _get_logZ_live(live), wall_time)
             self._dump_snapshot(_rescue_dir, live, dead_list, ns_utils,
                                 _get_logZ(live), tag="rescue", partial=False,
                                 progress=_progress)

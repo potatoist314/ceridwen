@@ -110,6 +110,45 @@ def test_checkpoint_disabled_when_no_dir(tmp_path, monkeypatch):
     assert not glob.glob(os.path.join(tmp_path, "*.pkl"))
 
 
+def test_progress_file_records_every_iteration(tmp_path):
+    """One JSON line per iteration, with rates, even when verbose is off."""
+    import json
+
+    priors, loglike, logprior, theta_init = _toy()
+    path = tmp_path / "ns_progress.jsonl"
+    ad = BlackJAXNestedSamplerAdapter(
+        priors, num_live=120, num_delete=40, num_inner_steps=10,
+        logZ_tol=-2.0, verbose=False, checkpoint_dir=str(tmp_path),
+        progress_path=str(path))
+    res = ad.run(loglike, logprior, theta_init, jax.random.PRNGKey(0))
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["iteration"] for r in records] == list(range(1, len(records) + 1))
+    assert records[-1]["n_discarded"] == 40 * len(records)
+    assert records[-1]["n_likelihood_calls"] == res.n_likelihood_calls
+    calls = [r["n_likelihood_calls"] for r in records]
+    assert calls == sorted(calls)
+    for r in records:
+        assert r["iteration_s"] > 0
+        assert np.isclose(r["dead_per_s"], r["n_discarded"] / r["elapsed_s"])
+        assert np.isclose(r["likelihood_calls_per_s"],
+                          r["n_likelihood_calls"] / r["elapsed_s"])
+        assert np.isclose(r["delta_logZ"], r["logZ_live"] - r["logZ"])
+    # The rescue snapshot reports the same final iteration.
+    rescue = glob.glob(os.path.join(tmp_path, "ns_raw_dead_*.pkl"))[0]
+    progress = BlackJAXNestedSamplerAdapter.load_checkpoint(rescue)["progress"]
+    assert progress["iteration"] == records[-1]["iteration"]
+
+
+def test_no_progress_file_by_default(tmp_path):
+    priors, loglike, logprior, theta_init = _toy()
+    ad = BlackJAXNestedSamplerAdapter(
+        priors, num_live=120, num_delete=40, num_inner_steps=10,
+        logZ_tol=-2.0, verbose=False, checkpoint_dir=str(tmp_path))
+    ad.run(loglike, logprior, theta_init, jax.random.PRNGKey(0))
+    assert not glob.glob(os.path.join(tmp_path, "*.jsonl"))
+
+
 def test_load_checkpoint_accepts_legacy_snapshot(tmp_path):
     import pickle
 
