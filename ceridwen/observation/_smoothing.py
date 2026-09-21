@@ -24,8 +24,16 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+from sedpy_jax.smoothing import _lin_grid, _log_grid, _lsf_grid, _lsf_subtract_inres
 
-__all__ = ["combined_sigma_lambda", "make_static_smoother"]
+__all__ = [
+    "combined_sigma_lambda",
+    "make_static_smoother",
+    "make_vel_smoother",
+    "make_wave_smoother",
+    "make_lsf_smoother",
+    "make_static_grid_interp",
+]
 
 
 def _bake_interp(x, xp, dtype=jnp.float64):
@@ -177,3 +185,108 @@ def make_static_smoother(
 
     smoother.grid_size = int(lam.size)
     return smoother
+
+
+# ---------------------------------------------------------------------------
+# Runtime-width smoothers: same operators as the sedpy_jax factories of the
+# same names, with every static piece baked.  Used when the LOSVD is sampled,
+# so the two stages cannot collapse into one static Gaussian.
+# ---------------------------------------------------------------------------
+
+def _padded_length(n, sigma_pix):
+    """Shortest FFT length ``n + n/8, n + n/4, n + n/2, 2n`` with a 20-sigma pad.
+
+    The cyclic wrap of a Gaussian only has to land in the zero pad.  Beyond
+    20 sigma the kernel is below 1e-87, so a pad of that width gives the same
+    convolution as the ``2n`` of ``smooth_fft_padded`` to rounding error, with
+    a shorter transform.  All four lengths are 3-smooth times a power of two.
+    """
+    for shift in (3, 2, 1):
+        if (n >> shift) >= 20.0 * sigma_pix:
+            return n + (n >> shift)
+    return 2 * n
+
+
+def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64):
+    """Return ``smoother(spec, sigma)``: resample -> padded Gaussian FFT -> resample.
+
+    Matches ``jax_interp -> smooth_fft_padded -> jax_interp`` of sedpy_jax.
+    Only ``spec`` and ``sigma`` stay traced.  A Python-float ``sigma`` also
+    bakes the taper and shortens the zero pad to what that width needs; a
+    traced ``sigma`` keeps the ``2n`` pad.
+    """
+    n = len(grid)
+    dx = float(dx)
+    to_grid = _bake_interp(grid, wave, dtype)
+    to_out = _bake_interp(outwave, grid, dtype)
+    exponent_2n = jnp.asarray(
+        -2.0 * np.pi**2 * np.fft.rfftfreq(2 * n, d=dx) ** 2).astype(dtype)
+
+    def smoother(spec, sigma):
+        if isinstance(sigma, (int, float, np.floating)):
+            sigma_eff = np.sqrt(max(float(sigma) ** 2 - float(inres) ** 2, 0.0))
+            m = _padded_length(n, sigma_eff / dx)
+            nu = np.fft.rfftfreq(m, d=dx)
+            taper = jnp.asarray(
+                np.exp(-2.0 * np.pi**2 * sigma_eff**2 * nu**2)).astype(dtype)
+        else:
+            m = 2 * n
+            taper = jnp.exp(exponent_2n * jnp.maximum(sigma**2 - inres**2, 0.0))
+        padded = jnp.concatenate([to_grid(spec), jnp.zeros((m - n,), dtype=dtype)])
+        return to_out(jnp.fft.irfft(jnp.fft.rfft(padded) * taper, n=m)[:n])
+
+    return smoother
+
+
+def make_vel_smoother(wave, outwave, inres=0.0):
+    """Baked ``sedpy_jax.smoothing.make_vel_smoother``: ``smoother(spec, sigma_v)``."""
+    grid, dv = _log_grid(np.asarray(wave))
+    return _bake_fft_smoother(wave, grid, dv, outwave, inres)
+
+
+def make_wave_smoother(wave, outwave, inres=0.0):
+    """Baked ``sedpy_jax.smoothing.make_wave_smoother``: ``smoother(spec, sigma_l)``."""
+    grid, dw = _lin_grid(np.asarray(wave))
+    return _bake_fft_smoother(wave, grid, dw, outwave, inres)
+
+
+def make_lsf_smoother(wave, sigma_lsf, outwave, pix_per_sigma=2, inres=0.0):
+    """Baked ``sedpy_jax.smoothing.make_lsf_smoother``: ``smoother(spec)``."""
+    sigma_eff = _lsf_subtract_inres(np.asarray(wave), np.asarray(sigma_lsf), inres)
+    lam, dx, x_per_sigma = _lsf_grid(np.asarray(wave), sigma_eff, pix_per_sigma)
+    smoother = _bake_fft_smoother(wave, lam, dx, outwave, 0.0)
+    return lambda spec: smoother(spec, x_per_sigma)
+
+
+def make_static_grid_interp(xp):
+    """Return ``f(x, fp) == jnp.interp(x, xp, fp)`` for a static ``xp`` and traced ``x``.
+
+    ``jnp.interp`` finds each interval with a binary search, a sequential
+    loop of log2(n) gathers per call.  ``xp`` is static, so the search is
+    replaced by a lookup table over uniform cells no wider than the smallest
+    ``xp`` step: each cell holds at most one node, and one comparison with
+    each neighbour node recovers ``searchsorted(xp, x, side="right")``
+    exactly.  The interpolation arithmetic is that of ``jnp.interp``.
+    """
+    xp_np = np.asarray(xp, dtype=np.float64)
+    n = len(xp_np)
+    h = float(np.diff(xp_np).min())
+    n_cell = int(np.ceil((xp_np[-1] - xp_np[0]) / h)) + 1
+    starts = xp_np[0] + h * np.arange(n_cell)
+    table = jnp.asarray(np.searchsorted(xp_np, starts, side="right"))
+    xp_j = jnp.asarray(xp_np)
+    x_first = float(xp_np[0])
+
+    def interp(x, fp):
+        cell = jnp.clip(jnp.floor((x - x_first) / h), 0, n_cell - 1).astype(jnp.int32)
+        i = table[cell]
+        above = xp_j[jnp.clip(i, 0, n - 1)] <= x
+        below = xp_j[jnp.clip(i - 1, 0, n - 1)] > x
+        i = jnp.clip(i + above.astype(i.dtype) - below.astype(i.dtype), 1, n - 1)
+        df = fp[i] - fp[i - 1]
+        dx = xp_j[i] - xp_j[i - 1]
+        f = fp[i - 1] + ((x - xp_j[i - 1]) / dx) * df
+        f = jnp.where(x < xp_j[0], fp[0], f)
+        return jnp.where(x > xp_j[-1], fp[-1], f)
+
+    return interp

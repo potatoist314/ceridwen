@@ -8,12 +8,13 @@ import json
 import jax.numpy as jnp
 import numpy as np
 from sedpy_jax.observate import FilterSet
-from sedpy_jax.smoothing import (
-    make_vel_smoother,
-    make_wave_smoother,
-    make_lsf_smoother,
+from sedpy_jax import smoothing as _sedpy_smoothing
+from . import _smoothing
+from ._smoothing import (
+    combined_sigma_lambda,
+    make_static_grid_interp,
+    make_static_smoother,
 )
-from ._smoothing import combined_sigma_lambda, make_static_smoother
 from .base import Observation, _CKMS
 
 # FWHM = 2 sqrt(2 ln 2) sigma for a Gaussian kernel.
@@ -159,6 +160,7 @@ class Spectrum(Observation):
         sigma_losvd  = None,
         fit_sigma_smooth = False,
         free_z       = False,
+        baked_runtime = False,
         **kwargs,
     ):
         """
@@ -228,6 +230,11 @@ class Spectrum(Observation):
             exact prediction at ``zred`` up to linear interpolation between
             observed pixels.  ``CSPBasis.predict`` threads ``theta["zred"]``
             in when this flag is set.
+        baked_runtime : bool, optional
+            Precompute the static indices, weights and tapers of the
+            runtime ``sigma_smooth`` and ``zred`` paths.  ``False`` (default)
+            keeps the sedpy_jax smoothers and ``jnp.interp``; the prediction
+            is the same to rounding error.
         """
         # Store wavelength via the property setter so subclasses can override.
         self._wavelength    = (
@@ -291,6 +298,7 @@ class Spectrum(Observation):
         self.sigma_losvd     = (None if sigma_losvd is None
                                 else float(sigma_losvd))
         self.free_z          = bool(free_z)
+        self.baked_runtime   = bool(baked_runtime)
 
         super().__init__(
             flux        = flux,
@@ -476,6 +484,19 @@ class Spectrum(Observation):
 
         self._H_factors = (j_lo, j_hi, alpha, n_pix, n_wave)
         self._H_cached = None
+
+        # ── Runtime-parameter fast path ────────────────────────────────────
+        # Same operators either way; the baked factories precompute every
+        # static index, weight and taper, and the redshift stretch reads the
+        # observed grid through a lookup table instead of a binary search.
+        _factories = _smoothing if self.baked_runtime else _sedpy_smoothing
+        make_vel_smoother  = _factories.make_vel_smoother
+        make_wave_smoother = _factories.make_wave_smoother
+        make_lsf_smoother  = _factories.make_lsf_smoother
+        if self.free_z:
+            self._stretch_interp = (
+                make_static_grid_interp(wo) if self.baked_runtime
+                else (lambda x, fp, _wo=jnp.asarray(wo): jnp.interp(x, _wo, fp)))
 
         # ── Build _predict_fn ──────────────────────────────────────────────
         st         = self.smoothtype
@@ -837,7 +858,7 @@ class Spectrum(Observation):
         # rescaled observed wavelengths.
         wo = self._wavelength
         stretch = (1.0 + self._zred_setup) / (1.0 + jnp.asarray(zred).reshape(()))
-        return jnp.interp(wo * stretch, wo, mu)
+        return self._stretch_interp(wo * stretch, mu)
 
     # ------------------------------------------------------------------
     def synthetic_photometry(self, filterset):
