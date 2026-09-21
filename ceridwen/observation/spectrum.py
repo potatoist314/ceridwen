@@ -160,7 +160,7 @@ class Spectrum(Observation):
         sigma_losvd  = None,
         fit_sigma_smooth = False,
         free_z       = False,
-        baked_runtime = False,
+        baked_runtime = True,
         **kwargs,
     ):
         """
@@ -232,7 +232,7 @@ class Spectrum(Observation):
             in when this flag is set.
         baked_runtime : bool, optional
             Precompute the static indices, weights and tapers of the
-            runtime ``sigma_smooth`` and ``zred`` paths.  ``False`` (default)
+            runtime ``sigma_smooth`` and ``zred`` paths (default).  ``False``
             keeps the sedpy_jax smoothers and ``jnp.interp``; the prediction
             is the same to rounding error.
         """
