@@ -6,6 +6,7 @@ from .noise_model import (
     DiagonalNoiseModel,
 )
 from .calibration import PolynomialCalibration
+from .emission_lines import EmissionLineColumns
 
 from .likelihood import (
     LikelihoodOutput,
@@ -30,6 +31,7 @@ __all__ = [
     "DiagonalNoiseModel",
     # calibration
     "PolynomialCalibration",
+    "EmissionLineColumns",
     # likelihood
     "LikelihoodOutput",
     "LikelihoodBase",

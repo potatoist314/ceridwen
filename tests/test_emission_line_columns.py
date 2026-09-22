@@ -1,0 +1,152 @@
+"""Emission lines as free-flux columns of the calibration solve.
+
+``PolynomialCalibration.calibrate_with_lines`` integrates out the Chebyshev
+coefficients and the line fluxes (flat prior) in one Gaussian integral.
+Pure-kernel tests; the line-list test needs ``$SPS_HOME`` and skips without it.
+"""
+from __future__ import annotations
+
+import os
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from numpy.polynomial.chebyshev import chebvander
+from scipy.integrate import quad
+
+from ceridwen.likelihood import (
+    DiagonalGaussianLikelihood,
+    DiagonalNoiseModel,
+    EmissionLineColumns,
+    PolynomialCalibration,
+)
+from ceridwen.observation import Spectrum
+
+jax.config.update("jax_enable_x64", True)
+
+WAVE = np.linspace(6000.0, 9000.0, 2000)
+X = (WAVE - 7500.0) / 1500.0
+ZRED = 0.7
+REST = np.array([3727.118, 4102.9514, 4862.7629])  # [O II], H-delta, H-beta (vacuum)
+SIGMA_INST = 40.0                                  # km/s
+SIGMA_GAS = 200.0                                  # km/s
+
+
+def _lines(rest=REST, free=True):
+    return EmissionLineColumns(
+        wave_obs=WAVE, sigma_inst_kms=np.full(WAVE.shape, SIGMA_INST), wave_rest=rest,
+        names=tuple(f"{w:.0f}" for w in rest), zred=ZRED, sigma_gas_kms=SIGMA_GAS,
+        zred_key="zred" if free else None, sigma_key="sigma_smooth" if free else None)
+
+
+def _continuum():
+    return 1e-29 * (1.0 + 0.3 * X) * (1.0 - 0.3 * np.exp(-((WAVE - 7000.0) / 8.0) ** 2))
+
+
+def _mock(fluxes, seed=0, snr=30.0):
+    mu = _continuum()
+    sigma = mu / snr
+    L = np.asarray(_lines().columns({"zred": ZRED, "sigma_smooth": SIGMA_GAS}))
+    p_true = 1.0 + chebvander(X, 2)[:, 1:] @ np.array([0.02, -0.01])
+    y = p_true * mu + L @ fluxes + np.random.default_rng(seed).normal(0.0, sigma)
+    return mu, y, sigma, np.ones(WAVE.shape, dtype=bool), L
+
+
+def test_line_columns_have_unit_flux():
+    L = np.asarray(_lines().columns({"zred": ZRED, "sigma_smooth": SIGMA_GAS}))
+    f_lambda = L * 2.99792458e18 / WAVE[:, None] ** 2
+    np.testing.assert_allclose(np.trapezoid(f_lambda, WAVE, axis=0), 1.0, rtol=1e-6)
+    centre = WAVE[np.argmax(L, axis=0)]
+    np.testing.assert_allclose(centre, REST * (1 + ZRED), atol=WAVE[1] - WAVE[0])
+
+
+@pytest.mark.parametrize("prior_sigma", [None, [0.3, 0.1, 0.1, 0.1]])
+def test_zero_line_columns_equal_polynomial_marginalisation(prior_sigma):
+    mu, y, sigma, mask, _ = _mock(np.zeros(3))
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
+                                                prior_sigma=prior_sigma)
+    mu_cal, coeffs, ln_extra = cal.calibrate(y, mu, sigma, mask)
+    mu_j, coeffs_j, fluxes, ln_extra_j = cal.calibrate_with_lines(
+        y, mu, sigma, mask, jnp.zeros((WAVE.size, 0)))
+    assert fluxes.shape == (0,)
+    np.testing.assert_allclose(coeffs_j, coeffs, rtol=1e-10, atol=1e-14)
+    np.testing.assert_allclose(mu_j, mu_cal, rtol=1e-12)
+    np.testing.assert_allclose(ln_extra_j, ln_extra, rtol=0, atol=1e-8)
+
+
+def test_joint_marginal_matches_quadrature_over_one_line_flux():
+    """ln of the integral over the flux f of the polynomial marginal of y - f L."""
+    mu, y, sigma, mask, L = _mock(np.array([0.0, 3e-17, 0.0]), snr=15.0)
+    line = L[:, 1:2]
+    cal = PolynomialCalibration.from_wavelength(WAVE, 2, fit_constant=True,
+                                                prior_sigma=[0.3, 0.1, 0.1])
+    lhood = DiagonalGaussianLikelihood(calibration=cal)
+    joint = DiagonalGaussianLikelihood(calibration=cal, emission_lines=_lines(REST[1:2], False))
+
+    def polynomial_marginal(f):
+        return float(lhood(y - f * line[:, 0], mu, sigma, mask)[0])
+
+    _, _, f_hat, _ = cal.calibrate_with_lines(y, mu, sigma, mask, jnp.asarray(line))
+    f_hat = float(f_hat[0])
+    peak = polynomial_marginal(f_hat)
+    width = 1.0 / np.sqrt(float(line[:, 0] @ (line[:, 0] / sigma ** 2)))
+    integral, _ = quad(lambda f: np.exp(polynomial_marginal(f) - peak),
+                       f_hat - 12 * width, f_hat + 12 * width, epsabs=0, epsrel=1e-11, limit=200)
+    np.testing.assert_allclose(float(joint(y, mu, sigma, mask)[0]), peak + np.log(integral),
+                               rtol=0, atol=1e-6)
+
+
+def test_injected_lines_are_recovered():
+    truth = np.array([4e-17, -1e-17, 2e-17])
+    mu, y, sigma, mask, L = _mock(truth, seed=3)
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
+                                                prior_sigma=[0.3, 0.1, 0.1, 0.1])
+    _, coeffs, fluxes, _ = cal.calibrate_with_lines(y, mu, sigma, mask, jnp.asarray(L))
+    normal, _ = cal._joint_system(y, mu, sigma, mask, jnp.asarray(L))
+    sd = np.sqrt(np.diag(np.linalg.inv(np.asarray(normal))))[cal.n_coeff:]
+    assert np.all(np.abs(np.asarray(fluxes) - truth) < 3 * sd)
+    assert np.all(truth[[0, 2]] / sd[[0, 2]] > 10)
+    # posterior draws scatter around the solution with the same width
+    draws = cal.posterior_draws_with_lines(
+        y, np.tile(mu, (4000, 1)), np.tile(sigma, (4000, 1)), jnp.tile(jnp.asarray(L), (4000, 1, 1)),
+        mask, jax.random.PRNGKey(0))[1]
+    np.testing.assert_allclose(np.std(np.asarray(draws), axis=0), sd, rtol=0.05)
+
+
+def test_likelihood_prefers_the_redshift_of_the_injected_lines():
+    mu, y, sigma, mask, _ = _mock(np.array([4e-17, 0.0, 2e-17]), seed=4)
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
+                                                prior_sigma=[0.3, 0.1, 0.1, 0.1])
+    lhood = DiagonalGaussianLikelihood(noise_model=DiagonalNoiseModel(use_fractional=True),
+                                       calibration=cal, emission_lines=_lines())
+    zs = ZRED + np.linspace(-2e-3, 2e-3, 41)
+    lnl = [float(lhood(y, mu, sigma, mask, {"zred": jnp.array([z]),
+                                            "sigma_smooth": jnp.array([SIGMA_GAS]),
+                                            "log_f_calib": jnp.array([np.log(0.01)])})[0])
+           for z in zs]
+    assert abs(zs[int(np.argmax(lnl))] - ZRED) <= 1e-4
+
+
+def test_likelihood_without_lines_is_the_polynomial_likelihood():
+    mu, y, sigma, mask, _ = _mock(np.zeros(3))
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True, prior_sigma=0.1)
+    plain = DiagonalGaussianLikelihood(calibration=cal)
+    assert DiagonalGaussianLikelihood(calibration=cal, emission_lines=None) == plain
+    assert repr(plain) == f"DiagonalGaussianLikelihood(noise_model={plain.noise_model!r}, calibration={cal!r})"
+
+
+@pytest.mark.skipif(not os.environ.get("SPS_HOME"), reason="needs $SPS_HOME for emlines_info.dat")
+def test_from_spectrum_selects_covered_lines_with_enough_unmasked_pixels():
+    spec = Spectrum(wavelength=WAVE, flux=_continuum(), uncertainty=_continuum() / 30,
+                    resolution=3500.0, smoothtype="R", res_convention="fwhm",
+                    sigma_losvd=SIGMA_GAS, fit_sigma_smooth=True, free_z=True, name="spectrum")
+    spec.mask_wavelength_range(4862.7629 * (1 + ZRED) - 30, 4862.7629 * (1 + ZRED) + 30)
+    lines = EmissionLineColumns.from_spectrum(spec, ZRED, zred_range=(ZRED - 0.01, ZRED + 0.01))
+    assert "[O II] 3726" in lines.names and "[O III] 5007" in lines.names
+    assert "Ba-beta 4861" not in lines.names          # masked: fewer than 3 pixels
+    assert lines.zred_key == "zred" and lines.sigma_key == "sigma_smooth"
+    assert np.all(lines.wave_rest * (1 + ZRED - 0.01) > WAVE[0])
+    assert np.all(lines.wave_rest * (1 + ZRED + 0.01) < WAVE[-1])
+    assert lines.covers(5006.8) and not lines.covers(4861.3)

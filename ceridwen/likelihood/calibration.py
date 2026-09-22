@@ -352,6 +352,90 @@ class PolynomialCalibration:
         return (self.polynomial(coeffs) * mu, coeffs,
                 self._marginal_terms(coeffs, log_det_normal))
 
+    def _joint_system(self, y, mu, sigma, mask, lines) -> tuple[Array, Array]:
+        """Normal matrix and right-hand side of ``y ~= mu (1 + basis @ a) + lines @ f``:
+        the polynomial block as in :meth:`normal_matrix`, the line block
+        ``L^T W L`` (flat prior) and their cross terms."""
+        mask = jnp.asarray(mask, dtype=bool)
+        mu = jnp.asarray(mu)
+        safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
+        weighted_lines = jnp.where(mask, 1.0 / safe_sigma ** 2, 0.0)[:, None] * lines
+        cross = self.basis.T @ (mu[:, None] * weighted_lines)
+        normal = jnp.block([[self.normal_matrix(mu, sigma, mask), cross],
+                            [cross.T, lines.T @ weighted_lines]])
+        residual = jnp.where(mask, jnp.asarray(y) - mu, 0.0)
+        rhs = jnp.concatenate([self._rhs(y, mu, sigma, mask),
+                               weighted_lines.T @ residual])
+        return normal, rhs
+
+    def _joint_factor(self, y, mu, sigma, mask, lines):
+        """Jacobi-scaled Cholesky factor, scale and solution of the joint system."""
+        normal, rhs = self._joint_system(y, mu, sigma, mask, lines)
+        scale = 1.0 / jnp.sqrt(jnp.diagonal(normal))
+        factor = jnp.linalg.cholesky(scale[:, None] * normal * scale[None, :])
+        solution = scale * jsl.cho_solve((factor, True), scale * rhs)
+        return factor, scale, solution
+
+    def calibrate_with_lines(self, y, mu, sigma, mask, lines
+                             ) -> tuple[Array, Array, Array, Array]:
+        """
+        :meth:`calibrate` with emission lines added after the polynomial.
+
+        The model is ``P(x) * mu + lines @ f``; the coefficients (Gaussian
+        prior) and the line fluxes ``f`` (flat prior) are integrated out
+        together.  ``lines`` is the ``(n_pix, n_line)`` matrix of
+        :meth:`EmissionLineColumns.columns`; with zero columns the result
+        equals :meth:`calibrate`.
+
+        Returns
+        -------
+        mu_cal : Array, shape (n_pix,)
+            ``P(x) * mu + lines @ f_hat``.
+        coeffs : Array, shape (n_coeff,)
+        fluxes : Array, shape (n_line,)
+            Line fluxes at the joint maximum.
+        ln_extra : Array, scalar
+            Coefficient prior at the solution plus, with ``marginalize``,
+            ``-0.5 ln|N|`` and the prior and flat-prior normalisations.
+        """
+        mu = jnp.asarray(mu)
+        factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines)
+        coeffs, fluxes = solution[:self.n_coeff], solution[self.n_coeff:]
+        log_det_normal = (2.0 * jnp.sum(jnp.log(jnp.diagonal(factor)))
+                          - 2.0 * jnp.sum(jnp.log(scale)))
+        ln_extra = self._marginal_terms(coeffs, log_det_normal)
+        if self.marginalize:
+            ln_extra = ln_extra + 0.5 * lines.shape[1] * _LOG_2PI
+        return (self.polynomial(coeffs) * mu + lines @ fluxes, coeffs, fluxes,
+                ln_extra)
+
+    def posterior_draws_with_lines(self, y, mu_draws, sigma_draws, lines_draws,
+                                   mask, key) -> tuple[Array, Array, Array]:
+        """
+        One joint draw of coefficients and line fluxes per posterior sample,
+        ``(a, f) ~ N((a_hat, f_hat), N^{-1})``.
+
+        Returns
+        -------
+        coeffs : Array, shape (n_draws, n_coeff)
+        fluxes : Array, shape (n_draws, n_line)
+        model : Array, shape (n_draws, n_pix)
+            ``P(x) * mu + lines @ f`` for every draw.
+        """
+        mask = jnp.asarray(mask, dtype=bool)
+        y = jnp.asarray(y)
+        n_draws, n_line = jnp.shape(lines_draws)[0], jnp.shape(lines_draws)[2]
+        noise = jax.random.normal(key, (n_draws, self.n_coeff + n_line))
+
+        def one(mu, sigma, lines, z):
+            factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines)
+            draw = solution + scale * jsl.solve_triangular(factor.T, z, lower=False)
+            coeffs, fluxes = draw[:self.n_coeff], draw[self.n_coeff:]
+            return coeffs, fluxes, self.polynomial(coeffs) * mu + lines @ fluxes
+
+        return jax.vmap(one)(jnp.asarray(mu_draws), jnp.asarray(sigma_draws),
+                             jnp.asarray(lines_draws), noise)
+
     def posterior_draws(self, y, mu_draws, sigma_draws, mask, key,
                         draws_per_sample: int = 1) -> tuple[Array, Array]:
         """

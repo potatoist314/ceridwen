@@ -94,6 +94,7 @@ import jax
 import jax.numpy as jnp
 
 from .calibration import PolynomialCalibration
+from .emission_lines import EmissionLineColumns
 from .noise_model import DiagonalNoiseModel, NoiseModelBase, NoiseModelOutput
 
 # Type alias matching the ceridwen codebase convention.
@@ -483,6 +484,13 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         the analytic marginalisation are added to the returned
         log-likelihood.  ``None`` (default) leaves every existing fit
         bit-for-bit unchanged.  Meant for ``Spectrum`` observations only.
+    emission_lines : EmissionLineColumns, optional
+        Emission lines as free-flux columns of the calibration solve (needs
+        ``calibration``): the model becomes ``P(x) * mu + sum_k f_k L_k``
+        and the line fluxes are integrated out with the coefficients
+        (``PolynomialCalibration.calibrate_with_lines``).  The line profiles
+        follow the sampled ``zred`` and ``sigma_smooth`` in ``params``.
+        ``None`` (default) leaves the likelihood unchanged.
 
     Examples
     --------
@@ -521,6 +529,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         default_factory=DiagonalNoiseModel
     )
     calibration: Optional[PolynomialCalibration] = None
+    emission_lines: Optional[EmissionLineColumns] = None
 
     # ------------------------------------------------------------------
     def __call__(
@@ -558,7 +567,12 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
             sigma_obs, mu, mask, params, data=y
         )
         ln_extra = jnp.zeros(())
-        if self.calibration is not None:
+        if self.emission_lines is not None:
+            mu, _, _, ln_extra = self.calibration.calibrate_with_lines(
+                y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
+                self.emission_lines.columns(params)
+            )
+        elif self.calibration is not None:
             mu, _, ln_extra = self.calibration.calibrate(
                 y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask
             )
@@ -614,6 +628,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         mask      : Array = observations.mask
         noise_model       = self.noise_model
         calibration       = self.calibration
+        emission_lines    = self.emission_lines
 
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
@@ -624,7 +639,13 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
             # JIT-compiled hot path and is safe for any noise model subclass.
             noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
             lnl = jnp.zeros(())
-            if calibration is not None:
+            if emission_lines is not None:
+                mu, _, _, ln_extra = calibration.calibrate_with_lines(
+                    y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
+                    emission_lines.columns(theta)
+                )
+                lnl = lnl + ln_extra
+            elif calibration is not None:
                 # Static Python branch: the calibration polynomial (weighted
                 # least squares in-graph, weights = the noise model's
                 # effective sigma) rescales mu before the Gaussian kernel.
@@ -644,15 +665,18 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
     def __repr__(self) -> str:
         cal = ("" if self.calibration is None
                else f", calibration={self.calibration!r}")
+        if self.emission_lines is not None:
+            cal += f", emission_lines={self.emission_lines!r}"
         return f"DiagonalGaussianLikelihood(noise_model={self.noise_model!r}{cal})"
 
 
 # PyTree: no dynamic leaves; the frozen dataclass config is all auxiliary.
 jax.tree_util.register_pytree_node(
     DiagonalGaussianLikelihood,
-    flatten_func   = lambda lh: ([], (lh.noise_model, lh.calibration)),
+    flatten_func   = lambda lh: ([], (lh.noise_model, lh.calibration,
+                                      lh.emission_lines)),
     unflatten_func = lambda aux, _: DiagonalGaussianLikelihood(
-        noise_model=aux[0], calibration=aux[1]
+        noise_model=aux[0], calibration=aux[1], emission_lines=aux[2]
     ),
 )
 
