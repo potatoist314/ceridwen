@@ -339,7 +339,6 @@ def run_sampler(
     # ── Static data extracted once, before trace ──────────────────────────
     _obs_dict    = model.obs_dict
     _keys        = tuple(likelihood.keys)
-    _likelihoods = tuple(likelihood.likelihoods)
     _static_data = {
         key: (
             _obs_dict[key].flux,
@@ -352,14 +351,7 @@ def run_sampler(
     # ── Log-likelihood: sum over observations, no prior ───────────────────
     @jax.jit
     def loglike_fn(theta: dict[str, Array]) -> Array:
-        predictions = model.predict(theta)
-        lnl = jnp.zeros(())
-        for key, lhood in zip(_keys, _likelihoods):
-            y_k, sig_k, mask_k = _static_data[key]
-            mu_k    = predictions[key]
-            lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta)
-            lnl = lnl + lnl_k
-        return lnl
+        return likelihood.loglike(_static_data, model.predict(theta), theta)
 
     # ── Log-prior ─────────────────────────────────────────────────────────
     @jax.jit

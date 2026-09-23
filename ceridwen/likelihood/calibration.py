@@ -352,10 +352,13 @@ class PolynomialCalibration:
         return (self.polynomial(coeffs) * mu, coeffs,
                 self._marginal_terms(coeffs, log_det_normal))
 
-    def _joint_system(self, y, mu, sigma, mask, lines, ridge=None) -> tuple[Array, Array]:
+    def _joint_system(self, y, mu, sigma, mask, lines, ridge=None, photometry=None
+                      ) -> tuple[Array, Array]:
         """Normal matrix and right-hand side of ``y ~= mu (1 + basis @ a) + lines @ f``:
         the polynomial block as in :meth:`normal_matrix`, the line block
-        ``L^T W L`` (plus ``diag(ridge)``) and their cross terms."""
+        ``L^T W L`` (plus ``diag(ridge)``) and their cross terms.  With
+        ``photometry = (B, y_p, mu_p, sigma_p, mask_p)`` the bands add
+        ``y_p ~= mu_p + B @ f`` to the line block and its right-hand side."""
         mask = jnp.asarray(mask, dtype=bool)
         mu = jnp.asarray(mu)
         safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
@@ -364,16 +367,23 @@ class PolynomialCalibration:
         line_block = lines.T @ weighted_lines
         if ridge is not None:
             line_block = line_block + jnp.diag(jnp.asarray(ridge))
+        residual = jnp.where(mask, jnp.asarray(y) - mu, 0.0)
+        line_rhs = weighted_lines.T @ residual
+        if photometry is not None:
+            band, y_p, mu_p, sigma_p, mask_p = photometry
+            mask_p = jnp.asarray(mask_p, dtype=bool)
+            weighted_band = (jnp.where(mask_p, 1.0 / jnp.where(mask_p, sigma_p, 1.0) ** 2, 0.0)[:, None]
+                             * jnp.asarray(band))
+            line_block = line_block + jnp.asarray(band).T @ weighted_band
+            line_rhs = line_rhs + weighted_band.T @ jnp.where(mask_p, y_p - mu_p, 0.0)
         normal = jnp.block([[self.normal_matrix(mu, sigma, mask), cross],
                             [cross.T, line_block]])
-        residual = jnp.where(mask, jnp.asarray(y) - mu, 0.0)
-        rhs = jnp.concatenate([self._rhs(y, mu, sigma, mask),
-                               weighted_lines.T @ residual])
+        rhs = jnp.concatenate([self._rhs(y, mu, sigma, mask), line_rhs])
         return normal, rhs
 
-    def _joint_factor(self, y, mu, sigma, mask, lines, ridge=None):
+    def _joint_factor(self, y, mu, sigma, mask, lines, ridge=None, photometry=None):
         """Jacobi-scaled Cholesky factor, scale and solution of the joint system."""
-        normal, rhs = self._joint_system(y, mu, sigma, mask, lines, ridge)
+        normal, rhs = self._joint_system(y, mu, sigma, mask, lines, ridge, photometry)
         scale = 1.0 / jnp.sqrt(jnp.diagonal(normal))
         factor = jnp.linalg.cholesky(scale[:, None] * normal * scale[None, :])
         solution = scale * jsl.cho_solve((factor, True), scale * rhs)
@@ -388,8 +398,8 @@ class PolynomialCalibration:
         s = scale[self.n_coeff:]
         return solution[self.n_coeff:], s[:, None] * (g.T @ g) * s[None, :]
 
-    def calibrate_with_lines(self, y, mu, sigma, mask, lines, pairs=(), ridge=None
-                             ) -> tuple[Array, Array, Array, Array]:
+    def calibrate_with_lines(self, y, mu, sigma, mask, lines, pairs=(), ridge=None,
+                             photometry=None) -> tuple[Array, Array, Array, Array]:
         """
         :meth:`calibrate` with emission lines added after the polynomial.
 
@@ -405,6 +415,9 @@ class PolynomialCalibration:
         the lines, with the exact bivariate probability for each blended
         pair in ``pairs`` (index pairs, disjoint).  ``ridge`` adds a small
         precision to each line flux (:class:`EmissionLineColumns`).
+        ``photometry = (B, y_p, mu_p, sigma_p, mask_p)`` adds bands that see
+        the same fluxes, ``y_p ~= mu_p + B @ f``; the caller then adds the
+        bands' Gaussian kernel at ``mu_p + B @ fluxes``.
 
         Returns
         -------
@@ -420,7 +433,8 @@ class PolynomialCalibration:
             ``ln P(f >= 0)``.
         """
         mu = jnp.asarray(mu)
-        factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge)
+        factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge,
+                                                     photometry)
         coeffs, fluxes = solution[:self.n_coeff], solution[self.n_coeff:]
         log_det_normal = (2.0 * jnp.sum(jnp.log(jnp.diagonal(factor)))
                           - 2.0 * jnp.sum(jnp.log(scale)))
@@ -433,15 +447,16 @@ class PolynomialCalibration:
                 ln_extra)
 
     def posterior_draws_with_lines(self, y, mu_draws, sigma_draws, lines_draws,
-                                   mask, key, sweeps: int = 1000, ridge=None
-                                   ) -> tuple[Array, Array, Array]:
+                                   mask, key, sweeps: int = 1000, ridge=None,
+                                   photometry=None) -> tuple[Array, Array, Array]:
         """
         One joint draw of coefficients and line fluxes per posterior sample
         from ``N((a_hat, f_hat), N^{-1})`` truncated to ``f >= 0``.
 
         The fluxes come from ``sweeps`` Gibbs sweeps of one-dimensional
         truncated normals (started at ``max(f_hat, 0)``), the coefficients
-        from their Gaussian conditional given the fluxes.
+        from their Gaussian conditional given the fluxes.  ``photometry`` is
+        ``(B, y_p, mu_p_draws, sigma_p_draws, mask_p)``, one row per draw.
 
         Returns
         -------
@@ -456,9 +471,16 @@ class PolynomialCalibration:
         keys = jax.random.split(key, n_draws)
         k = self.n_coeff
 
-        def one(mu, sigma, lines, key):
-            normal, _ = self._joint_system(y, mu, sigma, mask, lines, ridge)
-            factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge)
+        if photometry is None:
+            band = y_p = mask_p = None
+            mu_p_draws = sigma_p_draws = jnp.zeros((n_draws, 0))
+        else:
+            band, y_p, mu_p_draws, sigma_p_draws, mask_p = photometry
+
+        def one(mu, sigma, lines, key, mu_p, sigma_p):
+            phot = None if band is None else (band, y_p, mu_p, sigma_p, mask_p)
+            normal, _ = self._joint_system(y, mu, sigma, mask, lines, ridge, phot)
+            factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge, phot)
             mean, cov = self._line_posterior(factor, scale, solution)
             fluxes = truncated_gibbs(key, mean, jnp.linalg.inv(cov), sweeps)
             n_aa = normal[:k, :k]
@@ -470,7 +492,8 @@ class PolynomialCalibration:
             return coeffs, fluxes, self.polynomial(coeffs) * mu + lines @ fluxes
 
         return jax.vmap(one)(jnp.asarray(mu_draws), jnp.asarray(sigma_draws),
-                             jnp.asarray(lines_draws), keys)
+                             jnp.asarray(lines_draws), keys, jnp.asarray(mu_p_draws),
+                             jnp.asarray(sigma_p_draws))
 
     def posterior_draws(self, y, mu_draws, sigma_draws, mask, key,
                         draws_per_sample: int = 1) -> tuple[Array, Array]:

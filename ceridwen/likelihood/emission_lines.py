@@ -26,6 +26,12 @@ marginalisation (Espe13/ceridwen ``be852282``,
 The line fluxes have a flat prior on f >= 0: stellar absorption is in the
 stellar model, so a line column may only add light.
 
+Doublets from one upper level have a flux ratio fixed by atomic physics and
+share one flux (:data:`TIED_RATIOS`, the ratios of FSPS's Cloudy line table
+``$SPS_HOME/nebular/ZAU_ND_mist.lines``, constant to 1e-4 over its 770 grid
+points).  Density-sensitive pairs such as [O II] 3726/3729 and
+[S II] 6716/6731 stay free.
+
 Here the lines join the Chebyshev polynomial in one linear model of the
 spectrum,
 
@@ -44,9 +50,12 @@ galaxies:
 * The noise model's effective sigma (for example the fractional term
   ``f_calib mu``) is evaluated at the stellar model ``mu`` only, as for the
   polynomial alone.  The line flux does not enter the variance.
-* The lines are not added to the photometry.  A line of 1 A equivalent
-  width in a filter wider than 1000 A changes the band flux by less than
-  0.1 %, well under a 5 % photometric error floor.
+
+With :meth:`EmissionLineColumns.with_photometry` (fixed redshift only, as
+upstream) the same fluxes also enter a Photometry observation, through the
+band flux of each line (:attr:`band_matrix`); ``MultiObservationLikelihood``
+then solves the spectrum and the photometry together.  A line of 1 A
+equivalent width changes the flux of a band 1000 A wide by about 0.1 %.
 
 With the flat prior, ln Z is defined only up to a constant per line: do
 not compare the evidence of a fit with lines against one without.
@@ -68,6 +77,17 @@ _C_AA_S = 2.99792458e18
 _FWHM_TO_SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 COND_MAX = 1e10
 RIDGE = 1e-12
+_CGS_PER_MAGGIE = 3631e-23
+# (weaker, stronger) FSPS line names -> flux ratio stronger / weaker; each
+# pair shares one upper level (1D2), so the ratio is set by the Einstein A
+# values.  Values: FSPS ZAU_ND_mist.lines (Cloudy), median over the grid.
+TIED_RATIOS = {
+    ("[O III] 4959", "[O III] 5007"): 3.010,
+    ("[Ne III] 3968", "[Ne III] 3869"): 3.318,
+    ("[N II] 6548", "[N II] 6584"): 2.951,
+    ("[O I] 6363", "[O I] 6300"): 3.136,
+    ("[S III] 9069", "[S III] 9532"): 2.480,
+}
 
 __all__ = ["EmissionLineColumns", "read_fsps_line_list"]
 
@@ -126,6 +146,14 @@ class EmissionLineColumns:
     pairs : tuple of (int, int)
         Blended pairs: lines whose flux posterior correlation exceeds
         ``blend_correlation``; their ``P(f >= 0)`` is computed jointly.
+    tie : ndarray, shape (n_raw, n_line), optional
+        Profile of each free flux as a combination of the raw lines: an
+        identity column for a free line; for a tied doublet, 1 on the
+        stronger line and ``1 / ratio`` on the weaker.  ``None``: identity.
+    band_matrix : ndarray, shape (n_band, n_line), optional
+        Maggies per unit line flux in each band of ``photometry_key``.
+    photometry_key : str, optional
+        Key of the Photometry observation that shares the line fluxes.
     ridge : ndarray, shape (n_line,), optional
         Precision added to each line flux: ``1e-12`` times its information
         from the spectrum at ``zred`` (a prior 10^6 times wider than the
@@ -143,6 +171,9 @@ class EmissionLineColumns:
     sigma_key: Optional[str] = None
     pairs: tuple = ()
     ridge: Optional[np.ndarray] = None
+    tie: Optional[np.ndarray] = None
+    band_matrix: Optional[np.ndarray] = None
+    photometry_key: Optional[str] = None
 
     @classmethod
     def from_spectrum(
@@ -188,12 +219,20 @@ class EmissionLineColumns:
             if (wave[0] * np.exp(3 * s) < lo < wave[-1] * np.exp(-3 * s)
                     and np.sum(used & (np.abs(np.log(wave / lo)) < 2 * s)) >= 3):
                 keep.append(r)
+        kept = [table_names[r] for r in keep]
+        tie, weaker = np.eye(len(kept)), []
+        for (weak, strong), ratio in TIED_RATIOS.items():
+            if weak in kept and strong in kept:
+                tie[kept.index(weak), kept.index(strong)] = 1.0 / ratio
+                weaker.append(kept.index(weak))
+        tie = np.delete(tie, weaker, axis=1)
         lines = cls(
             wave_obs=wave, sigma_inst_kms=s_inst,
-            wave_rest=table_wave[keep], names=tuple(table_names[r] for r in keep),
+            wave_rest=table_wave[keep], names=tuple(kept),
             zred=float(zred), sigma_gas_kms=s_gas,
             zred_key="zred" if spectrum.free_z else None,
             sigma_key="sigma_smooth" if spectrum.fit_sigma_smooth else None,
+            tie=tie,
         )
         information, diag = lines._check_conditioning(spectrum)
         correlation = np.linalg.inv(information)
@@ -212,10 +251,49 @@ class EmissionLineColumns:
 
     @property
     def n_line(self) -> int:
-        return int(self.wave_rest.size)
+        """Number of free fluxes."""
+        return int(self.wave_rest.size if self.tie is None else self.tie.shape[1])
+
+    @property
+    def free_names(self) -> tuple:
+        """Name of each free flux; a tied doublet is named after its stronger
+        line, with the weaker in brackets."""
+        if self.tie is None:
+            return self.names
+        out = []
+        for c in range(self.tie.shape[1]):
+            rows = np.flatnonzero(self.tie[:, c])
+            main = rows[np.argmax(self.tie[rows, c])]
+            out.append(self.names[main] + "".join(f" (+{self.names[r]})" for r in rows if r != main))
+        return tuple(out)
+
+    def with_photometry(self, photometry, key: str) -> "EmissionLineColumns":
+        """The same lines, also added to the Photometry ``photometry`` (its
+        likelihood key ``key``).  Needs a fixed redshift."""
+        if self.zred_key is not None:
+            raise ValueError("emission lines in the photometry need a fixed redshift")
+        opz = 1.0 + self.zred
+        centre = self.wave_rest * opz
+        s = np.hypot(self.sigma_gas_kms, np.interp(centre, self.wave_obs, self.sigma_inst_kms)) / _CKMS
+        # AB maggies = int f_lambda T lambda dlambda / ab_zero_counts (sedpy's
+        # normalisation), integrated over each line profile on its own fine
+        # grid: FilterSet.get_sed_maggies samples f_lambda at the filter-grid
+        # points, which are coarser than a line.
+        x = np.linspace(-8.0, 8.0, 801)
+        band = np.zeros((len(photometry.filters), self.wave_rest.size))
+        for k, (lam, width) in enumerate(zip(centre, s)):
+            wave = lam * np.exp(width * x)
+            flam = np.exp(-0.5 * x * x) / (np.sqrt(2.0 * np.pi) * width * wave)
+            for b, curve in enumerate(photometry.filterset.filters):
+                trans = np.interp(wave, np.asarray(curve.wavelength, dtype=np.float64),
+                                  np.asarray(curve.transmission, dtype=np.float64), left=0.0, right=0.0)
+                band[b, k] = np.trapezoid(flam * trans * wave, wave) / float(curve.ab_zero_counts)
+        tie = np.eye(self.wave_rest.size) if self.tie is None else self.tie
+        return replace(self, band_matrix=band @ tie, photometry_key=key)
 
     def columns(self, params: Optional[dict] = None) -> Array:
-        """(n_pix, n_line) F_nu profiles of unit-flux lines [erg s^-1 cm^-2]."""
+        """(n_pix, n_line) F_nu profiles of unit-flux lines [erg s^-1 cm^-2],
+        one per free flux."""
         def value(key, fixed):
             if key is None:
                 return jnp.asarray(fixed)
@@ -228,7 +306,8 @@ class EmissionLineColumns:
         s = jnp.sqrt(s_gas ** 2 + s_inst ** 2) / _CKMS
         x = (jnp.asarray(np.log(self.wave_obs))[:, None] - jnp.log(centre)[None, :]) / s[None, :]
         phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
-        return phi * jnp.asarray(self.wave_obs / _C_AA_S)[:, None]
+        profiles = phi * jnp.asarray(self.wave_obs / _C_AA_S)[:, None]
+        return profiles if self.tie is None else profiles @ jnp.asarray(self.tie)
 
     def covers(self, rest_wave: float, tol: float = 2.0) -> bool:
         """Whether a fitted line lies within ``tol`` A of ``rest_wave``."""
@@ -253,7 +332,8 @@ class EmissionLineColumns:
         return C, np.diag(M)
 
     def __repr__(self) -> str:
-        return (f"EmissionLineColumns({self.n_line} lines, flat prior f >= 0, "
-                f"{len(self.pairs)} blended pairs, "
+        phot = "" if self.photometry_key is None else f", shared with {self.photometry_key!r}"
+        return (f"EmissionLineColumns({self.n_line} fluxes, flat prior f >= 0, "
+                f"{len(self.pairs)} blended pairs{phot}, "
                 f"zred={self.zred_key or self.zred}, "
-                f"sigma_gas={self.sigma_key or self.sigma_gas_kms}: {', '.join(self.names)})")
+                f"sigma_gas={self.sigma_key or self.sigma_gas_kms}: {', '.join(self.free_names)})")

@@ -569,6 +569,10 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         )
         ln_extra = jnp.zeros(())
         if self.emission_lines is not None:
+            if self.emission_lines.photometry_key is not None:
+                raise ValueError(
+                    "emission lines shared with photometry: evaluate through "
+                    "MultiObservationLikelihood.loglike")
             mu, _, _, ln_extra = self.calibration.calibrate_with_lines(
                 y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
                 self.emission_lines.columns(params), self.emission_lines.pairs,
@@ -582,6 +586,31 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
             y, mu, noise_out.inv_var, noise_out.log_det, mask
         )
         return lnl + ln_extra, aux
+
+    # ------------------------------------------------------------------
+    def with_photometry(self, y, mu, sigma_obs, mask, params, photometry) -> Array:
+        """
+        Log-likelihood of this spectrum and of the Photometry that shares its
+        emission-line fluxes (``emission_lines.photometry_key``), with the
+        calibration coefficients and the line fluxes integrated out together.
+
+        ``photometry = (y_p, mu_p, sigma_p, mask_p, noise_model_p)``; the
+        band model is ``mu_p + emission_lines.band_matrix @ f``.
+        """
+        y_p, mu_p, sigma_p, mask_p, noise_model_p = photometry
+        noise_out = self.noise_model.compute(sigma_obs, mu, mask, params, data=y)
+        noise_p = noise_model_p.compute(sigma_p, mu_p, mask_p, params, data=y_p)
+        band = jnp.asarray(self.emission_lines.band_matrix)
+        mu_cal, _, fluxes, ln_extra = self.calibration.calibrate_with_lines(
+            y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
+            self.emission_lines.columns(params), self.emission_lines.pairs,
+            self.emission_lines.ridge,
+            (band, y_p, mu_p, jnp.sqrt(1.0 / noise_p.inv_var), mask_p),
+        )
+        lnl, _ = lnlike_diag_gaussian(y, mu_cal, noise_out.inv_var, noise_out.log_det, mask)
+        lnl_p, _ = lnlike_diag_gaussian(y_p, mu_p + band @ fluxes, noise_p.inv_var,
+                                        noise_p.log_det, mask_p)
+        return lnl + lnl_p + ln_extra
 
     # ------------------------------------------------------------------
     def make_lnprobfn(
@@ -932,6 +961,38 @@ class MultiObservationLikelihood(LikelihoodBase):
         return lnl_total, aux
 
     # ------------------------------------------------------------------
+    def loglike(self, data, predictions, theta) -> Array:
+        """
+        Total log-likelihood, the sum over observations.
+
+        ``data[key] = (y, sigma_obs, mask)``, ``predictions[key] = mu``.  A
+        spectrum whose emission lines are shared with a Photometry
+        (``emission_lines.photometry_key``) is evaluated together with it by
+        :meth:`DiagonalGaussianLikelihood.with_photometry`; that
+        Photometry's own term is then skipped.
+        """
+        by_key = dict(zip(self.keys, self.likelihoods))
+        shared = {getattr(getattr(lh, "emission_lines", None), "photometry_key", None): key
+                  for key, lh in by_key.items()}
+        shared.pop(None, None)
+        lnl = jnp.zeros(())
+        for key, lhood in zip(self.keys, self.likelihoods):
+            if key in shared:
+                continue
+            y_k, sig_k, mask_k = data[key]
+            mu_k = predictions[key]
+            phot_key = getattr(getattr(lhood, "emission_lines", None), "photometry_key", None)
+            if phot_key is None:
+                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta)
+            else:
+                y_p, sig_p, mask_p = data[phot_key]
+                lnl_k = lhood.with_photometry(
+                    y_k, mu_k, sig_k, mask_k, theta,
+                    (y_p, predictions[phot_key], sig_p, mask_p, by_key[phot_key].noise_model))
+            lnl = lnl + lnl_k
+        return lnl
+
+    # ------------------------------------------------------------------
     def make_lnprobfn(
         self,
         observations : dict[str, Any],
@@ -966,25 +1027,11 @@ class MultiObservationLikelihood(LikelihoodBase):
             )
             for key in self.keys
         }
-        keys        = self.keys
-        likelihoods = self.likelihoods
-
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
-            predictions: dict[str, Array] = model.predict(theta)
-            lnl = jnp.zeros(())
-
-            for key, lhood in zip(keys, likelihoods):
-                y_k, sig_k, mask_k = static_data[key]
-                mu_k = predictions[key]
-                # Delegate entirely to each likelihood's __call__, which
-                # handles noise model dispatch internally.  Pass the full
-                # theta as params; each noise model silently ignores keys
-                # it does not recognise.  This respects the LikelihoodBase
-                # interface and works for any future subclass.
-                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta)
-                lnl = lnl + lnl_k
-
+            # Each likelihood's __call__ handles its noise model; the full
+            # theta is passed as params (see ``loglike``).
+            lnl = self.loglike(static_data, model.predict(theta), theta)
             lnp = prior.log_prob(theta)
             return lnl + lnp
 

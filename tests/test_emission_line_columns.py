@@ -17,10 +17,13 @@ from numpy.polynomial.chebyshev import chebvander
 from scipy.integrate import quad
 from scipy.stats import multivariate_normal
 
+from dataclasses import replace
+
 from ceridwen.likelihood import (
     DiagonalGaussianLikelihood,
     DiagonalNoiseModel,
     EmissionLineColumns,
+    MultiObservationLikelihood,
     PolynomialCalibration,
 )
 from ceridwen.likelihood.calibration import _bvn_upper, log_positive_probability
@@ -206,3 +209,75 @@ def test_from_spectrum_selects_covered_lines_with_enough_unmasked_pixels():
     blended = {frozenset((lines.names[i], lines.names[j])) for i, j in lines.pairs}
     assert frozenset(("He I 3888.63A", "Ba-6 3889")) in blended
     assert len({i for pair in lines.pairs for i in pair}) == 2 * len(lines.pairs)
+
+
+def test_photometry_shares_the_line_flux_exactly():
+    """One line seen by the spectrum and by two bands: ln of the integral over
+    f >= 0 of (polynomial marginal of y - f L) x (band Gaussian of y_p - mu_p - f B)."""
+    mu, y, sigma, mask, L = _mock(np.array([0.0, 2e-17, 0.0]), snr=15.0)
+    line = L[:, 1]
+    band = np.array([[4e10], [1e10]])                      # maggies per unit line flux
+    mu_p = np.array([2e-7, 3e-7])
+    sigma_p = 0.05 * mu_p
+    y_p = mu_p + band[:, 0] * 2e-17 + np.array([1e-9, -2e-9])
+    mask_p = np.ones(2, dtype=bool)
+    cal = PolynomialCalibration.from_wavelength(WAVE, 2, fit_constant=True, prior_sigma=[0.3, 0.1, 0.1])
+    lines = replace(_lines(REST[1:2], False), band_matrix=band, photometry_key="photometry")
+    joint = MultiObservationLikelihood(
+        keys=("photometry", "spectrum"),
+        likelihoods=(DiagonalGaussianLikelihood(),
+                     DiagonalGaussianLikelihood(calibration=cal, emission_lines=lines)))
+    data = {"spectrum": (y, sigma, mask), "photometry": (y_p, sigma_p, mask_p)}
+    value = float(joint.loglike(data, {"spectrum": mu, "photometry": mu_p}, {}))
+
+    plain = DiagonalGaussianLikelihood(calibration=cal)
+
+    def integrand_log(f):
+        spec = float(plain(y - f * line, mu, sigma, mask)[0])
+        r = (y_p - mu_p - f * band[:, 0]) / sigma_p
+        return spec - 0.5 * np.sum(r * r) - np.sum(np.log(np.sqrt(2 * np.pi) * sigma_p))
+
+    _, _, f_hat, _ = cal.calibrate_with_lines(
+        y, mu, sigma, mask, jnp.asarray(line[:, None]), photometry=(band, y_p, mu_p, sigma_p, mask_p))
+    f_hat = float(f_hat[0])
+    width = 1.0 / np.sqrt(float(line @ (line / sigma ** 2)) + float(band[:, 0] @ (band[:, 0] / sigma_p ** 2)))
+    peak = integrand_log(max(f_hat, 0.0))
+    integral, _ = quad(lambda f: np.exp(integrand_log(f) - peak),
+                       max(0.0, f_hat - 12 * width), max(0.0, f_hat) + 12 * width,
+                       epsabs=0, epsrel=1e-11, limit=200)
+    np.testing.assert_allclose(value, peak + np.log(integral), rtol=0, atol=1e-6)
+    with pytest.raises(ValueError, match="MultiObservationLikelihood.loglike"):
+        joint.likelihoods[1](y, mu, sigma, mask, {})
+
+
+def test_loglike_without_shared_lines_is_the_per_observation_sum():
+    mu, y, sigma, mask, _ = _mock(np.zeros(3))
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True, prior_sigma=0.1)
+    multi = MultiObservationLikelihood(
+        keys=("a", "b"),
+        likelihoods=(DiagonalGaussianLikelihood(), DiagonalGaussianLikelihood(calibration=cal)))
+    data = {"a": (y, sigma, mask), "b": (y, sigma, mask)}
+    expected = (jnp.zeros(()) + multi.likelihoods[0](y, mu, sigma, mask, params={})[0]
+                + multi.likelihoods[1](y, mu, sigma, mask, params={})[0])
+    assert float(multi.loglike(data, {"a": mu, "b": mu}, {})) == float(expected)
+
+
+@pytest.mark.skipif(not os.environ.get("SPS_HOME"), reason="needs $SPS_HOME for emlines_info.dat")
+def test_atomic_doublets_share_one_flux_at_the_fsps_ratio():
+    spec = Spectrum(wavelength=WAVE, flux=_continuum(), uncertainty=_continuum() / 30,
+                    resolution=3500.0, smoothtype="R", res_convention="fwhm",
+                    sigma_losvd=SIGMA_GAS, name="spectrum")
+    lines = EmissionLineColumns.from_spectrum(spec, ZRED)
+    names = list(lines.names)
+    assert "[O III] 5007 (+[O III] 4959)" in lines.free_names
+    assert "[O III] 4959" not in lines.free_names
+    assert lines.n_line == len(names) - 2                  # [O III] and [Ne III] doublets tied
+    raw = np.asarray(replace(lines, tie=None).columns())
+    tied = np.asarray(lines.columns())
+    column = lines.free_names.index("[O III] 5007 (+[O III] 4959)")
+    np.testing.assert_allclose(tied[:, column],
+                               raw[:, names.index("[O III] 5007")] + raw[:, names.index("[O III] 4959")] / 3.010,
+                               rtol=1e-12)
+    assert lines.zred_key is None
+    with pytest.raises(ValueError, match="fixed redshift"):
+        replace(lines, zred_key="zred").with_photometry(None, "photometry")
