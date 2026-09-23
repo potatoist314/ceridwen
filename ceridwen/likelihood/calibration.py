@@ -352,89 +352,125 @@ class PolynomialCalibration:
         return (self.polynomial(coeffs) * mu, coeffs,
                 self._marginal_terms(coeffs, log_det_normal))
 
-    def _joint_system(self, y, mu, sigma, mask, lines) -> tuple[Array, Array]:
+    def _joint_system(self, y, mu, sigma, mask, lines, ridge=None) -> tuple[Array, Array]:
         """Normal matrix and right-hand side of ``y ~= mu (1 + basis @ a) + lines @ f``:
         the polynomial block as in :meth:`normal_matrix`, the line block
-        ``L^T W L`` (flat prior) and their cross terms."""
+        ``L^T W L`` (plus ``diag(ridge)``) and their cross terms."""
         mask = jnp.asarray(mask, dtype=bool)
         mu = jnp.asarray(mu)
         safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
         weighted_lines = jnp.where(mask, 1.0 / safe_sigma ** 2, 0.0)[:, None] * lines
         cross = self.basis.T @ (mu[:, None] * weighted_lines)
+        line_block = lines.T @ weighted_lines
+        if ridge is not None:
+            line_block = line_block + jnp.diag(jnp.asarray(ridge))
         normal = jnp.block([[self.normal_matrix(mu, sigma, mask), cross],
-                            [cross.T, lines.T @ weighted_lines]])
+                            [cross.T, line_block]])
         residual = jnp.where(mask, jnp.asarray(y) - mu, 0.0)
         rhs = jnp.concatenate([self._rhs(y, mu, sigma, mask),
                                weighted_lines.T @ residual])
         return normal, rhs
 
-    def _joint_factor(self, y, mu, sigma, mask, lines):
+    def _joint_factor(self, y, mu, sigma, mask, lines, ridge=None):
         """Jacobi-scaled Cholesky factor, scale and solution of the joint system."""
-        normal, rhs = self._joint_system(y, mu, sigma, mask, lines)
+        normal, rhs = self._joint_system(y, mu, sigma, mask, lines, ridge)
         scale = 1.0 / jnp.sqrt(jnp.diagonal(normal))
         factor = jnp.linalg.cholesky(scale[:, None] * normal * scale[None, :])
         solution = scale * jsl.cho_solve((factor, True), scale * rhs)
         return factor, scale, solution
 
-    def calibrate_with_lines(self, y, mu, sigma, mask, lines
+    def _line_posterior(self, factor, scale, solution):
+        """Mean and covariance of the line fluxes with the coefficients
+        integrated out: the line block of ``N^{-1}``."""
+        n_line = solution.shape[0] - self.n_coeff
+        unit = jnp.eye(solution.shape[0])[:, self.n_coeff:]
+        g = jsl.solve_triangular(factor, unit, lower=True)
+        s = scale[self.n_coeff:]
+        return solution[self.n_coeff:], s[:, None] * (g.T @ g) * s[None, :]
+
+    def calibrate_with_lines(self, y, mu, sigma, mask, lines, pairs=(), ridge=None
                              ) -> tuple[Array, Array, Array, Array]:
         """
         :meth:`calibrate` with emission lines added after the polynomial.
 
         The model is ``P(x) * mu + lines @ f``; the coefficients (Gaussian
-        prior) and the line fluxes ``f`` (flat prior) are integrated out
-        together.  ``lines`` is the ``(n_pix, n_line)`` matrix of
-        :meth:`EmissionLineColumns.columns`; with zero columns the result
-        equals :meth:`calibrate`.
+        prior) and the line fluxes ``f`` (flat prior on ``f >= 0``) are
+        integrated out together.  ``lines`` is the ``(n_pix, n_line)``
+        matrix of :meth:`EmissionLineColumns.columns`; with zero columns the
+        result equals :meth:`calibrate`.
+
+        The integral over ``f >= 0`` is the unconstrained integral times
+        ``P(f >= 0)`` under the Gaussian posterior of ``f``, ``N(f_hat,
+        Sigma)``.  ``P`` is the product of ``Phi(f_hat_k / sigma_k)`` over
+        the lines, with the exact bivariate probability for each blended
+        pair in ``pairs`` (index pairs, disjoint).  ``ridge`` adds a small
+        precision to each line flux (:class:`EmissionLineColumns`).
 
         Returns
         -------
         mu_cal : Array, shape (n_pix,)
-            ``P(x) * mu + lines @ f_hat``.
+            ``P(x) * mu + lines @ f_hat`` (unconstrained maximum; the
+            Gaussian kernel at this point plus ``ln_extra`` is the marginal).
         coeffs : Array, shape (n_coeff,)
         fluxes : Array, shape (n_line,)
-            Line fluxes at the joint maximum.
+            Unconstrained line fluxes ``f_hat``.
         ln_extra : Array, scalar
             Coefficient prior at the solution plus, with ``marginalize``,
-            ``-0.5 ln|N|`` and the prior and flat-prior normalisations.
+            ``-0.5 ln|N|``, the prior and flat-prior normalisations and
+            ``ln P(f >= 0)``.
         """
         mu = jnp.asarray(mu)
-        factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines)
+        factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge)
         coeffs, fluxes = solution[:self.n_coeff], solution[self.n_coeff:]
         log_det_normal = (2.0 * jnp.sum(jnp.log(jnp.diagonal(factor)))
                           - 2.0 * jnp.sum(jnp.log(scale)))
         ln_extra = self._marginal_terms(coeffs, log_det_normal)
         if self.marginalize:
-            ln_extra = ln_extra + 0.5 * lines.shape[1] * _LOG_2PI
+            mean, cov = self._line_posterior(factor, scale, solution)
+            ln_extra = (ln_extra + 0.5 * lines.shape[1] * _LOG_2PI
+                        + log_positive_probability(mean, cov, pairs))
         return (self.polynomial(coeffs) * mu + lines @ fluxes, coeffs, fluxes,
                 ln_extra)
 
     def posterior_draws_with_lines(self, y, mu_draws, sigma_draws, lines_draws,
-                                   mask, key) -> tuple[Array, Array, Array]:
+                                   mask, key, sweeps: int = 1000, ridge=None
+                                   ) -> tuple[Array, Array, Array]:
         """
-        One joint draw of coefficients and line fluxes per posterior sample,
-        ``(a, f) ~ N((a_hat, f_hat), N^{-1})``.
+        One joint draw of coefficients and line fluxes per posterior sample
+        from ``N((a_hat, f_hat), N^{-1})`` truncated to ``f >= 0``.
+
+        The fluxes come from ``sweeps`` Gibbs sweeps of one-dimensional
+        truncated normals (started at ``max(f_hat, 0)``), the coefficients
+        from their Gaussian conditional given the fluxes.
 
         Returns
         -------
         coeffs : Array, shape (n_draws, n_coeff)
-        fluxes : Array, shape (n_draws, n_line)
+        fluxes : Array, shape (n_draws, n_line), all ``>= 0``
         model : Array, shape (n_draws, n_pix)
             ``P(x) * mu + lines @ f`` for every draw.
         """
         mask = jnp.asarray(mask, dtype=bool)
         y = jnp.asarray(y)
-        n_draws, n_line = jnp.shape(lines_draws)[0], jnp.shape(lines_draws)[2]
-        noise = jax.random.normal(key, (n_draws, self.n_coeff + n_line))
+        n_draws = jnp.shape(lines_draws)[0]
+        keys = jax.random.split(key, n_draws)
+        k = self.n_coeff
 
-        def one(mu, sigma, lines, z):
-            factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines)
-            draw = solution + scale * jsl.solve_triangular(factor.T, z, lower=False)
-            coeffs, fluxes = draw[:self.n_coeff], draw[self.n_coeff:]
+        def one(mu, sigma, lines, key):
+            normal, _ = self._joint_system(y, mu, sigma, mask, lines, ridge)
+            factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge)
+            mean, cov = self._line_posterior(factor, scale, solution)
+            fluxes = truncated_gibbs(key, mean, jnp.linalg.inv(cov), sweeps)
+            n_aa = normal[:k, :k]
+            chol = jnp.linalg.cholesky(n_aa)
+            shift = jsl.cho_solve((chol, True), normal[:k, k:] @ (fluxes - mean))
+            z = jax.random.normal(jax.random.fold_in(key, 1), (k,))
+            coeffs = (solution[:k] - shift
+                      + jsl.solve_triangular(chol.T, z, lower=False))
             return coeffs, fluxes, self.polynomial(coeffs) * mu + lines @ fluxes
 
         return jax.vmap(one)(jnp.asarray(mu_draws), jnp.asarray(sigma_draws),
-                             jnp.asarray(lines_draws), noise)
+                             jnp.asarray(lines_draws), keys)
 
     def posterior_draws(self, y, mu_draws, sigma_draws, mask, key,
                         draws_per_sample: int = 1) -> tuple[Array, Array]:
@@ -477,3 +513,88 @@ class PolynomialCalibration:
                 f"fit_constant={self.fit_constant}, "
                 f"prior_sigma={self.prior_sigma}, "
                 f"marginalize={self.marginalize}, n_pix={self.basis.shape[0]})")
+
+
+# ---------------------------------------------------------------------------
+# Positivity of the line fluxes
+# ---------------------------------------------------------------------------
+_GL_X, _GL_W = np.polynomial.legendre.leggauss(20)
+
+
+def _bvn_upper(h, k, r):
+    """``P(X > h, Y > k)`` for a standard bivariate normal with correlation
+    ``r`` (Genz 2004, Stat. Comput. 14, 251; his ``bvnu`` with 20 Gauss-
+    Legendre points, absolute error ~1e-15)."""
+    ndtr = jax.scipy.special.ndtr
+    x, w = jnp.asarray(_GL_X), jnp.asarray(_GL_W)
+    hk = h * k
+    # |r| < 0.925: Drezner-Wesolowsky integral over asin(r)
+    asr = jnp.arcsin(r)
+    sn = jnp.sin(asr * (1.0 + x) / 2.0)
+    small = (jnp.sum(w * jnp.exp((sn * hk - (h * h + k * k) / 2.0) / (1.0 - sn * sn)))
+             * asr / (4.0 * jnp.pi) + ndtr(-h) * ndtr(-k))
+    # |r| >= 0.925: Genz's expansion about |r| = 1
+    kk = jnp.where(r < 0, -k, k)
+    hk = jnp.where(r < 0, -hk, hk)
+    as_ = (1.0 - r) * (1.0 + r)
+    a = jnp.sqrt(as_)
+    bs = (h - kk) ** 2
+    c = (4.0 - hk) / 8.0
+    d = (12.0 - hk) / 16.0
+    e = -(bs / as_ + hk) / 2.0
+    big = jnp.where(e > -100.0, a * jnp.exp(e) * (1.0 - c * (bs - as_) * (1.0 - d * bs / 5.0) / 3.0
+                                                  + c * d * as_ * as_ / 5.0), 0.0)
+    b = jnp.sqrt(bs)
+    big = big - jnp.where(hk > -100.0, jnp.exp(-hk / 2.0) * jnp.sqrt(2.0 * jnp.pi) * ndtr(-b / a)
+                          * b * (1.0 - c * bs * (1.0 - d * bs / 5.0) / 3.0), 0.0)
+    xs = (a / 2.0 * (1.0 + x)) ** 2
+    rs = jnp.sqrt(1.0 - xs)
+    e = -(bs / xs + hk) / 2.0
+    term = jnp.exp(e) * (jnp.exp(-hk * xs / (2.0 * (1.0 + rs) ** 2)) / rs
+                         - (1.0 + c * xs * (1.0 + d * xs)))
+    big = -(big + a / 2.0 * jnp.sum(jnp.where(e > -100.0, w * term, 0.0))) / (2.0 * jnp.pi)
+    lower = jnp.where(h < 0, ndtr(kk) - ndtr(h), ndtr(-h) - ndtr(-kk))
+    big = jnp.where(r > 0, big + ndtr(-jnp.maximum(h, kk)),
+                    jnp.where(h >= kk, -big, lower - big))
+    return jnp.clip(jnp.where(jnp.abs(r) < 0.925, small, big), 0.0, 1.0)
+
+
+def log_positive_probability(mean, cov, pairs=()) -> Array:
+    """``ln P(f >= 0)`` for ``f ~ N(mean, cov)``: independent lines, times the
+    exact bivariate probability of each blended pair in ``pairs``.  Where a
+    pair's probability is below 1e-10 (beyond the absolute accuracy of the
+    bivariate formula) the pair keeps the product of its two ``Phi``."""
+    sd = jnp.sqrt(jnp.diagonal(cov))
+    z = mean / sd
+    single = jax.scipy.special.log_ndtr(z)
+    total = jnp.sum(single)
+    for i, j in pairs:
+        p = _bvn_upper(-z[i], -z[j], cov[i, j] / (sd[i] * sd[j]))
+        product = single[i] + single[j]
+        total = total + jnp.where(p > 1e-10, jnp.log(jnp.maximum(p, 1e-300)), product) - product
+    return total
+
+
+def truncated_gibbs(key, mean, precision, sweeps: int) -> Array:
+    """One draw of ``N(mean, precision^{-1})`` truncated to the positive
+    orthant, by ``sweeps`` Gibbs sweeps of one-dimensional truncated normals
+    started at ``max(mean, 0)``."""
+    m = mean.shape[0]
+    cond_sd = 1.0 / jnp.sqrt(jnp.diagonal(precision))
+
+    def update(i, carry):
+        f, key = carry
+        key, sub = jax.random.split(key)
+        k = i % m
+        centre = mean[k] - (precision[k] @ (f - mean) - precision[k, k] * (f[k] - mean[k])) / precision[k, k]
+        # inverse CDF of the upper tail; beyond 30 sigma, where ndtr underflows,
+        # the tail inverse sqrt(a^2 - 2 ln U) (relative error < 1e-3)
+        a = -centre / cond_sd[k]
+        uniform = jax.random.uniform(sub, dtype=mean.dtype, minval=1e-300)
+        u = jnp.where(a < 30.0,
+                      -jax.scipy.special.ndtri(uniform * jax.scipy.special.ndtr(-jnp.minimum(a, 30.0))),
+                      jnp.sqrt(a * a - 2.0 * jnp.log(uniform)))
+        return f.at[k].set(centre + cond_sd[k] * u), key
+
+    f, _ = jax.lax.fori_loop(0, sweeps * m, update, (jnp.maximum(mean, 0.0), key))
+    return f

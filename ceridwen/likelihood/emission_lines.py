@@ -17,9 +17,14 @@ marginalisation (Espe13/ceridwen ``be852282``,
   width ``sqrt(sigma_gas^2 + sigma_inst^2)``; ``sigma_gas`` is tied to the
   stellar dispersion (upstream's default ``Kinematics(sigma_gas=TIED)``)
   and ``sigma_inst`` is the spectrum's instrumental width at the line;
-* every line whose centre stays inside the spectrum over the redshift
-  range, 3 sigma from the edges, with at least 3 unmasked pixels within
-  2 sigma, is fitted; its flux has a flat prior.
+* every line 3 sigma inside the spectrum, with at least 3 unmasked
+  pixels within 2 sigma, is fitted.  Upstream tests this at the ends of
+  the redshift prior; here it is tested at the catalogue redshift, because
+  the fit's +/- 0.1 prior would drop every line within ~500 A of an edge
+  ([O III] 4959, 5007 for M1_210210).
+
+The line fluxes have a flat prior on f >= 0: stellar absorption is in the
+stellar model, so a line column may only add light.
 
 Here the lines join the Chebyshev polynomial in one linear model of the
 spectrum,
@@ -49,7 +54,7 @@ not compare the evidence of a fit with lines against one without.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -62,6 +67,7 @@ _CKMS = 2.99792458e5
 _C_AA_S = 2.99792458e18
 _FWHM_TO_SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 COND_MAX = 1e10
+RIDGE = 1e-12
 
 __all__ = ["EmissionLineColumns", "read_fsps_line_list"]
 
@@ -117,6 +123,14 @@ class EmissionLineColumns:
         Values used when ``zred_key`` / ``sigma_key`` is None.
     zred_key, sigma_key : str or None
         ``theta`` keys of a sampled redshift / line dispersion.
+    pairs : tuple of (int, int)
+        Blended pairs: lines whose flux posterior correlation exceeds
+        ``blend_correlation``; their ``P(f >= 0)`` is computed jointly.
+    ridge : ndarray, shape (n_line,), optional
+        Precision added to each line flux: ``1e-12`` times its information
+        from the spectrum at ``zred`` (a prior 10^6 times wider than the
+        flux error).  It keeps the solve finite where a sampled redshift
+        moves a line off the unmasked pixels (zero column).
     """
 
     wave_obs: np.ndarray
@@ -127,6 +141,8 @@ class EmissionLineColumns:
     sigma_gas_kms: float
     zred_key: Optional[str] = None
     sigma_key: Optional[str] = None
+    pairs: tuple = ()
+    ridge: Optional[np.ndarray] = None
 
     @classmethod
     def from_spectrum(
@@ -134,9 +150,9 @@ class EmissionLineColumns:
         spectrum,
         zred: float,
         *,
-        zred_range: Optional[tuple[float, float]] = None,
         names: Optional[Sequence[str]] = None,
         sps_home: Optional[str] = None,
+        blend_correlation: float = 0.5,
     ) -> "EmissionLineColumns":
         """
         Select the lines the spectrum constrains, with upstream's rules.
@@ -150,12 +166,13 @@ class EmissionLineColumns:
             ``theta["sigma_smooth"]``; otherwise ``zred`` and
             ``spectrum.sigma_losvd`` are fixed.
         zred : float
-            Redshift of the model (the start value when it is sampled).
-        zred_range : (float, float), optional
-            Redshift prior range; a line is fitted only if it is covered at
-            both ends and at ``zred``.
+            Catalogue redshift; line coverage is tested here.
         names : sequence of str, optional
             FSPS names of the candidate lines.  Default: every FSPS line.
+        blend_correlation : float
+            Lines whose flux posterior correlation (spectrum weights, at
+            ``zred``) exceeds this in absolute value form a pair, strongest
+            first; a line joins at most one pair.
         """
         wave = np.asarray(spectrum.wavelength, dtype=np.float64)
         used = np.asarray(spectrum.mask, dtype=bool)
@@ -164,18 +181,12 @@ class EmissionLineColumns:
         table_wave, table_names = read_fsps_line_list(sps_home)
         rows = (range(table_wave.size) if names is None
                 else [table_names.index(n) for n in names])
-        zs = [zred] if zred_range is None else [zred_range[0], zred, zred_range[1]]
         keep = []
         for r in rows:
-            fits = True
-            for z in zs:
-                lo = table_wave[r] * (1.0 + z)
-                s = np.hypot(s_gas, np.interp(lo, wave, s_inst)) / _CKMS
-                if not (wave[0] * np.exp(3 * s) < lo < wave[-1] * np.exp(-3 * s)
-                        and np.sum(used & (np.abs(np.log(wave / lo)) < 2 * s)) >= 3):
-                    fits = False
-                    break
-            if fits:
+            lo = table_wave[r] * (1.0 + zred)
+            s = np.hypot(s_gas, np.interp(lo, wave, s_inst)) / _CKMS
+            if (wave[0] * np.exp(3 * s) < lo < wave[-1] * np.exp(-3 * s)
+                    and np.sum(used & (np.abs(np.log(wave / lo)) < 2 * s)) >= 3):
                 keep.append(r)
         lines = cls(
             wave_obs=wave, sigma_inst_kms=s_inst,
@@ -184,8 +195,20 @@ class EmissionLineColumns:
             zred_key="zred" if spectrum.free_z else None,
             sigma_key="sigma_smooth" if spectrum.fit_sigma_smooth else None,
         )
-        lines._check_conditioning(spectrum)
-        return lines
+        information, diag = lines._check_conditioning(spectrum)
+        correlation = np.linalg.inv(information)
+        d = np.sqrt(np.diag(correlation))
+        correlation = correlation / np.outer(d, d)
+        candidates = sorted(
+            ((i, j) for i in range(lines.n_line) for j in range(i + 1, lines.n_line)
+             if abs(correlation[i, j]) > blend_correlation),
+            key=lambda p: -abs(correlation[p]))
+        pairs, used = [], set()
+        for i, j in candidates:          # strongest first; a line joins one pair only
+            if i not in used and j not in used:
+                pairs.append((i, j))
+                used |= {i, j}
+        return replace(lines, pairs=tuple(sorted(pairs)), ridge=RIDGE * diag)
 
     @property
     def n_line(self) -> int:
@@ -211,21 +234,26 @@ class EmissionLineColumns:
         """Whether a fitted line lies within ``tol`` A of ``rest_wave``."""
         return bool(np.any(np.abs(self.wave_rest - float(rest_wave)) < tol))
 
-    def _check_conditioning(self, spectrum) -> None:
-        """Refuse near-degenerate line sets (upstream's rule, cond > 1e10)."""
+    def _check_conditioning(self, spectrum) -> tuple[np.ndarray, np.ndarray]:
+        """Refuse near-degenerate line sets (upstream's rule, cond > 1e10);
+        return the unit-diagonal information matrix of the line fluxes and
+        its diagonal."""
         unc = np.asarray(spectrum.uncertainty, dtype=np.float64)
         used = np.asarray(spectrum.mask, dtype=bool) & np.isfinite(unc) & (unc > 0)
         w = np.where(used, 1.0 / np.where(unc > 0, unc, 1.0) ** 2, 0.0)
         A = np.asarray(self.columns({"zred": self.zred, "sigma_smooth": self.sigma_gas_kms}))
         M = A.T @ (w[:, None] * A)
         d = 1.0 / np.sqrt(np.maximum(np.diag(M), np.finfo(float).tiny))
-        cond = float(np.linalg.cond(d[:, None] * M * d[None, :]))
+        C = d[:, None] * M * d[None, :]
+        cond = float(np.linalg.cond(C))
         if not np.isfinite(cond) or cond > COND_MAX:
             raise ValueError(
                 f"the emission lines are nearly degenerate (condition number {cond:.2e}); "
                 "select fewer lines with names=...")
+        return C, np.diag(M)
 
     def __repr__(self) -> str:
-        return (f"EmissionLineColumns({self.n_line} lines, flat prior, "
+        return (f"EmissionLineColumns({self.n_line} lines, flat prior f >= 0, "
+                f"{len(self.pairs)} blended pairs, "
                 f"zred={self.zred_key or self.zred}, "
                 f"sigma_gas={self.sigma_key or self.sigma_gas_kms}: {', '.join(self.names)})")

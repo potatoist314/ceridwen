@@ -487,7 +487,8 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
     emission_lines : EmissionLineColumns, optional
         Emission lines as free-flux columns of the calibration solve (needs
         ``calibration``): the model becomes ``P(x) * mu + sum_k f_k L_k``
-        and the line fluxes are integrated out with the coefficients
+        and the line fluxes (flat prior on ``f >= 0``) are integrated out
+        with the coefficients
         (``PolynomialCalibration.calibrate_with_lines``).  The line profiles
         follow the sampled ``zred`` and ``sigma_smooth`` in ``params``.
         ``None`` (default) leaves the likelihood unchanged.
@@ -570,7 +571,8 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         if self.emission_lines is not None:
             mu, _, _, ln_extra = self.calibration.calibrate_with_lines(
                 y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
-                self.emission_lines.columns(params)
+                self.emission_lines.columns(params), self.emission_lines.pairs,
+                self.emission_lines.ridge
             )
         elif self.calibration is not None:
             mu, _, ln_extra = self.calibration.calibrate(
@@ -642,7 +644,8 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
             if emission_lines is not None:
                 mu, _, _, ln_extra = calibration.calibrate_with_lines(
                     y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
-                    emission_lines.columns(theta)
+                    emission_lines.columns(theta), emission_lines.pairs,
+                    emission_lines.ridge
                 )
                 lnl = lnl + ln_extra
             elif calibration is not None:

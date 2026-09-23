@@ -1,7 +1,7 @@
 """Emission lines as free-flux columns of the calibration solve.
 
 ``PolynomialCalibration.calibrate_with_lines`` integrates out the Chebyshev
-coefficients and the line fluxes (flat prior) in one Gaussian integral.
+coefficients and the line fluxes (flat prior on f >= 0) in one integral.
 Pure-kernel tests; the line-list test needs ``$SPS_HOME`` and skips without it.
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from numpy.polynomial.chebyshev import chebvander
 from scipy.integrate import quad
+from scipy.stats import multivariate_normal
 
 from ceridwen.likelihood import (
     DiagonalGaussianLikelihood,
@@ -22,6 +23,7 @@ from ceridwen.likelihood import (
     EmissionLineColumns,
     PolynomialCalibration,
 )
+from ceridwen.likelihood.calibration import _bvn_upper, log_positive_probability
 from ceridwen.observation import Spectrum
 
 jax.config.update("jax_enable_x64", True)
@@ -76,9 +78,10 @@ def test_zero_line_columns_equal_polynomial_marginalisation(prior_sigma):
     np.testing.assert_allclose(ln_extra_j, ln_extra, rtol=0, atol=1e-8)
 
 
-def test_joint_marginal_matches_quadrature_over_one_line_flux():
-    """ln of the integral over the flux f of the polynomial marginal of y - f L."""
-    mu, y, sigma, mask, L = _mock(np.array([0.0, 3e-17, 0.0]), snr=15.0)
+@pytest.mark.parametrize("flux", [3e-17, 2e-18, -1e-17])
+def test_joint_marginal_matches_quadrature_over_one_line_flux(flux):
+    """ln of the integral over f >= 0 of the polynomial marginal of y - f L."""
+    mu, y, sigma, mask, L = _mock(np.array([0.0, flux, 0.0]), snr=15.0)
     line = L[:, 1:2]
     cal = PolynomialCalibration.from_wavelength(WAVE, 2, fit_constant=True,
                                                 prior_sigma=[0.3, 0.1, 0.1])
@@ -90,16 +93,17 @@ def test_joint_marginal_matches_quadrature_over_one_line_flux():
 
     _, _, f_hat, _ = cal.calibrate_with_lines(y, mu, sigma, mask, jnp.asarray(line))
     f_hat = float(f_hat[0])
-    peak = polynomial_marginal(f_hat)
+    peak = polynomial_marginal(max(f_hat, 0.0))
     width = 1.0 / np.sqrt(float(line[:, 0] @ (line[:, 0] / sigma ** 2)))
+    lo, hi = max(0.0, f_hat - 12 * width), max(0.0, f_hat) + 12 * width
     integral, _ = quad(lambda f: np.exp(polynomial_marginal(f) - peak),
-                       f_hat - 12 * width, f_hat + 12 * width, epsabs=0, epsrel=1e-11, limit=200)
+                       lo, hi, epsabs=0, epsrel=1e-11, limit=200)
     np.testing.assert_allclose(float(joint(y, mu, sigma, mask)[0]), peak + np.log(integral),
                                rtol=0, atol=1e-6)
 
 
 def test_injected_lines_are_recovered():
-    truth = np.array([4e-17, -1e-17, 2e-17])
+    truth = np.array([4e-17, 1e-17, 2e-17])
     mu, y, sigma, mask, L = _mock(truth, seed=3)
     cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
                                                 prior_sigma=[0.3, 0.1, 0.1, 0.1])
@@ -108,11 +112,60 @@ def test_injected_lines_are_recovered():
     sd = np.sqrt(np.diag(np.linalg.inv(np.asarray(normal))))[cal.n_coeff:]
     assert np.all(np.abs(np.asarray(fluxes) - truth) < 3 * sd)
     assert np.all(truth[[0, 2]] / sd[[0, 2]] > 10)
-    # posterior draws scatter around the solution with the same width
-    draws = cal.posterior_draws_with_lines(
-        y, np.tile(mu, (4000, 1)), np.tile(sigma, (4000, 1)), jnp.tile(jnp.asarray(L), (4000, 1, 1)),
-        mask, jax.random.PRNGKey(0))[1]
-    np.testing.assert_allclose(np.std(np.asarray(draws), axis=0), sd, rtol=0.05)
+    # draws of lines far from zero are the untruncated Gaussian
+    draws = np.asarray(cal.posterior_draws_with_lines(
+        y, np.tile(mu, (2000, 1)), np.tile(sigma, (2000, 1)), jnp.tile(jnp.asarray(L), (2000, 1, 1)),
+        mask, jax.random.PRNGKey(0), sweeps=20)[1])
+    assert np.all(draws >= 0)
+    np.testing.assert_allclose(np.std(draws, axis=0)[[0, 2]], sd[[0, 2]], rtol=0.06)
+    np.testing.assert_allclose(np.mean(draws, axis=0)[[0, 2]], np.asarray(fluxes)[[0, 2]], atol=0.1 * sd.max())
+
+
+@pytest.mark.parametrize("extra_depth", [0.0, 1.0])
+def test_pure_stellar_absorption_gives_line_fluxes_near_zero(extra_depth):
+    """Absorption at the line centres, in the model (0) or deeper in the data than
+    in the model (twice as deep, template mismatch): the fluxes stay >= 0 and near zero."""
+    mu = _continuum()
+    L = np.asarray(_lines().columns({"zred": ZRED, "sigma_smooth": SIGMA_GAS}))
+    absorption = 1.0 - 3.0 * (L / L.max(axis=0)).sum(axis=1) * 0.1
+    sigma = mu / 30.0
+    y = mu * absorption * (1.0 - extra_depth * (1.0 - absorption)) \
+        + np.random.default_rng(5).normal(0.0, sigma)
+    mu = mu * absorption
+    mask = np.ones(WAVE.shape, dtype=bool)
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
+                                                prior_sigma=[0.3, 0.1, 0.1, 0.1])
+    _, _, f_hat, ln_extra = cal.calibrate_with_lines(y, mu, sigma, mask, jnp.asarray(L))
+    factor, scale, solution = cal._joint_factor(y, mu, sigma, mask, jnp.asarray(L))
+    sd = np.sqrt(np.diag(np.asarray(cal._line_posterior(factor, scale, solution)[1])))
+    draws = np.asarray(cal.posterior_draws_with_lines(
+        y, np.tile(mu, (500, 1)), np.tile(sigma, (500, 1)), jnp.tile(jnp.asarray(L), (500, 1, 1)),
+        mask, jax.random.PRNGKey(1))[1])
+    assert np.all(draws >= 0)
+    assert np.all(np.mean(draws, axis=0) < 1.5 * sd)
+    if extra_depth:
+        assert np.all(np.asarray(f_hat) / sd < -5)       # unconstrained fluxes would be negative
+
+
+def test_bivariate_orthant_matches_scipy():
+    rng = np.random.default_rng(1)
+    for r in [-0.996, -0.93, -0.5, 0.0, 0.3, 0.95]:
+        for h, k in rng.normal(0.0, 3.0, (20, 2)):
+            exact = multivariate_normal(mean=[0, 0], cov=[[1, r], [r, 1]]).cdf([-h, -k])
+            assert abs(float(_bvn_upper(h, k, r)) - exact) < 1e-12
+
+
+def test_positive_probability_of_a_blended_pair_is_exact():
+    mean = np.array([0.0, 0.0, 1e-17])
+    sd = np.array([3e-17, 3e-17, 1e-17])
+    corr = np.array([[1.0, -0.99, 0.0], [-0.99, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    cov = corr * np.outer(sd, sd)
+    exact = np.log(multivariate_normal(mean=-mean, cov=cov, abseps=1e-14, releps=1e-10,
+                                       maxpts=10**7).cdf(np.zeros(3)))
+    got = float(log_positive_probability(jnp.asarray(mean), jnp.asarray(cov), ((0, 1),)))
+    assert abs(got - exact) < 1e-5
+    product = float(log_positive_probability(jnp.asarray(mean), jnp.asarray(cov)))
+    assert abs(product - exact) > 1.0
 
 
 def test_likelihood_prefers_the_redshift_of_the_injected_lines():
@@ -143,10 +196,13 @@ def test_from_spectrum_selects_covered_lines_with_enough_unmasked_pixels():
                     resolution=3500.0, smoothtype="R", res_convention="fwhm",
                     sigma_losvd=SIGMA_GAS, fit_sigma_smooth=True, free_z=True, name="spectrum")
     spec.mask_wavelength_range(4862.7629 * (1 + ZRED) - 30, 4862.7629 * (1 + ZRED) + 30)
-    lines = EmissionLineColumns.from_spectrum(spec, ZRED, zred_range=(ZRED - 0.01, ZRED + 0.01))
+    lines = EmissionLineColumns.from_spectrum(spec, ZRED)
     assert "[O II] 3726" in lines.names and "[O III] 5007" in lines.names
     assert "Ba-beta 4861" not in lines.names          # masked: fewer than 3 pixels
     assert lines.zred_key == "zred" and lines.sigma_key == "sigma_smooth"
-    assert np.all(lines.wave_rest * (1 + ZRED - 0.01) > WAVE[0])
-    assert np.all(lines.wave_rest * (1 + ZRED + 0.01) < WAVE[-1])
+    assert np.all(lines.wave_rest * (1 + ZRED) > WAVE[0])
+    assert np.all(lines.wave_rest * (1 + ZRED) < WAVE[-1])
     assert lines.covers(5006.8) and not lines.covers(4861.3)
+    blended = {frozenset((lines.names[i], lines.names[j])) for i, j in lines.pairs}
+    assert frozenset(("He I 3888.63A", "Ba-6 3889")) in blended
+    assert len({i for pair in lines.pairs for i in pair}) == 2 * len(lines.pairs)
