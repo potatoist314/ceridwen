@@ -81,6 +81,11 @@ _CGS_PER_MAGGIE = 3631e-23
 # (weaker, stronger) FSPS line names -> flux ratio stronger / weaker; each
 # pair shares one upper level (1D2), so the ratio is set by the Einstein A
 # values.  Values: FSPS ZAU_ND_mist.lines (Cloudy), median over the grid.
+# FSPS names that are not real lines.  "[O II] 3867" (3868.16 A) has zero flux
+# in every Cloudy model, and NIST ASD lists no forbidden [O II] line between
+# 3860 and 3875 A; the forbidden line there is [Ne III] 3869, which stays.
+# https://physics.nist.gov/cgi-bin/ASD/lines1.pl?spectra=O+II&low_w=3860&upp_w=3875
+EXCLUDED_LINES = ("[O II] 3867",)
 TIED_RATIOS = {
     ("[O III] 4959", "[O III] 5007"): 3.010,
     ("[Ne III] 3968", "[Ne III] 3869"): 3.318,
@@ -214,6 +219,8 @@ class EmissionLineColumns:
                 else [table_names.index(n) for n in names])
         keep = []
         for r in rows:
+            if table_names[r] in EXCLUDED_LINES:
+                continue
             lo = table_wave[r] * (1.0 + zred)
             s = np.hypot(s_gas, np.interp(lo, wave, s_inst)) / _CKMS
             if (wave[0] * np.exp(3 * s) < lo < wave[-1] * np.exp(-3 * s)
