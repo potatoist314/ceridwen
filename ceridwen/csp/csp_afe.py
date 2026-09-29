@@ -169,8 +169,8 @@ class CSPBasis_afe:
             ``theta["sfh"]`` is indexed to match: ``sfh[0]`` is the
             SFR at today (per-node input) or the SFR of the
             youngest bin (per-bin / FastStepBasis input).  Likewise
-            ``theta["zh"]`` (per-node) has ``zh[0]`` = today's
-            metallicity.
+            ``theta["zh"]`` has ``zh[0]`` = today's metallicity
+            (per-node) or the metallicity of the youngest bin (per-bin).
 
             Example::
 
@@ -625,8 +625,9 @@ class CSPBasis_afe:
         ``"lookback_time"`` : shape ``(n_time,)``
 
         Either ``"Z"`` (scalar, constant metallicity) or ``"zh"`` (shape
-        ``(n_time,)``, time-varying metallicity) must be present, depending on
-        the ``zh_const`` flag set during ``__init__``.
+        ``(n_time,)`` per node or ``(n_time - 1,)`` per bin, time-varying
+        metallicity) must be present, depending on the ``zh_const`` flag set
+        during ``__init__``.
         """
         # --- Required keys: nice errors instead of raw KeyErrors -----------
         if 'lookback_time' not in theta:
@@ -765,9 +766,16 @@ class CSPBasis_afe:
                 )
 
         self.zh_is_scalar = None
+        # ``zh`` follows the two ``sfh`` conventions: one value per node
+        # (bins average adjacent nodes) or one value per bin (used directly).
+        self.zh_per_bin = False
         if 'zh' in theta:
             zh = jnp.atleast_1d(jnp.asarray(theta['zh'], dtype=float))
-            assert zh.shape == (self.n_time,), "'zh' must match 'lookback_time' length"
+            assert zh.shape in ((self.n_time,), (self.n_time - 1,)), (
+                f"'zh' shape {zh.shape} must be ({self.n_time},) (per node) "
+                f"or ({self.n_time - 1},) (per bin)"
+            )
+            self.zh_per_bin = zh.shape == (self.n_time - 1,)
             self.zh_is_scalar = False
         elif 'Z' in theta:
             Z = jnp.atleast_1d(jnp.asarray(theta['Z'], dtype=float))
@@ -1028,7 +1036,7 @@ class CSPBasis_afe:
             z_weight = jnp.clip((target_z - z0) / (z1 - z0), 0.0, 1.0)
         else:
             zh = theta["zh"]
-            zbin = 0.5 * (zh[:-1] + zh[1:])
+            zbin = zh if self.zh_per_bin else 0.5 * (zh[:-1] + zh[1:])
             z_lo = jnp.clip(
                 jnp.searchsorted(self.zmet, zbin, method="compare_all") - 1,
                 0,
@@ -1801,7 +1809,8 @@ class CSPBasis_afe:
         zh_mode : {"const", "var"}
             ``"const"`` — single constant metallicity from ``theta["Z"]``
             (shape ``(1,)``); ``"var"`` — time-varying metallicity from
-            ``theta["zh"]`` (shape ``(n_time,)``).
+            ``theta["zh"]`` (shape ``(n_time,)`` per node or
+            ``(n_time - 1,)`` per bin).
         sfh_mode : {"linear", "step"}
             ``"linear"`` — analytic log-age integration of a piecewise-linear
             SFH via :func:`intsfwght`; ``"step"`` — piecewise-constant SFH via
@@ -1952,7 +1961,7 @@ class CSPBasis_afe:
 
         # zh_mode == "var"
         zh   = theta["zh"]
-        zbin = 0.5 * (zh[:-1] + zh[1:])
+        zbin = zh if self.zh_per_bin else 0.5 * (zh[:-1] + zh[1:])
         k    = jnp.clip(jnp.searchsorted(self.zmet, zbin) - 1, 0, self._n_z - 2)
 
         z0 = self.zmet[k]
