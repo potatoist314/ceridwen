@@ -9,6 +9,7 @@ prediction and the log-likelihood must equal the ``baked_runtime=False`` path
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -24,7 +25,10 @@ from ceridwen.likelihood import (
     DiagonalNoiseModel,
     PolynomialCalibration,
 )
-from ceridwen.observation._smoothing import make_static_grid_interp
+from ceridwen.model.model import SedModel
+from ceridwen.observation._smoothing import (make_static_grid_interp,
+                                             make_vel_smoother)
+from ceridwen.sampler.priors import ClippedNormal, Normal
 from ceridwen.observation.spectrum import Spectrum
 
 Z0 = 0.70
@@ -59,7 +63,7 @@ ROUTES = {
 }
 
 
-def _build(route, baked):
+def _build(route, baked, sigma_smooth_max=None):
     cfg = ROUTES[route]
     wo = _observed_grid()
     wm = _model_grid()
@@ -73,7 +77,8 @@ def _build(route, baked):
         baked_runtime=baked, name="spec",
     )
     lib = (wm, np.linspace(20.0, 45.0, wm.size)) if cfg["lib"] else None
-    spec.setup_for_model(wm, zred=Z0, lib_resolution=lib)
+    spec.setup_for_model(wm, zred=Z0, lib_resolution=lib,
+                         sigma_smooth_max=sigma_smooth_max)
     return spec, wm
 
 
@@ -117,6 +122,61 @@ def test_prediction_and_log_likelihood_match_unbaked_path(route):
     np.testing.assert_allclose(mu_new, mu_old, rtol=1e-9, atol=0.0)
     # chi-square sums of order 1e6 carry the 1e-12 prediction rounding.
     np.testing.assert_allclose(lnl_new, lnl_old, rtol=1e-9, atol=1e-5)
+
+
+SIGMA_MAX = 350.0  # upper limit of the sigma drawn in _sampled_points
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_sigma_bound_pad_matches_the_2n_pad(route):
+    """An upper bound on the sampled sigma shortens the LOSVD zero pad only."""
+    spectra, sigma, zred, log_f = _sampled_points()
+    results = {}
+    for bound in (None, SIGMA_MAX):
+        spec, wm = _build(route, True, sigma_smooth_max=bound)
+        likelihood = DiagonalGaussianLikelihood(
+            noise_model=DiagonalNoiseModel(use_fractional=True),
+            calibration=PolynomialCalibration.from_spectrum(
+                spec, order=10, fit_constant=False, prior_sigma=0.1,
+                marginalize=True),
+        )
+
+        def point(flux, s, z, lf, spec=spec, wm=wm, likelihood=likelihood):
+            mu = spec.predict(flux, wm, sigma_smooth=s, zred=z)
+            lnl, _ = likelihood(spec.flux, mu, spec.uncertainty, spec.mask,
+                                params={"log_f_calib": lf[None]})
+            return mu, lnl
+
+        results[bound] = jax.jit(jax.vmap(point))(spectra, sigma, zred, log_f)
+
+    mu_old, lnl_old = (np.asarray(v) for v in results[None])
+    mu_new, lnl_new = (np.asarray(v) for v in results[SIGMA_MAX])
+    assert not np.array_equal(mu_new, mu_old)  # the shorter transform ran
+    np.testing.assert_allclose(mu_new, mu_old, rtol=1e-9, atol=0.0)
+    np.testing.assert_allclose(lnl_new, lnl_old, rtol=1e-9, atol=1e-5)
+
+
+def test_sigma_bound_sets_the_traced_fft_length():
+    wm = _model_grid()
+    full = make_vel_smoother(wm, wm).traced_fft_length
+    short = make_vel_smoother(wm, wm, sigma_max=SIGMA_MAX).traced_fft_length
+    # 350 km/s is 7 pixels of c/6000: the 20-sigma pad is below n/8.
+    n = full // 2
+    assert full == 2 * n and short == n + (n >> 3)
+    # A bound too wide for a short pad keeps 2n.
+    assert make_vel_smoother(wm, wm, sigma_max=1e5).traced_fft_length == full
+
+
+def test_model_reads_the_bound_from_the_sigma_smooth_prior():
+    def bound(priors, transforms=()):
+        model = SimpleNamespace(priors=priors, transforms=dict.fromkeys(transforms))
+        return SedModel._prior_upper_bound(model, "sigma_smooth")
+
+    clipped = ClippedNormal(mean=200.0, sigma=20.0, low=140.0, high=260.0)
+    assert bound({"sigma_smooth": clipped}) == 260.0
+    assert bound({"sigma_smooth": Normal(mean=200.0, sigma=20.0)}) is None
+    assert bound({"sigma_smooth": clipped}, transforms=["sigma_smooth"]) is None
+    assert bound({}) is None
 
 
 def test_static_grid_interp_equals_jnp_interp():

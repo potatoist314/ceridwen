@@ -410,7 +410,7 @@ class Spectrum(Observation):
         return self._H_cached
 
     def setup_for_model(self, wave_model, zred: float = 0.0,
-                        lib_resolution=None):
+                        lib_resolution=None, sigma_smooth_max=None):
         """
         Precompute projection matrices and/or smoothing kernels, then build
         ``_predict_fn`` — the single callable used by ``predict``.
@@ -454,6 +454,12 @@ class Spectrum(Observation):
             observed pixel ``(1+z)·λ_rest`` unchanged.  Required in that
             case — a smoothing-enabled Spectrum with ``inres="auto"`` and
             no curve raises (pass an explicit ``inres`` float to opt out).
+        sigma_smooth_max : float, optional
+            Upper bound [km/s] on the runtime ``sigma_smooth``.  The baked
+            runtime LOSVD stage then pads its FFT for this width in place
+            of ``2n``; the prediction is the same to rounding error for
+            every ``sigma_smooth`` up to the bound.  ``SedModel`` passes
+            the upper limit of the ``sigma_smooth`` prior.
         """
         if self._wavelength is None:
             raise ValueError(
@@ -548,10 +554,14 @@ class Spectrum(Observation):
             # step.
             if has_losvd:
                 _sv_losvd = float(self.sigma_losvd)
+                _pad = ({"sigma_max": sigma_smooth_max}
+                        if fit_lo and self.baked_runtime
+                        and sigma_smooth_max is not None else {})
                 if has_instr:
                     # Output stays on trimmed model grid for chaining with
                     # the instrumental smoother below.
-                    _losvd_sm = make_vel_smoother(_wm_trim, _wm_trim, inres=0.0)
+                    _losvd_sm = make_vel_smoother(
+                        _wm_trim, _wm_trim, inres=0.0, **_pad)
                     _sv       = _sv_losvd   # capture scalar before lambda
                     def _apply_losvd(spec_trim, _s=_losvd_sm, _v=_sv):
                         return _s(spec_trim, _v)
@@ -562,7 +572,8 @@ class Spectrum(Observation):
                         return _s(spec_trim, sigma_v)
                 else:
                     # LOSVD only: output goes directly to observed grid.
-                    _losvd_sm = make_vel_smoother(_wm_trim, wo, inres=0.0)
+                    _losvd_sm = make_vel_smoother(
+                        _wm_trim, wo, inres=0.0, **_pad)
                     _sv       = _sv_losvd
                     def _apply_losvd(spec_trim, _s=_losvd_sm, _v=_sv):
                         return _s(spec_trim, _v)

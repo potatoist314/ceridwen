@@ -207,20 +207,24 @@ def _padded_length(n, sigma_pix):
     return 2 * n
 
 
-def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64):
+def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64,
+                       sigma_max=None):
     """Return ``smoother(spec, sigma)``: resample -> padded Gaussian FFT -> resample.
 
     Matches ``jax_interp -> smooth_fft_padded -> jax_interp`` of sedpy_jax.
     Only ``spec`` and ``sigma`` stay traced.  A Python-float ``sigma`` also
     bakes the taper and shortens the zero pad to what that width needs; a
-    traced ``sigma`` keeps the ``2n`` pad.
+    traced ``sigma`` keeps the ``2n`` pad unless ``sigma_max``, an upper
+    bound on every traced ``sigma``, gives the pad that bound needs.
     """
     n = len(grid)
     dx = float(dx)
     to_grid = _bake_interp(grid, wave, dtype)
     to_out = _bake_interp(outwave, grid, dtype)
-    exponent_2n = jnp.asarray(
-        -2.0 * np.pi**2 * np.fft.rfftfreq(2 * n, d=dx) ** 2).astype(dtype)
+    m_traced = 2 * n if sigma_max is None else _padded_length(
+        n, np.sqrt(max(float(sigma_max) ** 2 - float(inres) ** 2, 0.0)) / dx)
+    exponent = jnp.asarray(
+        -2.0 * np.pi**2 * np.fft.rfftfreq(m_traced, d=dx) ** 2).astype(dtype)
 
     def smoother(spec, sigma):
         if isinstance(sigma, (int, float, np.floating)):
@@ -230,18 +234,19 @@ def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64):
             taper = jnp.asarray(
                 np.exp(-2.0 * np.pi**2 * sigma_eff**2 * nu**2)).astype(dtype)
         else:
-            m = 2 * n
-            taper = jnp.exp(exponent_2n * jnp.maximum(sigma**2 - inres**2, 0.0))
+            m = m_traced
+            taper = jnp.exp(exponent * jnp.maximum(sigma**2 - inres**2, 0.0))
         padded = jnp.concatenate([to_grid(spec), jnp.zeros((m - n,), dtype=dtype)])
         return to_out(jnp.fft.irfft(jnp.fft.rfft(padded) * taper, n=m)[:n])
 
+    smoother.traced_fft_length = m_traced
     return smoother
 
 
-def make_vel_smoother(wave, outwave, inres=0.0):
+def make_vel_smoother(wave, outwave, inres=0.0, sigma_max=None):
     """Baked ``sedpy_jax.smoothing.make_vel_smoother``: ``smoother(spec, sigma_v)``."""
     grid, dv = _log_grid(np.asarray(wave))
-    return _bake_fft_smoother(wave, grid, dv, outwave, inres)
+    return _bake_fft_smoother(wave, grid, dv, outwave, inres, sigma_max=sigma_max)
 
 
 def make_wave_smoother(wave, outwave, inres=0.0):

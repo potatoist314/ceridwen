@@ -238,9 +238,16 @@ class SedModel:
                 # into the Spectrum projection so the library width is
                 # subtracted in quadrature from the instrumental
                 # smoothing automatically (inres="auto").
+                extra = {}
+                if obs._kind == "spectrum":
+                    # The hard upper limit of the sigma_smooth prior sets
+                    # the zero pad of the runtime LOSVD FFT.
+                    extra["sigma_smooth_max"] = self._prior_upper_bound(
+                        "sigma_smooth")
                 obs.setup_for_model(
                     self.wave, zred=self.zred,
-                    lib_resolution=getattr(self.csp, "lib_resolution", None))
+                    lib_resolution=getattr(self.csp, "lib_resolution", None),
+                    **extra)
             else:
                 obs.setup_for_model(self.wave, zred=self.zred)
 
@@ -330,6 +337,16 @@ class SedModel:
     # ------------------------------------------------------------------
     # Transforms
     # ------------------------------------------------------------------
+
+    def _prior_upper_bound(self, name):
+        """Finite hard upper limit of the prior on a sampled parameter, else None."""
+        if name not in self.priors or name in self.transforms:
+            return None
+        bounds = self.priors[name].bounds
+        if callable(bounds):
+            bounds = bounds()
+        high = float(jnp.max(jnp.asarray(bounds[1])))
+        return high if high < float("inf") else None
 
     def apply_transforms(self, free_theta: dict[str, Array]) -> dict[str, Array]:
         """
