@@ -220,3 +220,45 @@ def test_step_compiled_during_init_compiles_once_and_matches_serial_run(caplog):
         live, dead = step(subkey, live)
         for a, b in zip(jax.tree.leaves((outgoing, info)), jax.tree.leaves((live, dead))):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("prior", ["flat", "normal"])
+def test_lane_kernel_skips_and_stores_evaluations_bitwise(prior):
+    """A flat prior: every batch slot saved comes from a stored lookahead result.
+    A normal prior: candidates below the prior slice level also skip the batch."""
+    import blackjax
+    import numpy as np
+
+    batches = []
+
+    def loglike(p):
+        jax.debug.callback(lambda: batches.append(1))
+        return -8.*jnp.sum((p['x'] - .5)**2) - 6.*p['x'][0]*p['x'][1]
+
+    def logprior(p):
+        return jnp.zeros(()) if prior == "flat" else -.5*jnp.sum(p['x']**2)
+
+    num_delete, num_inner_steps = 10, 8
+    stock = blackjax.nss(logprior_fn=logprior, loglikelihood_fn=loglike,
+                         num_inner_steps=num_inner_steps, num_delete=num_delete)
+    lanes = BlackJAXNestedSamplerAdapter(
+        {}, verbose=False, slice_kernel="lanes")._build_nested_sampler(
+            loglike, logprior, num_inner_steps, num_delete)
+    keys = jax.random.split(jax.random.key(11), 2)
+    state = jax.jit(stock.init)({'x': jax.random.normal(keys[0], (60, 3))})
+    stock_step, lane_step = jax.jit(stock.step), jax.jit(lanes.step)
+    unbatched = 0
+    for key in jax.random.split(keys[1], 10):
+        want = stock_step(key, state)
+        batches.clear()
+        got = jax.block_until_ready(lane_step(key, state))
+        jax.effects_barrier()     # the callback runs once per batch
+        for a, b in zip(jax.tree.leaves(want), jax.tree.leaves(got)):
+            assert a.dtype == b.dtype
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        info = want[1].update_info
+        per_lane = np.sum(np.asarray(info.num_expansions) + np.asarray(info.num_shrink) + 2, axis=1)
+        # One batch per candidate of the slowest lane, less the batches saved.
+        unbatched += per_lane.max() - len(batches)
+        state = want[0]
+    assert unbatched > 0
