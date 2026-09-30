@@ -7,6 +7,7 @@ Broadband photometric observation container.
 import json
 import jax.numpy as jnp
 import numpy as np
+from scipy import sparse
 from sedpy_jax.observate import FilterSet
 from sedpy_jax.smoothing import (
     make_vel_smoother,
@@ -231,13 +232,14 @@ class Photometry(Observation):
         outside = (lam_filt < wm[0]) | (lam_filt > wm[-1])
         frac[outside] = 0.0
 
-        # Build H as a dense matrix (n_lam, n_wave)
-        H = np.zeros((n_lam, n_wave), dtype=np.float64)
-        for j in range(n_lam):
-            if outside[j]:
-                continue
-            H[j, idx[j]]     = (1.0 - frac[j])
-            H[j, idx[j] + 1] = frac[j]
+        # H (n_lam, n_wave) has two entries per filter-grid row; sparse, so
+        # no dense (n_lam, n_wave) matrix (4.9 GB for 28 bands) is built.
+        rows = np.flatnonzero(~outside)
+        H = sparse.csr_matrix(
+            (np.column_stack([1.0 - frac[rows], frac[rows]]).ravel(),
+             np.column_stack([idx[rows], idx[rows] + 1]).ravel(),
+             np.searchsorted(rows, np.arange(n_lam + 1)) * 2),
+            shape=(n_lam, n_wave))
 
         # FilterSet.trans is (n_filters, n_lam): already includes
         # R * lam * dlam / ab_zero_counts normalisation.
@@ -247,7 +249,8 @@ class Photometry(Observation):
         #   maggies = trans @ (H @ (F_nu * fnu_to_flam))
         #           = (trans @ H @ diag(fnu_to_flam)) @ F_nu
         #           = _T @ F_nu
-        TH = trans @ H                                   # (n_filt, n_wave)
+        # Each column of trans @ H sums its nonzero terms in filter-grid order.
+        TH = (H.T @ trans.T).T                           # (n_filt, n_wave)
         T  = TH * fnu_to_flam[None, :]                   # (n_filt, n_wave)
 
         self._T = jnp.array(T.astype(np.float32))
