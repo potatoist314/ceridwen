@@ -7,7 +7,8 @@ import jax.numpy as jnp
 from blackjax.ns.base import init_state_strategy
 from blackjax.ns.nss import covariance_proposal, slice_constrained_step
 from blackjax.mcmc.slice import build_kernel, stepping_out
-from ceridwen.sampler.nested import BlackJAXNestedSamplerAdapter
+from ceridwen.sampler.nested import (BlackJAXNestedSamplerAdapter,
+                                     stepping_out_carry)
 
 
 def test_logical_call_count_includes_endpoint_checks_and_shrinkage():
@@ -85,3 +86,63 @@ def test_callback_replays_completed_transition_and_counts_initial_points():
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
         count += int(adapter._logical_likelihood_calls(info))
     assert result.n_likelihood_calls == count
+
+
+def test_carry_stepping_out_counts_the_same_calls_as_stock():
+    counts = {}
+    for interval in (stepping_out, stepping_out_carry):
+        calls = []
+
+        def loglike(position):
+            calls.append(1)
+            return -jnp.sum(position['x'] ** 2)
+
+        def initialize(position, loglikelihood_birth=jnp.nan):
+            return init_state_strategy(position, lambda p: jnp.zeros(()),
+                                       loglike, loglikelihood_birth)
+
+        move = slice_constrained_step(
+            initialize, build_kernel(interval=interval,
+                                     max_expansions=10, max_shrinkage=100),
+            covariance_proposal)
+        with jax.disable_jit():
+            state = initialize({'x': jnp.array([0.1, 0.2])})
+            calls.clear()
+            move(jax.random.PRNGKey(37), state, -2., cov=jnp.eye(2))
+        counts[interval] = len(calls)
+    assert counts[stepping_out_carry] == counts[stepping_out] > 1
+
+
+def test_carry_kernel_is_bitwise_equal_to_stock_blackjax_nss():
+    from ceridwen.sampler import Uniform
+    import numpy as np
+
+    def run(slice_kernel):
+        records = []
+        adapter = BlackJAXNestedSamplerAdapter(
+            {'x': Uniform(low=-5., high=5.)}, num_live=40, num_delete=8,
+            num_inner_steps=6, verbose=False, slice_kernel=slice_kernel,
+            iteration_callback=lambda *args: records.append(args[3:5]))
+        # A narrow, correlated peak: the stepping-out loops reach their
+        # caps early on and the shrink loop runs many times later.
+        result = adapter.run(
+            lambda p: -50.*jnp.sum((p['x'] - .7)**2) - 40.*jnp.prod(p['x']),
+            lambda p: jnp.zeros(()), {'x': jnp.zeros(3)},
+            jax.random.PRNGKey(20260930))
+        return result, records
+
+    carry, carry_records = run('carry')
+    stock, stock_records = run('stock')
+    assert len(carry_records) == len(stock_records) > 20
+    expansions = np.concatenate([np.asarray(info.update_info.num_expansions).ravel()
+                                 for _, info in stock_records])
+    assert expansions.min() == 0 and expansions.max() == 9
+    for a, b in zip(jax.tree.leaves(carry_records), jax.tree.leaves(stock_records)):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    for name in ('log_likelihoods', 'log_weights'):
+        np.testing.assert_array_equal(np.asarray(getattr(carry, name)),
+                                      np.asarray(getattr(stock, name)))
+    np.testing.assert_array_equal(np.asarray(carry.samples['x']),
+                                  np.asarray(stock.samples['x']))
+    assert carry.log_evidence == stock.log_evidence
+    assert carry.n_likelihood_calls == stock.n_likelihood_calls

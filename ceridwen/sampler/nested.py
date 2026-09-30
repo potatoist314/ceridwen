@@ -86,6 +86,40 @@ from .runner import SamplerAdapter, SamplingResult
 Array = jax.Array
 
 
+def stepping_out_carry(rng_key, in_slice, width, max_expansions):
+    """Neal (2003) Fig. 3 stepping-out with the slice test in the loop body.
+
+    Drop-in for ``blackjax.mcmc.slice.stepping_out``: same random numbers,
+    same sequence of ``in_slice`` evaluations, bitwise-equal bracket.  The
+    stock loops call ``in_slice`` in their condition, and a vmapped
+    ``lax.while_loop`` evaluates the condition a second time inside its
+    body, so every expansion costs two batched likelihood evaluations.
+    Here the body evaluates the new edge once and carries the result.
+    """
+    u_key, jk_key = jax.random.split(rng_key)
+    u = jax.random.uniform(u_key)
+    left = -width * u
+    right = left + width
+    v = jax.random.uniform(jk_key)
+    j = jnp.floor(max_expansions * v).astype(int)
+    k = (max_expansions - 1) - j
+
+    def cond(carry):
+        _, n, inside = carry
+        return inside & (n > 0)
+
+    def step(sign):
+        def body(carry):
+            edge, n, _ = carry
+            edge = edge + sign * width
+            return edge, n - 1, in_slice(edge)
+        return body
+
+    left, jl, _ = jax.lax.while_loop(cond, step(-1), (left, j, in_slice(left)))
+    right, kr, _ = jax.lax.while_loop(cond, step(+1), (right, k, in_slice(right)))
+    return left, right, (j - jl) + (k - kr), lambda t: jnp.asarray(True)
+
+
 class BlackJAXNestedSamplerAdapter(SamplerAdapter):
     """
     Adapter wrapping ``blackjax.nss`` for use with any Ceridwen ``SedModel``.
@@ -155,6 +189,10 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         Called after each completed step with ``(iteration, key, incoming,
         outgoing, info, compiled_step, elapsed_seconds)``. Default None.
         Intended for profiling; the callback must not modify the sampler state.
+    slice_kernel : str, optional
+        ``"carry"`` (default) runs the slice kernel with
+        :func:`stepping_out_carry`; ``"stock"`` runs the unchanged
+        ``blackjax.nss`` kernel.  Both give bitwise-equal samples.
     progress_path : str, optional
         JSON-lines file that receives one record per completed iteration:
         the checkpoint ``progress`` fields plus ``iteration_s``,
@@ -180,6 +218,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         checkpoint_frame_max_bytes: int = 2 * 1024 * 1024,
         iteration_callback: Optional[Callable] = None,
         progress_path: Optional[str] = None,
+        slice_kernel: str = "carry",
     ):
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
@@ -189,6 +228,9 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self.verbose         = bool(verbose)
         self.iteration_callback = iteration_callback
         self.progress_path = progress_path
+        if slice_kernel not in ("carry", "stock"):
+            raise ValueError(f"unknown slice_kernel {slice_kernel!r}")
+        self.slice_kernel = slice_kernel
         # Periodic checkpointing.  Every ``checkpoint_interval_s`` seconds
         # (default 1200 = 20 min; <= 0 disables) the accumulated dead points
         # are finalised against the current live ensemble and dumped to disk,
@@ -435,12 +477,39 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
     def _build_nested_sampler(self, loglike_fn, logprior_fn,
                               num_inner_steps, num_delete):
-        """Construct the unchanged BlackJAX NSS transition kernel."""
+        """Construct the BlackJAX NSS transition kernel.
+
+        ``slice_kernel="carry"`` assembles the kernel as
+        ``blackjax.ns.nss.as_top_level_api`` does, with
+        :func:`stepping_out_carry` as the interval procedure.
+        """
         import blackjax
-        return blackjax.nss(
-            logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn,
-            num_delete=num_delete, num_inner_steps=num_inner_steps,
-        )
+        if self.slice_kernel == "stock":
+            return blackjax.nss(
+                logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn,
+                num_delete=num_delete, num_inner_steps=num_inner_steps,
+            )
+        from functools import partial
+        from blackjax.mcmc.slice import build_kernel as build_slice_kernel
+        from blackjax.ns import adaptive, base, from_mcmc, nss
+        init_state_fn = partial(
+            base.init_state_strategy,
+            logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn)
+        constrained_step = nss.slice_constrained_step(
+            init_state_fn,
+            build_slice_kernel(interval=stepping_out_carry,
+                               max_expansions=10, max_shrinkage=100),
+            nss.covariance_proposal)
+        kernel = from_mcmc.build_kernel(
+            constrained_step, num_inner_steps, nss.live_covariance, num_delete)
+
+        def init_fn(position, rng_key=None):
+            return adaptive.init(
+                position, init_state_fn=jax.vmap(init_state_fn),
+                update_inner_kernel_params_fn=nss.live_covariance,
+                rng_key=rng_key)
+
+        return blackjax.SamplingAlgorithm(init_fn, kernel)
 
     @staticmethod
     def _logical_likelihood_calls(info):
