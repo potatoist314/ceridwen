@@ -351,9 +351,12 @@ class EmissionLineColumns:
         else:
             x = (jnp.asarray(np.log(self.wave_obs)[rows]) - jnp.log(centre)[None, :]) / s[None, :]
             phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
-            profiles = jnp.zeros((self.wave_obs.size, self.wave_rest.size)).at[
-                rows, np.arange(self.wave_rest.size)[None, :]].set(
-                phi * jnp.asarray((self.wave_obs / _C_AA_S)[rows]), unique_indices=True)
+            window = phi * jnp.asarray((self.wave_obs / _C_AA_S)[rows])
+            # Each pixel's value in its line's window, or 0 outside it.
+            offset = np.arange(self.wave_obs.size)[:, None] - rows[0][None, :]
+            inside = (offset >= 0) & (offset < rows.shape[0])
+            profiles = jnp.where(inside, window[np.clip(offset, 0, rows.shape[0] - 1),
+                                                np.arange(self.wave_rest.size)[None, :]], 0.0)
         if self.tie is None:
             return profiles
         # profiles @ tie without its zero terms, bitwise: a free line's column
@@ -361,8 +364,11 @@ class EmissionLineColumns:
         free = profiles[:, np.argmax(self.tie, axis=0)]
         for c in np.flatnonzero(np.count_nonzero(self.tie, axis=0) > 1):
             r = np.flatnonzero(self.tie[:, c])
-            free = free.at[:, c].set(profiles[:, r] @ jnp.asarray(self.tie[r, c]))
-        return free
+            free = jnp.where(np.arange(free.shape[1]) == c,
+                             (profiles[:, r] @ jnp.asarray(self.tie[r, c]))[:, None], free)
+        # Without the barrier, XLA fuses the doublet's dot into its consumers
+        # and can contract it to an FMA, which rounds differently.
+        return jax.lax.optimization_barrier(free)
 
     def covers(self, rest_wave: float, tol: float = 2.0) -> bool:
         """Whether a fitted line lies within ``tol`` A of ``rest_wave``."""
