@@ -80,6 +80,7 @@ from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 
 from .runner import SamplerAdapter, SamplingResult
 
@@ -118,6 +119,154 @@ def stepping_out_carry(rng_key, in_slice, width, max_expansions):
     left, jl, _ = jax.lax.while_loop(cond, step(-1), (left, j, in_slice(left)))
     right, kr, _ = jax.lax.while_loop(cond, step(+1), (right, k, in_slice(right)))
     return left, right, (j - jl) + (k - kr), lambda t: jnp.asarray(True)
+
+
+_LEFT, _RIGHT, _SHRINK = 0, 1, 2
+
+
+def lane_update(init_state_fn, num_inner_steps, num_delete,
+                max_expansions=10, max_shrinkage=100, width=1.0):
+    """Inner update of the NS kernel, one ``lax.while_loop`` per particle.
+
+    ``blackjax.nss`` replaces ``num_delete`` particles per iteration.  Each
+    particle (a lane) runs ``num_inner_steps`` slice steps, and each slice
+    step runs three ``lax.while_loop``s: two stepping-out loops and one
+    shrink loop.  Under ``vmap`` a while loop runs until its slowest lane
+    stops, so at every slice step every lane pays for the longest loop of
+    any lane.
+
+    Here a lane is one ``lax.while_loop`` over its whole chain of slice
+    steps.  Each iteration evaluates one candidate; the lane's phase (left
+    edge, right edge, shrink) selects which one.  A lane that completes a
+    slice step starts its next step on the next iteration.  The vmapped
+    loop therefore runs for the largest per-lane total of evaluations, not
+    for the sum over slice steps of the per-step maxima.  The scheme is the
+    finite-state-machine vectorisation of Dance et al. (2025,
+    arXiv:2503.17405).
+
+    The random numbers are split as BlackJAX splits them and every
+    candidate is evaluated with the same arithmetic, so the new particles
+    and the per-step ``SliceInfo`` are bitwise equal to those of
+    ``blackjax.nss``.
+
+    Drop-in for ``blackjax.ns.from_mcmc.update_with_mcmc_take_last`` applied
+    to ``blackjax.ns.nss.slice_constrained_step`` with the stepping-out
+    interval and the covariance proposal.  Returns the ``num_delete`` new
+    particles and a ``SliceInfo`` of shape ``(num_delete, num_inner_steps)``.
+    """
+    from blackjax.mcmc.slice import SliceInfo
+    from blackjax.ns.nss import sample_direction_from_covariance
+
+    def update_function(rng_key, state, loglikelihood_0, cov):
+        choice_key, sample_key = jax.random.split(rng_key)
+        particles = state.particles
+
+        # Start particles, selected as in update_with_mcmc_take_last.
+        weights = (particles.loglikelihood > loglikelihood_0).astype(jnp.float32)
+        weights = jnp.where(weights.sum() > 0.0, weights, jnp.ones_like(weights))
+        start_idx = jax.random.choice(
+            choice_key, len(weights), shape=(num_delete,),
+            p=weights / weights.sum(), replace=True)
+        start_state = jax.tree.map(lambda x: x[start_idx], particles)
+
+        def lane(rng_key, state):
+            _, unravel = ravel_pytree(state.position)
+
+            def draws(key):
+                # The random numbers of one slice step: blackjax.mcmc.slice
+                # build_kernel, _univariate_slice and stepping_out.
+                prop_key, slice_key = jax.random.split(key)
+                direction, _ = ravel_pytree(sample_direction_from_covariance(
+                    prop_key, state.position, cov))
+                level_key, interval_key, shrink_key = jax.random.split(slice_key, 3)
+                log_u = jnp.log(jax.random.uniform(level_key))
+                u_key, jk_key = jax.random.split(interval_key)
+                left = -width * jax.random.uniform(u_key)
+                right = left + width
+                j = jnp.floor(max_expansions * jax.random.uniform(jk_key)).astype(int)
+                k = (max_expansions - 1) - j
+                return direction, jnp.stack([log_u, left, right]), jnp.stack([j, k]), shrink_key
+
+            # A scan, as in BlackJAX, so the draws keep their batch structure.
+            directions, reals, caps, shrink_keys = jax.lax.map(
+                draws, jax.random.split(rng_key, num_inner_steps))
+            counter = caps.dtype.type
+
+            def begin(i, logdensity):
+                log_u, left, right = reals[i]
+                return dict(phase=jnp.asarray(_LEFT), level=logdensity + log_u,
+                            left=left, right=right,
+                            n_left=caps[i, 0], n_right=caps[i, 1],
+                            bracket_left=left, bracket_right=right,
+                            key=shrink_keys[i], n_expansions=counter(0),
+                            n_shrink=counter(0))
+
+            def cond(carry):
+                return carry[0] < num_inner_steps
+
+            def body(carry):
+                i, state, s, info = carry
+                in_left, in_right = s["phase"] == _LEFT, s["phase"] == _RIGHT
+                in_shrink = s["phase"] == _SHRINK
+
+                # One candidate per iteration: an edge, or a shrink proposal.
+                key, subkey = jax.random.split(s["key"])
+                t = s["left"] + jax.random.uniform(subkey) * (s["right"] - s["left"])
+                t = jnp.where(in_left, s["left"], jnp.where(in_right, s["right"], t))
+                direction = unravel(directions[i])
+                x = jax.tree.map(lambda p, d: p + t * d, state.position, direction)
+                candidate = init_state_fn(x, loglikelihood_birth=loglikelihood_0)
+                inside = ((candidate.logdensity >= s["level"])
+                          & (candidate.loglikelihood > loglikelihood_0))
+
+                # Stepping out (Neal 2003, Fig. 3).
+                grow_left = in_left & inside & (s["n_left"] > 0)
+                grow_right = in_right & inside & (s["n_right"] > 0)
+                left = jnp.where(grow_left, s["left"] - width, s["left"])
+                right = jnp.where(grow_right, s["right"] + width, s["right"])
+                bracket_left = jnp.where(in_shrink, s["bracket_left"], left)
+                bracket_right = jnp.where(in_shrink, s["bracket_right"], right)
+                n_expansions = s["n_expansions"] + (grow_left | grow_right)
+                phase = jnp.where(in_left & ~grow_left, _RIGHT,
+                                  jnp.where(in_right & ~grow_right, _SHRINK, s["phase"]))
+
+                # Shrinkage (Neal 2003, Fig. 5).
+                found = in_shrink & inside
+                left = jnp.where(in_shrink & (t < 0.0), t, left)
+                right = jnp.where(in_shrink & (t >= 0.0), t, right)
+                n_shrink = s["n_shrink"] + in_shrink
+                state = jax.tree.map(
+                    lambda new, old: jnp.where(found, new, old), candidate, state)
+                done = in_shrink & (found | (n_shrink >= max_shrinkage))
+
+                row = jnp.stack([found, n_expansions, n_shrink,
+                                 bracket_left, bracket_right]).astype(info.dtype)
+                info = info.at[jnp.where(done, i, num_inner_steps)].set(row, mode="drop")
+                running = dict(
+                    phase=phase, level=s["level"], left=left, right=right,
+                    n_left=s["n_left"] - grow_left, n_right=s["n_right"] - grow_right,
+                    bracket_left=bracket_left, bracket_right=bracket_right,
+                    key=jnp.where(in_shrink, key, s["key"]),
+                    n_expansions=n_expansions, n_shrink=n_shrink)
+                i = i + done
+                fresh = begin(jnp.minimum(i, num_inner_steps - 1), state.logdensity)
+                s = jax.tree.map(lambda a, b: jnp.where(done, a, b), fresh, running)
+                return i, state, s, info
+
+            first = jnp.asarray(0)
+            _, state, _, info = jax.lax.while_loop(
+                cond, body,
+                (first, state, begin(first, state.logdensity),
+                 jnp.zeros((num_inner_steps, 5), reals.dtype)))
+            return state, SliceInfo(
+                is_accepted=info[:, 0] != 0,
+                num_expansions=info[:, 1].astype(caps.dtype),
+                num_shrink=info[:, 2].astype(caps.dtype),
+                bracket_left=info[:, 3], bracket_right=info[:, 4])
+
+        return jax.vmap(lane)(jax.random.split(sample_key, num_delete), start_state)
+
+    return update_function
 
 
 class BlackJAXNestedSamplerAdapter(SamplerAdapter):
@@ -190,9 +339,11 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         outgoing, info, compiled_step, elapsed_seconds)``. Default None.
         Intended for profiling; the callback must not modify the sampler state.
     slice_kernel : str, optional
-        ``"carry"`` (default) runs the slice kernel with
+        ``"lanes"`` (default) runs each replaced particle as one loop over
+        its whole slice chain (:func:`lane_update`);
+        ``"carry"`` runs the BlackJAX slice kernel with
         :func:`stepping_out_carry`; ``"stock"`` runs the unchanged
-        ``blackjax.nss`` kernel.  Both give bitwise-equal samples.
+        ``blackjax.nss`` kernel.  All three give bitwise-equal samples.
     progress_path : str, optional
         JSON-lines file that receives one record per completed iteration:
         the checkpoint ``progress`` fields plus ``iteration_s``,
@@ -218,7 +369,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         checkpoint_frame_max_bytes: int = 2 * 1024 * 1024,
         iteration_callback: Optional[Callable] = None,
         progress_path: Optional[str] = None,
-        slice_kernel: str = "carry",
+        slice_kernel: str = "lanes",
     ):
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
@@ -228,7 +379,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self.verbose         = bool(verbose)
         self.iteration_callback = iteration_callback
         self.progress_path = progress_path
-        if slice_kernel not in ("carry", "stock"):
+        if slice_kernel not in ("lanes", "carry", "stock"):
             raise ValueError(f"unknown slice_kernel {slice_kernel!r}")
         self.slice_kernel = slice_kernel
         # Periodic checkpointing.  Every ``checkpoint_interval_s`` seconds
@@ -482,6 +633,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         ``slice_kernel="carry"`` assembles the kernel as
         ``blackjax.ns.nss.as_top_level_api`` does, with
         :func:`stepping_out_carry` as the interval procedure.
+        ``"lanes"`` replaces the inner update with :func:`lane_update`.
         """
         import blackjax
         if self.slice_kernel == "stock":
@@ -495,13 +647,20 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         init_state_fn = partial(
             base.init_state_strategy,
             logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn)
-        constrained_step = nss.slice_constrained_step(
-            init_state_fn,
-            build_slice_kernel(interval=stepping_out_carry,
-                               max_expansions=10, max_shrinkage=100),
-            nss.covariance_proposal)
-        kernel = from_mcmc.build_kernel(
-            constrained_step, num_inner_steps, nss.live_covariance, num_delete)
+        if self.slice_kernel == "lanes":
+            kernel = adaptive.build_kernel(
+                partial(base.delete_fn, num_delete=num_delete),
+                lane_update(init_state_fn, num_inner_steps, num_delete),
+                update_inner_kernel_params_fn=nss.live_covariance)
+        else:
+            constrained_step = nss.slice_constrained_step(
+                init_state_fn,
+                build_slice_kernel(interval=stepping_out_carry,
+                                   max_expansions=10, max_shrinkage=100),
+                nss.covariance_proposal)
+            kernel = from_mcmc.build_kernel(
+                constrained_step, num_inner_steps, nss.live_covariance,
+                num_delete)
 
         def init_fn(position, rng_key=None):
             return adaptive.init(
