@@ -392,11 +392,12 @@ class PolynomialCalibration:
     def _line_posterior(self, factor, scale, solution):
         """Mean and covariance of the line fluxes with the coefficients
         integrated out: the line block of ``N^{-1}``."""
-        n_line = solution.shape[0] - self.n_coeff
-        unit = jnp.eye(solution.shape[0])[:, self.n_coeff:]
-        g = jsl.solve_triangular(factor, unit, lower=True)
-        s = scale[self.n_coeff:]
-        return solution[self.n_coeff:], s[:, None] * (g.T @ g) * s[None, :]
+        k = self.n_coeff
+        # Rows above k of L^{-1} [0; I] are exactly zero, so only the
+        # line block of the factor enters.
+        g = jsl.solve_triangular(factor[k:, k:], jnp.eye(solution.shape[0] - k), lower=True)
+        s = scale[k:]
+        return solution[k:], s[:, None] * (g.T @ g) * s[None, :]
 
     def calibrate_with_lines(self, y, mu, sigma, mask, lines, pairs=(), ridge=None,
                              photometry=None) -> tuple[Array, Array, Array, Array]:

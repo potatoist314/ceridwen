@@ -104,6 +104,28 @@ def test_zero_line_columns_equal_polynomial_marginalisation(prior_sigma):
     np.testing.assert_allclose(ln_extra_j, ln_extra, rtol=0, atol=1e-8)
 
 
+def test_line_posterior_equals_the_full_triangular_solve_bitwise():
+    """The line block of N^{-1} from the line block of the factor alone."""
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
+                                                prior_sigma=[0.3, 0.1, 0.1, 0.1])
+    k = cal.n_coeff
+
+    def full(factor, scale, solution):
+        g = jax.scipy.linalg.solve_triangular(factor, jnp.eye(solution.shape[0])[:, k:], lower=True)
+        return solution[k:], scale[k:, None] * (g.T @ g) * scale[None, k:]
+
+    def both(seed):
+        mu, y, sigma, mask, L = _mock(np.array([4e-17, 1e-17, 2e-17]), seed=seed)
+        return (y, mu, sigma, mask, L)
+
+    batch = [jnp.stack(v) for v in zip(*(both(seed) for seed in range(8)))]
+    factors = jax.jit(jax.vmap(lambda *a: cal._joint_factor(*a)))(*batch)
+    got = jax.jit(jax.vmap(cal._line_posterior))(*factors)
+    want = jax.jit(jax.vmap(full))(*factors)
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
 @pytest.mark.parametrize("flux", [3e-17, 2e-18, -1e-17])
 def test_joint_marginal_matches_quadrature_over_one_line_flux(flux):
     """ln of the integral over f >= 0 of the polynomial marginal of y - f L."""
