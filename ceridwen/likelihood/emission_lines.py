@@ -77,6 +77,9 @@ _C_AA_S = 2.99792458e18
 _FWHM_TO_SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 COND_MAX = 1e10
 RIDGE = 1e-12
+# Profile half-width in units of its sigma: exp(-x^2 / 2) is exactly 0 in
+# float64 for |x| > 38.6 (below the smallest subnormal, 4.9e-324).
+_WINDOW = 40.0
 _CGS_PER_MAGGIE = 3631e-23
 # (weaker, stronger) FSPS line names -> flux ratio stronger / weaker; each
 # pair shares one upper level (1D2), so the ratio is set by the Einstein A
@@ -159,6 +162,12 @@ class EmissionLineColumns:
         Maggies per unit line flux in each band of ``photometry_key``.
     photometry_key : str, optional
         Key of the Photometry observation that shares the line fluxes.
+    sigma_max_kms : float, optional
+        Hard upper limit of the prior on a sampled line dispersion.  With a
+        fixed redshift and a fixed or bounded dispersion, :meth:`columns`
+        evaluates each profile only on the pixels within 40 sigma of its
+        centre (:meth:`_window`); the other pixels are exactly 0 in float64
+        for every dispersion up to this limit.
     ridge : ndarray, shape (n_line,), optional
         Precision added to each line flux: ``1e-12`` times its information
         from the spectrum at ``zred`` (a prior 10^6 times wider than the
@@ -179,6 +188,7 @@ class EmissionLineColumns:
     tie: Optional[np.ndarray] = None
     band_matrix: Optional[np.ndarray] = None
     photometry_key: Optional[str] = None
+    sigma_max_kms: Optional[float] = None
 
     @classmethod
     def from_spectrum(
@@ -189,6 +199,7 @@ class EmissionLineColumns:
         names: Optional[Sequence[str]] = None,
         sps_home: Optional[str] = None,
         blend_correlation: float = 0.5,
+        sigma_max_kms: Optional[float] = None,
     ) -> "EmissionLineColumns":
         """
         Select the lines the spectrum constrains, with upstream's rules.
@@ -209,6 +220,9 @@ class EmissionLineColumns:
             Lines whose flux posterior correlation (spectrum weights, at
             ``zred``) exceeds this in absolute value form a pair, strongest
             first; a line joins at most one pair.
+        sigma_max_kms : float, optional
+            Hard upper limit of the ``sigma_smooth`` prior; see
+            :attr:`sigma_max_kms`.
         """
         wave = np.asarray(spectrum.wavelength, dtype=np.float64)
         used = np.asarray(spectrum.mask, dtype=bool)
@@ -239,7 +253,7 @@ class EmissionLineColumns:
             zred=float(zred), sigma_gas_kms=s_gas,
             zred_key="zred" if spectrum.free_z else None,
             sigma_key="sigma_smooth" if spectrum.fit_sigma_smooth else None,
-            tie=tie,
+            tie=tie, sigma_max_kms=sigma_max_kms,
         )
         information, diag = lines._check_conditioning(spectrum)
         correlation = np.linalg.inv(information)
@@ -298,9 +312,27 @@ class EmissionLineColumns:
         tie = np.eye(self.wave_rest.size) if self.tie is None else self.tie
         return replace(self, band_matrix=band @ tie, photometry_key=key)
 
+    def _window(self) -> Optional[np.ndarray]:
+        """(width, n_raw) pixel rows holding every nonzero value of each raw
+        profile, or None.  Needs a fixed redshift and a fixed dispersion or
+        :attr:`sigma_max_kms`."""
+        if self.zred_key is not None or (self.sigma_key is not None and self.sigma_max_kms is None):
+            return None
+        s_gas = self.sigma_gas_kms if self.sigma_key is None else self.sigma_max_kms
+        centre = self.wave_rest * (1.0 + self.zred)
+        s = np.hypot(s_gas, np.interp(centre, self.wave_obs, self.sigma_inst_kms)) / _CKMS
+        log_wave = np.log(self.wave_obs)
+        lo = np.searchsorted(log_wave, np.log(centre) - _WINDOW * s)
+        hi = np.searchsorted(log_wave, np.log(centre) + _WINDOW * s, side="right")
+        width = min(int(np.max(hi - lo)), log_wave.size)
+        start = np.clip(lo, 0, log_wave.size - width)
+        return start[None, :] + np.arange(width)[:, None]
+
     def columns(self, params: Optional[dict] = None) -> Array:
         """(n_pix, n_line) F_nu profiles of unit-flux lines [erg s^-1 cm^-2],
-        one per free flux."""
+        one per free flux.  Where :meth:`_window` applies, each profile is
+        evaluated on its window only and is 0 elsewhere, bitwise as the
+        full evaluation."""
         def value(key, fixed):
             if key is None:
                 return jnp.asarray(fixed)
@@ -311,9 +343,17 @@ class EmissionLineColumns:
         s_inst = jnp.interp(centre, jnp.asarray(self.wave_obs),
                             jnp.asarray(self.sigma_inst_kms))
         s = jnp.sqrt(s_gas ** 2 + s_inst ** 2) / _CKMS
-        x = (jnp.asarray(np.log(self.wave_obs))[:, None] - jnp.log(centre)[None, :]) / s[None, :]
-        phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
-        profiles = phi * jnp.asarray(self.wave_obs / _C_AA_S)[:, None]
+        rows = self._window()
+        if rows is None:
+            x = (jnp.asarray(np.log(self.wave_obs))[:, None] - jnp.log(centre)[None, :]) / s[None, :]
+            phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
+            profiles = phi * jnp.asarray(self.wave_obs / _C_AA_S)[:, None]
+        else:
+            x = (jnp.asarray(np.log(self.wave_obs)[rows]) - jnp.log(centre)[None, :]) / s[None, :]
+            phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
+            profiles = jnp.zeros((self.wave_obs.size, self.wave_rest.size)).at[
+                rows, np.arange(self.wave_rest.size)[None, :]].set(
+                phi * jnp.asarray((self.wave_obs / _C_AA_S)[rows]), unique_indices=True)
         return profiles if self.tie is None else profiles @ jnp.asarray(self.tie)
 
     def covers(self, rest_wave: float, tol: float = 2.0) -> bool:

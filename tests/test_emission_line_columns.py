@@ -67,6 +67,19 @@ def test_line_columns_have_unit_flux():
     np.testing.assert_allclose(centre, REST * (1 + ZRED), atol=WAVE[1] - WAVE[0])
 
 
+@pytest.mark.parametrize("rest", [REST, np.append(REST, 3540.0)])  # 3540 A: window clipped at the blue edge
+def test_windowed_columns_equal_the_full_evaluation_bitwise(rest):
+    full = replace(_lines(rest), zred_key=None)
+    windowed = replace(full, sigma_max_kms=350.0)
+    fixed = replace(windowed, sigma_key=None)
+    assert windowed._window().shape[0] < WAVE.size
+    sigmas = {"sigma_smooth": jnp.array([[5.0], [SIGMA_GAS], [350.0]])}
+    np.testing.assert_array_equal(np.asarray(jax.jit(jax.vmap(windowed.columns))(sigmas)),
+                                  np.asarray(jax.jit(jax.vmap(full.columns))(sigmas)))
+    np.testing.assert_array_equal(np.asarray(jax.jit(fixed.columns)({})),
+                                  np.asarray(jax.jit(full.columns)({"sigma_smooth": jnp.array([SIGMA_GAS])})))
+
+
 @pytest.mark.parametrize("prior_sigma", [None, [0.3, 0.1, 0.1, 0.1]])
 def test_zero_line_columns_equal_polynomial_marginalisation(prior_sigma):
     mu, y, sigma, mask, _ = _mock(np.zeros(3))
