@@ -354,7 +354,15 @@ class EmissionLineColumns:
             profiles = jnp.zeros((self.wave_obs.size, self.wave_rest.size)).at[
                 rows, np.arange(self.wave_rest.size)[None, :]].set(
                 phi * jnp.asarray((self.wave_obs / _C_AA_S)[rows]), unique_indices=True)
-        return profiles if self.tie is None else profiles @ jnp.asarray(self.tie)
+        if self.tie is None:
+            return profiles
+        # profiles @ tie without its zero terms, bitwise: a free line's column
+        # is its profile; a tied doublet's is a dot over its own lines.
+        free = profiles[:, np.argmax(self.tie, axis=0)]
+        for c in np.flatnonzero(np.count_nonzero(self.tie, axis=0) > 1):
+            r = np.flatnonzero(self.tie[:, c])
+            free = free.at[:, c].set(profiles[:, r] @ jnp.asarray(self.tie[r, c]))
+        return free
 
     def covers(self, rest_wave: float, tol: float = 2.0) -> bool:
         """Whether a fitted line lies within ``tol`` A of ``rest_wave``."""

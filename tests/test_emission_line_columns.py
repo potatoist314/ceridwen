@@ -80,6 +80,16 @@ def test_windowed_columns_equal_the_full_evaluation_bitwise(rest):
                                   np.asarray(jax.jit(full.columns)({"sigma_smooth": jnp.array([SIGMA_GAS])})))
 
 
+@pytest.mark.parametrize("sigma_max_kms", [None, 350.0])
+def test_tied_columns_equal_the_tie_product_bitwise(sigma_max_kms):
+    tie = np.array([[1.0, 0.0], [0.0, 1.0 / 3.010], [0.0, 1.0]])   # [O III] 4960 tied to 5008
+    raw = replace(_lines(np.array([3727.118, 4960.295, 5008.240])), zred_key=None, sigma_max_kms=sigma_max_kms)
+    tied = replace(raw, tie=tie)
+    sigmas = {"sigma_smooth": jnp.linspace(5.0, 350.0, 64)[:, None]}
+    np.testing.assert_array_equal(np.asarray(jax.jit(jax.vmap(tied.columns))(sigmas)),
+                                  np.asarray(jax.jit(jax.vmap(lambda t: raw.columns(t) @ jnp.asarray(tie)))(sigmas)))
+
+
 @pytest.mark.parametrize("prior_sigma", [None, [0.3, 0.1, 0.1, 0.1]])
 def test_zero_line_columns_equal_polynomial_marginalisation(prior_sigma):
     mu, y, sigma, mask, _ = _mock(np.zeros(3))
