@@ -521,6 +521,7 @@ class Spectrum(Observation):
             w_lo = jnp.asarray((1.0 - alpha).astype(np.float32))
             w_hi = jnp.asarray(alpha.astype(np.float32))
             self._predict_fn = lambda spec: w_lo * spec[lo] + w_hi * spec[hi]
+            self.model_support = (int(j_lo.min()), int(j_hi.max()) + 1)
 
         else:
             # ── Trim model grid to observed wavelength range ────────────
@@ -544,6 +545,7 @@ class Spectrum(Observation):
             # shape of _idx is statically known at Python level, so XLA
             # can lower this to a static gather with no shape ambiguity.
             _idx = jnp.array(np.where(_trim)[0])
+            self.model_support = (int(_idx.min()), int(_idx.max()) + 1)
 
             # ── Optional LOSVD pre-smoothing stage ─────────────────────
             # If sigma_losvd is set, a velocity-broadening step (galaxy

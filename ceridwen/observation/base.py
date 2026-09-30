@@ -56,6 +56,10 @@ class Observation:
     # raising AttributeError on bare Observation instances.
     wavelength = None
 
+    # Half-open ``(lo, hi)`` range of model-grid indices that ``predict``
+    # reads, set by ``setup_for_model``; None means the whole grid.
+    model_support = None
+
     def __init__(self,
                  flux=None,
                  uncertainty=None,

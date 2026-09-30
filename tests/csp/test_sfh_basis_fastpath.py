@@ -192,7 +192,7 @@ def test_fastpath_hlo_excludes_age_cube_shapes(models):
         "tensor<13x107xf32>",
     ):
         assert excluded not in stablehlo
-    assert "tensor<5x13x1x7x11xf32>" in stablehlo
+    assert "tensor<5x13x7x11xf32>" in stablehlo
     # compare_all searchsorted and the corner dynamic_slice must not lower
     # to sequential loops.
     assert "stablehlo.while" not in stablehlo
