@@ -73,6 +73,7 @@ Usage
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import time
@@ -746,11 +747,19 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         step_fn = jax.jit(nested_sampler.step)
 
         if self.verbose:
-            print("  [timing] Calling init_fn (JIT compile + eval) ...",
+            print("  [timing] Calling init_fn (JIT compile + eval) and "
+                  "compiling the step kernel ...",
                   flush=True)
             _t0 = time.perf_counter()
 
-        live = init_fn(particles)
+        # Compile the step kernel in a thread while init compiles and runs;
+        # the first step_fn call then takes the executable from JAX's cache.
+        live_shape = jax.eval_shape(init_fn, particles)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            step_compiled = pool.submit(
+                lambda: step_fn.lower(rng_key, live_shape).compile())
+            live = init_fn(particles)
+            step_compiled.result()
 
         # ── BlackJAX version compatibility ───────────────────────────────
         # Three known layouts for logZ / logZ_live:
@@ -787,7 +796,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
         if self.verbose:
             _t1 = time.perf_counter()
-            print(f"  [timing] init_fn done    ({_t1 - _t0:.1f} s)  "
+            print(f"  [timing] init_fn and step compile done    ({_t1 - _t0:.1f} s)  "
                   f"logZ={_get_logZ(live):.4f}  "
                   f"logZ_live={_get_logZ_live(live):.4f}", flush=True)
             print(f"  (state type: {type(live).__name__})")
@@ -840,12 +849,6 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             _logZ_live = _get_logZ_live(live)
             while float(_logZ_live - _logZ) >= self.logZ_tol:
                 rng_key, subkey = jax.random.split(rng_key)
-                if _iter == 0 and self.verbose:
-                    print("  [step_fn] Compiling the step kernel (one-time JIT) "
-                          "+ running the first iteration. This compile can be "
-                          "slow on CPU (seconds to many minutes depending on "
-                          "model size and hardware); subsequent steps are fast.",
-                          flush=True)
                 _t_iter = time.perf_counter()
 
                 incoming = live

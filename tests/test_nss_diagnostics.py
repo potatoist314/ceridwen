@@ -182,3 +182,41 @@ def test_lane_kernel_matches_stock_when_shrinkage_runs_out():
     accepted, shrinks = np.concatenate(accepted), np.concatenate(shrinks)
     assert accepted.any() and not accepted.all()
     assert shrinks[~accepted].min() == shrinks.max() == 100
+
+
+def test_step_compiled_during_init_compiles_once_and_matches_serial_run(caplog):
+    from ceridwen.sampler import Uniform
+    import numpy as np
+
+    def loglike(p):
+        return -50.*jnp.sum((p['x'] - .7)**2)
+
+    def logprior(p):
+        return jnp.zeros(())
+
+    records = []
+    adapter = BlackJAXNestedSamplerAdapter(
+        {'x': Uniform(low=-5., high=5.)}, num_live=40, num_delete=8,
+        num_inner_steps=6, verbose=False,
+        iteration_callback=lambda *args: records.append(args[3:5]))
+    # A config context would be thread-local and miss the compiling thread.
+    jax.config.update('jax_log_compiles', True)
+    try:
+        adapter.run(loglike, logprior, {'x': jnp.zeros(3)}, jax.random.PRNGKey(7))
+    finally:
+        jax.config.update('jax_log_compiles', False)
+    compiles = [r for r in caplog.records
+                if r.getMessage().startswith('Finished XLA compilation of jit(kernel)')]
+    assert len(compiles) == 1
+
+    # The serial path: init, then the step compiled on its first call.
+    key, prior_key = jax.random.split(jax.random.PRNGKey(7))
+    sampler = adapter._build_nested_sampler(loglike, logprior, 6, 8)
+    live = jax.jit(sampler.init)(adapter._sample_prior({'x': jnp.zeros(3)}, prior_key))
+    step = jax.jit(sampler.step)
+    assert len(records) > 5
+    for outgoing, info in records:
+        key, subkey = jax.random.split(key)
+        live, dead = step(subkey, live)
+        for a, b in zip(jax.tree.leaves((outgoing, info)), jax.tree.leaves((live, dead))):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
