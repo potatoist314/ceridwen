@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from blackjax.ns.base import init_state_strategy
 from blackjax.ns.nss import covariance_proposal, slice_constrained_step
@@ -113,7 +114,8 @@ def test_carry_stepping_out_counts_the_same_calls_as_stock():
     assert counts[stepping_out_carry] == counts[stepping_out] > 1
 
 
-def test_carry_kernel_is_bitwise_equal_to_stock_blackjax_nss():
+@pytest.mark.parametrize("kernel", ["carry", "lanes"])
+def test_slice_kernel_is_bitwise_equal_to_stock_blackjax_nss(kernel):
     from ceridwen.sampler import Uniform
     import numpy as np
 
@@ -131,7 +133,7 @@ def test_carry_kernel_is_bitwise_equal_to_stock_blackjax_nss():
             jax.random.PRNGKey(20260930))
         return result, records
 
-    carry, carry_records = run('carry')
+    carry, carry_records = run(kernel)
     stock, stock_records = run('stock')
     assert len(carry_records) == len(stock_records) > 20
     expansions = np.concatenate([np.asarray(info.update_info.num_expansions).ravel()
@@ -146,3 +148,37 @@ def test_carry_kernel_is_bitwise_equal_to_stock_blackjax_nss():
                                   np.asarray(stock.samples['x']))
     assert carry.log_evidence == stock.log_evidence
     assert carry.n_likelihood_calls == stock.n_likelihood_calls
+
+
+def test_lane_kernel_matches_stock_when_shrinkage_runs_out():
+    """Two likelihood levels: once every live point is on the upper level, no
+    candidate is above the contour and each slice uses all of max_shrinkage."""
+    import blackjax
+    import numpy as np
+
+    inside = lambda p: jnp.all(jnp.abs(p['x']) < 1.2) & (jnp.abs(p['y']) < 1.2)  # noqa: E731
+    loglike = lambda p: jnp.where(inside(p), 1., 0.)  # noqa: E731
+    logprior = lambda p: jnp.where(  # noqa: E731
+        jnp.all(jnp.abs(p['x']) < 2.) & (jnp.abs(p['y']) < 2.), 0., -jnp.inf)
+    stock = blackjax.nss(logprior_fn=logprior, loglikelihood_fn=loglike,
+                         num_inner_steps=4, num_delete=6)
+    lanes = BlackJAXNestedSamplerAdapter(
+        {}, verbose=False, slice_kernel="lanes")._build_nested_sampler(
+            loglike, logprior, 4, 6)
+    keys = jax.random.split(jax.random.key(5), 3)
+    state = jax.jit(stock.init)({
+        'x': jax.random.uniform(keys[0], (30, 2), minval=-2., maxval=2.),
+        'y': jax.random.uniform(keys[1], (30,), minval=-2., maxval=2.)})
+    stock_step, lane_step = jax.jit(stock.step), jax.jit(lanes.step)
+    accepted, shrinks = [], []
+    for key in jax.random.split(keys[2], 12):
+        want, got = stock_step(key, state), lane_step(key, state)
+        for a, b in zip(jax.tree.leaves(want), jax.tree.leaves(got)):
+            assert a.dtype == b.dtype
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        state = want[0]
+        accepted.append(np.asarray(want[1].update_info.is_accepted))
+        shrinks.append(np.asarray(want[1].update_info.num_shrink))
+    accepted, shrinks = np.concatenate(accepted), np.concatenate(shrinks)
+    assert accepted.any() and not accepted.all()
+    assert shrinks[~accepted].min() == shrinks.max() == 100
