@@ -255,6 +255,8 @@ class Photometry(Observation):
 
         self._T = jnp.array(T.astype(np.float32))
         self._has_precomputed_T = True
+        columns = np.flatnonzero(np.any(np.asarray(self._T) != 0, axis=0))
+        self.model_support = (int(columns[0]), int(columns[-1]) + 1)
 
     # ------------------------------------------------------------------
     def predict(self, spectrum, wave_model):
