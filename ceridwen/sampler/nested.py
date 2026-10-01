@@ -146,10 +146,12 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
 
     * A candidate below the slice level of the prior is outside the slice
       whatever its likelihood.  Each round a lane first moves past up to
-      ``free_moves`` such candidates (and stored ones outside the slice)
-      without a likelihood evaluation.  The lane's next candidates are
-      worked out in one pass, each on the assumption that the ones before
-      it are outside the slice, and their prior is evaluated as one batch.
+      ``free_moves`` such candidates (and stored ones outside the slice,
+      and stepping-out edges with no expansion left, whose result does not
+      change the step) without a likelihood evaluation.  The lane's next
+      candidates are worked out in one pass, each on the assumption that
+      the ones before it are outside the slice, and their prior is
+      evaluated as one batch.
     * Once some lanes have finished, their batch slots evaluate candidates
       that the running lanes need later if their current candidates are
       outside the slice: the next edge, then the shrink proposals (up to
@@ -287,6 +289,11 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             s = jax.tree.map(lambda a, b: jnp.where(done, a, b), fresh, running)
             return i, lane, s, info
 
+        def no_expansion_left(s):
+            # An edge evaluated with no expansion left does not change the step.
+            return (((s["phase"] == _LEFT) & (s["n_left"] == 0))
+                    | ((s["phase"] == _RIGHT) & (s["n_right"] == 0)))
+
         def path(l, i, lane, s, info):
             """The lane's next ``depth`` candidates, each on the assumption that
             the ones before it are outside the slice, the state before each,
@@ -328,9 +335,11 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             found_inside = (found.logdensity >= level) & (found.loglikelihood > loglikelihood_0)
 
             # Move past candidates below the prior level (outside the slice
-            # whatever their likelihood) and stored ones outside the slice,
-            # up to free_moves of them, within the slice step.
-            free = (~(logprior >= level) | (hit & ~found_inside)) & ~ends
+            # whatever their likelihood), stored ones outside the slice and
+            # edges with no expansion left (the step goes on whatever they
+            # are), up to free_moves of them, within the slice step.
+            spent = jax.vmap(jax.vmap(no_expansion_left))(states)
+            free = (~(logprior >= level) | (hit & ~found_inside) | spent) & ~ends
             m = jnp.argmin(free & (jnp.arange(depth) < free_moves), axis=1)
             at = lambda tree: jax.tree.map(lambda v: v[lanes, m], tree)  # noqa: E731
             s, now_t, now_x, now_hit, now_found, now_inside = at(
@@ -350,7 +359,7 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
                 hop_x, now_x)
             active = jnp.where(hop, i < num_inner_steps, running)
             now_hit = now_hit & ~hop
-            evaluate_now = active & ~now_hit
+            evaluate_now = active & ~now_hit & ~(hop & jax.vmap(no_expansion_left)(s))
 
             # Idle slots: the next candidates of the running lanes on the same
             # path, nearest first, then lanes with the most slice steps left.
@@ -358,7 +367,7 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             before = jnp.cumsum(ends, axis=1) - ends
             same_step = before == before[lanes, m][:, None]
             wanted = ((running & ~hop)[:, None] & (ahead > 0) & (ahead < lookahead) & same_step
-                      & (logprior >= level) & ~hit)
+                      & (logprior >= level) & ~hit & ~spent)
             score = jnp.where(wanted, ahead * (num_inner_steps + 1) + step[:, None],
                               depth * (num_inner_steps + 1)).ravel()
             rank = jnp.empty_like(score).at[jnp.argsort(score)].set(
