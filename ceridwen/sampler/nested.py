@@ -126,7 +126,8 @@ _LEFT, _RIGHT, _SHRINK = 0, 1, 2
 
 
 def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
-                max_expansions=10, max_shrinkage=100, width=1.0, lookahead=4):
+                max_expansions=10, max_shrinkage=100, width=1.0, free_moves=8,
+                lookahead=4):
     """Inner update of the NS kernel: every particle's slice chain as one lane.
 
     ``blackjax.nss`` replaces ``num_delete`` particles per iteration.  Each
@@ -144,19 +145,26 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
     arXiv:2503.17405).  Two further rules remove rounds:
 
     * A candidate below the slice level of the prior is outside the slice
-      whatever its likelihood, so the lane moves on without a likelihood
-      evaluation.
+      whatever its likelihood.  Each round a lane first moves past up to
+      ``free_moves`` such candidates (and stored ones outside the slice)
+      without a likelihood evaluation.  The lane's next candidates are
+      worked out in one pass, each on the assumption that the ones before
+      it are outside the slice, and their prior is evaluated as one batch.
     * Once some lanes have finished, their batch slots evaluate candidates
       that the running lanes need later if their current candidates are
       outside the slice: the next edge, then the shrink proposals (up to
-      ``lookahead - 1`` per lane, lanes with the most slice steps left
-      first).  A lane takes a stored result when its candidate is the same
-      slice step, the same point on the slice line and the same position.
+      ``lookahead - 1`` per lane, nearest first, then lanes with the most
+      slice steps left).  A lane takes a stored result when its candidate
+      is the same slice step, the same point on the slice line and the
+      same position.  When that result is inside the slice, the lane also
+      evaluates its next candidate in the same round.
 
-    The random numbers are split as BlackJAX splits them and every
-    candidate is evaluated with the same arithmetic in a batch of
-    ``num_delete``, so the new particles and the per-step ``SliceInfo``
-    are bitwise equal to those of ``blackjax.nss``.
+    The random numbers are drawn as BlackJAX draws them (the shrink
+    proposals of a slice step in advance: their key moves once per
+    proposal, whatever its outcome) and every candidate is evaluated with
+    the same arithmetic in a batch of ``num_delete``, so the new particles
+    and the per-step ``SliceInfo`` are bitwise equal to those of
+    ``blackjax.nss``.
 
     Drop-in for ``blackjax.ns.from_mcmc.update_with_mcmc_take_last`` applied
     to ``blackjax.ns.nss.slice_constrained_step`` with the stepping-out
@@ -168,7 +176,8 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
     from blackjax.ns.base import init_state_strategy
     from blackjax.ns.nss import sample_direction_from_covariance
 
-    slots = 2 * lookahead      # stored results per lane
+    depth = free_moves + lookahead   # candidates looked at per lane and round
+    slots = 2 * lookahead            # stored results per lane
 
     def update_function(rng_key, state, loglikelihood_0, cov):
         choice_key, sample_key = jax.random.split(rng_key)
@@ -205,8 +214,16 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             # A scan, as in BlackJAX, so the draws keep their batch structure.
             return jax.lax.map(draws, jax.random.split(rng_key, num_inner_steps))
 
+        def shrink_draws(key):
+            # blackjax.mcmc.slice.shrinkage: one split per proposal.
+            def proposal(key, _):
+                key, subkey = jax.random.split(key)
+                return key, jax.random.uniform(subkey)
+            return jax.lax.scan(proposal, key, None, length=max_shrinkage)[1]
+
         directions, reals, caps, shrink_keys = jax.vmap(lane_draws)(
             jax.random.split(sample_key, num_delete), start.position)
+        shrink_u = jax.vmap(jax.vmap(shrink_draws))(shrink_keys)
         counter = caps.dtype.type
         lanes = jnp.arange(num_delete)
 
@@ -217,32 +234,19 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
                         left=left, right=right,
                         n_left=caps[l, i, 0], n_right=caps[l, i, 1],
                         bracket_left=left, bracket_right=right,
-                        key=shrink_keys[l, i], n_expansions=counter(0),
-                        n_shrink=counter(0))
+                        n_expansions=counter(0), n_shrink=counter(0))
 
-        def propose(phase, left, right, key):
-            key, subkey = jax.random.split(key)
-            t = left + jax.random.uniform(subkey) * (right - left)
-            return jnp.where(phase == _LEFT, left, jnp.where(phase == _RIGHT, right, t)), key
+        def propose(l, i, s):
+            u = shrink_u[l, i, jnp.minimum(s["n_shrink"], max_shrinkage - 1)]
+            t = s["left"] + u * (s["right"] - s["left"])
+            return jnp.where(s["phase"] == _LEFT, s["left"],
+                             jnp.where(s["phase"] == _RIGHT, s["right"], t))
 
         def point(l, i, position, t):
             direction = unravel(directions[l, i])
             return jax.tree.map(lambda p, d: p + t * d, position, direction)
 
-        def look(l, i, lane, s, stored):
-            """The lane's candidate, its prior, and a stored result for it."""
-            t, key = propose(s["phase"], s["left"], s["right"], s["key"])
-            x = point(l, jnp.minimum(i, num_inner_steps - 1), lane.position, t)
-            # The stored point must equal this one bitwise: XLA may contract
-            # p + t * d into an FMA in one layout and not in another.
-            match = (stored["step"][l] == i) & (stored["t"][l] == t) & jnp.all(jnp.stack([
-                jnp.all((v[l] == u).reshape(slots, -1), axis=1)
-                for v, u in zip(jax.tree.leaves(stored["state"].position), jax.tree.leaves(x))]), axis=0)
-            found = jax.tree.map(lambda v: v[l, jnp.argmax(match)], stored["state"])
-            return dict(t=t, key=key, x=x, logprior=logprior_fn(x),
-                        hit=jnp.any(match), stored=found)
-
-        def advance(l, active, i, lane, s, info, t, key, candidate):
+        def advance(l, active, i, lane, s, info, t, candidate):
             """One transition of the lane's state machine for an evaluated candidate."""
             in_left, in_right = s["phase"] == _LEFT, s["phase"] == _RIGHT
             in_shrink = s["phase"] == _SHRINK
@@ -276,7 +280,6 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
                 phase=phase, level=s["level"], left=left, right=right,
                 n_left=s["n_left"] - grow_left, n_right=s["n_right"] - grow_right,
                 bracket_left=bracket_left, bracket_right=bracket_right,
-                key=jnp.where(in_shrink, key, s["key"]),
                 n_expansions=n_expansions, n_shrink=n_shrink)
             running = jax.tree.map(lambda a, b: jnp.where(active, a, b), running, s)
             i = i + done
@@ -284,96 +287,113 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             s = jax.tree.map(lambda a, b: jnp.where(done, a, b), fresh, running)
             return i, lane, s, info
 
-        def ahead(l, i, lane, s, now):
-            """The next ``lookahead - 1`` candidates if the current one and each
-            of these is outside the slice, and whether they belong to the
-            current slice step."""
-            phase, left, right, key = s["phase"], s["left"], s["right"], s["key"]
-            n_shrink, t, next_key = s["n_shrink"], now["t"], now["key"]
-            same_step, out = jnp.asarray(True), []
-            for _ in range(lookahead - 1):
-                in_shrink = phase == _SHRINK
-                left = jnp.where(in_shrink & (t < 0.0), t, left)
-                right = jnp.where(in_shrink & (t >= 0.0), t, right)
-                key = jnp.where(in_shrink, next_key, key)
-                n_shrink = n_shrink + in_shrink
-                same_step = same_step & ~(in_shrink & (n_shrink >= max_shrinkage))
-                phase = jnp.where(phase == _LEFT, _RIGHT, jnp.where(phase == _RIGHT, _SHRINK, phase))
-                t, next_key = propose(phase, left, right, key)
-                x = point(l, jnp.minimum(i, num_inner_steps - 1), lane.position, t)
-                out.append((t, x, logprior_fn(x) >= s["level"], same_step))
+        def path(l, i, lane, s, info):
+            """The lane's next ``depth`` candidates, each on the assumption that
+            the ones before it are outside the slice, the state before each,
+            and whether an outside candidate ends the slice step."""
+            outside = lane._replace(logdensity=jnp.full_like(lane.logdensity, -jnp.inf))
+            k = jnp.minimum(i, num_inner_steps - 1)
+            out = []
+            for _ in range(depth):
+                t = propose(l, k, s)
+                i_next, _, s_next, _ = advance(l, True, i, lane, s, info, t, outside)
+                out.append((s, t, point(l, k, lane.position, t), i_next > i))
+                # Without the barrier XLA fuses the whole chain of states and
+                # its compile time grows faster than the depth.
+                s = jax.lax.optimization_barrier(s_next)
             return jax.tree.map(lambda *v: jnp.stack(v), *out)
 
-        v_look = jax.vmap(look, in_axes=(0, 0, 0, 0, None))
+        v_path = jax.vmap(path)
         v_advance = jax.vmap(advance)
-        v_ahead = jax.vmap(ahead)
-
-        def settle(carry):
-            """Move every lane past candidates outside the prior slice level or
-            with a stored result."""
-            def free(carry):
-                i, lane, s, info, stored, now = carry
-                return (i < num_inner_steps) & (now["hit"] | ~(now["logprior"] >= s["level"]))
-
-            def body(carry):
-                i, lane, s, info, stored, now = carry
-                active = free(carry)
-                # Outside the prior level: logdensity < level makes it outside
-                # the slice whatever the likelihood.
-                below = lane._replace(position=now["x"], logdensity=now["logprior"])
-                candidate = jax.tree.map(
-                    lambda a, b: jnp.where(jnp.expand_dims(now["hit"], tuple(range(1, a.ndim))), a, b),
-                    now["stored"], below)
-                i, lane, s, info = v_advance(lanes, active, i, lane, s, info,
-                                             now["t"], now["key"], candidate)
-                return i, lane, s, info, stored, v_look(lanes, i, lane, s, stored)
-
-            return jax.lax.while_loop(lambda c: jnp.any(free(c)), body, carry)
+        v_logprior = jax.vmap(jax.vmap(logprior_fn))
 
         def round_(carry):
-            i, lane, s, info, stored, now = carry
+            i, lane, s, info, stored = carry
             running = i < num_inner_steps
-            spare = num_delete - running.sum()
+            states, t, x, ends = v_path(lanes, i, lane, s, info)
+            logprior = v_logprior(x)
+            level = s["level"][:, None]
 
-            # Idle slots: the lookahead candidates of the running lanes, by
-            # depth, then by slice steps left.
-            t_next, x_next, in_prior, same_step = v_ahead(lanes, i, lane, s, now)
-            new = ~((stored["step"][:, None, :] == i[:, None, None])
-                    & (stored["t"][:, None, :] == t_next[..., None])).any(-1)
-            wanted = running[:, None] & same_step & in_prior & new
-            depth = jnp.arange(1, lookahead)[None, :]
-            score = jnp.where(wanted, depth * (num_inner_steps + 1) + i[:, None],
-                              lookahead * (num_inner_steps + 1)).ravel()
+            # A stored result for the same slice step, t and position.  The
+            # position must match bitwise: XLA may contract p + t * d into an
+            # FMA in one layout and not in another.
+            match = ((stored["step"][:, None, :] == i[:, None, None])
+                     & (stored["t"][:, None, :] == t[..., None]))
+            for v, u in zip(jax.tree.leaves(stored["state"].position), jax.tree.leaves(x)):
+                equal = v[:, None] == u[:, :, None]
+                match &= jnp.all(equal.reshape(*match.shape, -1), axis=-1)
+            hit = match.any(-1)
+            found = jax.tree.map(lambda v: v[lanes[:, None], jnp.argmax(match, -1)],
+                                 stored["state"])
+            found_inside = (found.logdensity >= level) & (found.loglikelihood > loglikelihood_0)
+
+            # Move past candidates below the prior level (outside the slice
+            # whatever their likelihood) and stored ones outside the slice,
+            # up to free_moves of them, within the slice step.
+            free = (~(logprior >= level) | (hit & ~found_inside)) & ~ends
+            m = jnp.argmin(free & (jnp.arange(depth) < free_moves), axis=1)
+            at = lambda tree: jax.tree.map(lambda v: v[lanes, m], tree)  # noqa: E731
+            s, now_t, now_x, now_hit, now_found, now_inside = at(
+                (states, t, x, hit, found, found_inside))
+
+            # A stored result inside the slice: the lane takes it and
+            # evaluates its next candidate in this round.
+            hop = running & now_hit & now_inside
+            step = i
+            i, lane, s, info = v_advance(lanes, hop, i, lane, s, info, now_t, now_found)
+            k = jnp.minimum(i, num_inner_steps - 1)
+            hop_t = jax.vmap(propose)(lanes, k, s)
+            hop_x = jax.vmap(point)(lanes, k, lane.position, hop_t)
+            now_t = jnp.where(hop, hop_t, now_t)
+            now_x = jax.tree.map(
+                lambda a, b: jnp.where(jnp.expand_dims(hop, tuple(range(1, a.ndim))), a, b),
+                hop_x, now_x)
+            active = jnp.where(hop, i < num_inner_steps, running)
+            now_hit = now_hit & ~hop
+            evaluate_now = active & ~now_hit
+
+            # Idle slots: the next candidates of the running lanes on the same
+            # path, nearest first, then lanes with the most slice steps left.
+            ahead = jnp.arange(depth)[None, :] - m[:, None]
+            before = jnp.cumsum(ends, axis=1) - ends
+            same_step = before == before[lanes, m][:, None]
+            wanted = ((running & ~hop)[:, None] & (ahead > 0) & (ahead < lookahead) & same_step
+                      & (logprior >= level) & ~hit)
+            score = jnp.where(wanted, ahead * (num_inner_steps + 1) + step[:, None],
+                              depth * (num_inner_steps + 1)).ravel()
             rank = jnp.empty_like(score).at[jnp.argsort(score)].set(
                 jnp.arange(score.size)).reshape(wanted.shape)
-            chosen = wanted & (rank < spare)
-            idle = jnp.argsort(running)          # finished lanes first
+            chosen = wanted & (rank < num_delete - evaluate_now.sum())
+            idle = jnp.argsort(evaluate_now)     # slots without a candidate first
             slot = jnp.where(chosen, idle[jnp.minimum(rank, num_delete - 1)], num_delete)
 
             batch = jax.tree.map(
                 lambda a, b: a.at[slot.ravel()].set(
                     b.reshape(-1, *b.shape[2:]), mode="drop"),
-                now["x"], x_next)
+                now_x, x)
             evaluated = evaluate(batch)
+            candidate = jax.tree.map(
+                lambda a, b: jnp.where(jnp.expand_dims(now_hit, tuple(range(1, a.ndim))), a, b),
+                now_found, evaluated)
 
-            # Store every result under its lane, slice step and t.
-            take = jnp.concatenate([running[:, None], chosen], axis=1)
+            # Store every result under its lane, slice step and t (at most
+            # lookahead per lane and round, so no two share a slot).
+            take = jnp.concatenate([evaluate_now[:, None], chosen], axis=1)
             source = jnp.concatenate([lanes[:, None], slot], axis=1)
             where_to = (stored["next"][:, None] + jnp.cumsum(take, axis=1) - 1) % slots
             where_to = jnp.where(take, where_to, slots)
-            ts = jnp.concatenate([now["t"][:, None], t_next], axis=1)
             put = lambda old, new: old.at[lanes[:, None], where_to].set(new, mode="drop")  # noqa: E731
             stored = dict(
-                step=put(stored["step"], jnp.broadcast_to(i[:, None], take.shape)),
-                t=put(stored["t"], ts),
+                step=put(stored["step"], jnp.concatenate(
+                    [i[:, None], jnp.broadcast_to(step[:, None], chosen.shape)], axis=1)),
+                t=put(stored["t"], jnp.concatenate([now_t[:, None], t], axis=1)),
                 state=jax.tree.map(
                     lambda old, new: put(old, new[jnp.minimum(source, num_delete - 1)]),
                     stored["state"], evaluated),
                 next=stored["next"] + take.sum(1, dtype=stored["next"].dtype))
 
-            i, lane, s, info = v_advance(lanes, running, i, lane, s, info,
-                                         now["t"], now["key"], evaluated)
-            return settle((i, lane, s, info, stored, v_look(lanes, i, lane, s, stored)))
+            i, lane, s, info = v_advance(lanes, active, i, lane, s, info, now_t, candidate)
+            return i, lane, s, info, stored
 
         i = jnp.zeros(num_delete, dtype=jnp.int32)
         s = jax.vmap(begin)(lanes, i, start.logdensity)
@@ -384,9 +404,8 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             state=jax.tree.map(
                 lambda v: jnp.zeros((num_delete, slots, *v.shape[1:]), v.dtype), start),
             next=jnp.zeros(num_delete, dtype=i.dtype))
-        carry = settle((i, start, s, info, stored, v_look(lanes, i, start, s, stored)))
-        _, lane, _, info, _, _ = jax.lax.while_loop(
-            lambda c: jnp.any(c[0] < num_inner_steps), round_, carry)
+        _, lane, _, info, _ = jax.lax.while_loop(
+            lambda c: jnp.any(c[0] < num_inner_steps), round_, (i, start, s, info, stored))
         return lane, SliceInfo(
             is_accepted=info[..., 0] != 0,
             num_expansions=info[..., 1].astype(caps.dtype),
