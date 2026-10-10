@@ -1,103 +1,47 @@
-"""
-Download-on-demand registry for pre-built ceridwen SSP grids.
+"""Download-on-demand registry of published ceridwen SSP grids (cached in
+$CERIDWEN_GRID_DIR, default ~/.ceridwen/grids; SHA-256 verified on every fetch).
 
-Rationale
----------
-ceridwen needs FSPS only at grid-GENERATION time; every fit loads a
-cached HDF5.  For the alpha-enhanced grids the generation step requires
-an unreleased python-fsps compiled from source with ``AFE_FLAG=1``
-against FSPS v4.0 data — a barrier users should not face, and an easy
-source of silent misbuilds.  We therefore publish the canonical grids
-(Zenodo) and users fetch them by name:
-
-    from ceridwen.ssps.grid_fetch import fetch_grid
-    from ceridwen.ssps.ssp_data_afe import SSPDataAfe
-
-    path = fetch_grid("amist_c3k_lr_chab_afe")   # cached after first call
-    ssp  = SSPDataAfe.load(path)                 # also loads legacy 3-D grids
-
-Files are cached in ``$CERIDWEN_GRID_DIR`` (default ``~/.ceridwen/grids``)
-and verified against a pinned SHA-256 on every fetch, so a truncated
-download or a silently updated remote file fails loudly instead of
-producing subtly wrong SEDs.
-
-Publishing a new grid
----------------------
-1. Build it with ``scripts_afe/build_afe_grid.py`` (records provenance).
-2. Run ``scripts_afe/publish_grid_zenodo.py --file the_grid.h5 --name
-   <registry_key>`` wherever the file and network access coexist (Tursa
-   login node, or laptop after scp).  With ``$ZENODO_TOKEN`` set it
-   drives the Zenodo API (new version of the ceridwen-grids deposit,
-   upload, checksum verify); without a token it prints the manual
-   checklist.  Either way it prints the finished REGISTRY entry.
-3. Paste that entry below, commit, release.
-"""
+``stellar_mass_table``: whether the published file carries the surviving-mass table
+(``ssp_stellar_mass``) that ``mfrac`` needs."""
 
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
 import shutil
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ---------------------------------------------------------------------
-# Registry of published grids.
-#
-# Current release: v5 of the ceridwen-grids deposit, record 21977508
-# (doi:10.5281/zenodo.21977508, 2026-08-17).  All v5 files are schema-2.x
-# grids carrying the ssp_resolution dataset (library resolution curve =
-# element-wise max of the grid's own 2-pixel sampling floor and any
-# documented library LSF), required by the strict loaders.  Entries with
-# url=None are defined-but-unpublished; fetch_grid raises a clear error
-# naming the build script instead of downloading.
-# ---------------------------------------------------------------------
 REGISTRY: dict[str, dict] = {
-    # Solar-scaled MIST+MILES release grid (schema 2.0, 3-D).
     "mist_miles_chab": {
-        "url": "https://zenodo.org/records/21977508/files/"
+        "stellar_mass_table": True,
+        "url": "https://zenodo.org/records/22937956/files/"
                "ssp_data_mist_miles.h5?download=1",
-        "sha256": "d52f1940e4cfcf739a50e8afaea03898"
-                  "71bec9404653a7e023faa53f86382f31",
+        "sha256": "f2f40fe9d57b7fbdba5a60aa130c79ac"
+                  "ad09c0d7f26e789d95f93092eeedf4fd",
         "size_mb": 67,
         "notes": "python-fsps 0.5.0, MIST + MILES, Chabrier IMF "
-                 "(imf_type=1).  Schema 2.0: ssp_resolution = sampling "
-                 "floor max MILES LSF (FWHM 2.54 A, Falcon-Barroso+2011). "
-                 "Nebular-capable via CSPBasis.",
+                 "(imf_type=1).  Schema 3.0: ssp_resolution = sampling "
+                 "floor max MILES LSF (FWHM 2.54 A, Falcon-Barroso+2011); "
+                 "surviving-mass table (FSPS stellar_mass; first isochrone bin "
+                 "corrected for truncated young isochrones, Zenodo 22937956) "
+                 "for mfrac.  Nebular-capable via CSPBasis.",
     },
-    # BPASS v2 binary-population release grid (schema 2.0, 3-D).
     "mist_bpass_v2": {
-        "url": "https://zenodo.org/records/21977508/files/"
+        "stellar_mass_table": True,
+        "url": "https://zenodo.org/records/22937956/files/"
                "ssp_data_bpass.h5?download=1",
-        "sha256": "64c93ea751133cf3d34f4f33222af767"
-                  "d029a69b9ac3549059568055a489b9e9",
+        "sha256": "c119d19e6ade6f1de72ebf0a887e70e8"
+                  "8330a1d36c6323b4d314d8baa952d151",
         "size_mb": 62,
         "notes": "python-fsps 0.5.0, BPASS v2 binary SSPs, Chabrier IMF. "
-                 "Schema 2.0: ssp_resolution = grid sampling-floor curve "
-                 "(no documented LSF broader than the tabulation).",
-    },
-    # Alpha-enhanced grid (schema 2.0, 4-D, n_afe=5).  THE download path
-    # for [alpha/Fe] fitting: CSPBasis_afe has no nebular model, so with
-    # this file no FSPS install (and no $SPS_HOME) is needed at all.
-    "amist_c3k_lr_chab_afe": {
-        # Published 2026-08-04 as v2 of the ceridwen-grids deposit
-        # (concept DOI 10.5281/zenodo.21221633); sha256 pinned by
-        # scripts_afe/publish_grid_zenodo.py from the built grid.
-        "url": "https://zenodo.org/records/21794924/files/"
-               "amist_c3k_lr_chab_afe.h5?download=1",
-        "sha256": "0ae3ca192f1ba3a7825c83d77dd927ec069f4107"
-                  "a52051b2e4484f80d5a47ef7",
-        "size_mb": 108,     # (5, 13, 107, 1936) float64 + metadata
-        "notes": "FSPS v4.0 alpha-MC (python-fsps >= 0.4.9.dev, AFE_FLAG=1), "
-                 "aMIST + C3K_LR, Chabrier IMF, [alpha/Fe] = "
-                 "{-0.2, 0.0, +0.2, +0.4, +0.6}. For CSPBasis_afe "
-                 "(no nebular; no FSPS needed at fit time).  NB: this "
-                 "published copy predates schema 2.x (no ssp_resolution); "
-                 "after download, convert it once with "
-                 "scripts/convert_grids_schema2.py, or use "
-                 "'amist_c3k_hr_krou_afe' (schema 2.1, published in v5).",
+                 "Schema 3.0: ssp_resolution = grid sampling-floor curve "
+                 "(no documented LSF broader than the tabulation); "
+                 "surviving-mass table (FSPS stellar_mass) for mfrac.",
     },
     # Grid used by the Astro project's Ceridwen fitting notebooks:
     # aMIST v2.5 describes how stars evolve; C3K v2.3 supplies their spectra.
@@ -109,38 +53,31 @@ REGISTRY: dict[str, dict] = {
     # For what each stored value means, read SSPDataAfe in ssps/ssp_data_afe.py.
     # For how the original values are converted, read scripts_afe/build_afe_hr_grid.py.
     "amist_c3k_hr_krou_afe": {
-        # Published 2026-08-17 in v5 of the ceridwen-grids deposit
-        # (record 21977508); schema 2.1 (ssp_resolution = grid
-        # sampling-floor curve; the stored 10992-pt wavelength grid, not
-        # the native C3K LSF, is the binding resolution of this file).
-        "url": "https://zenodo.org/records/21977508/files/"
+        "stellar_mass_table": False,
+        "url": "https://zenodo.org/records/22937956/files/"
                "amist_c3k_hr_krou_afe.h5?download=1",
         "sha256": "f6af03d813569f5982891d969f030d93"
                   "45278a60de907b90b2a910d56af32a16",
-        "size_mb": 612,     # (5, 13, 107, 10992) float64 + metadata
+        "size_mb": 612,
         "notes": "MIST v2.5 (aMIST) + C3K v2.3 high-res, Kroupa IMF, "
                  "[alpha/Fe] = {-0.2, 0.0, +0.2, +0.4, +0.6}, "
                  "[Fe/H] in [-2.5, +0.5], log10(age/yr) in [5.0, 10.3]. "
-                 "High-resolution twin of amist_c3k_lr_chab_afe for "
-                 "CSPBasis_afe (no nebular; no FSPS needed at fit time). "
+                 "For CSPBasis_afe (no nebular; no FSPS needed at fit time). "
+                 "No surviving-mass table yet: mfrac is not available on it. "
                  "Source: M. J. Park alpha-MC SSPs (2025-07-22).",
-    },
-    # Library-null control: same code/data/library, single solar plane.
-    "mist_c3k_lr_chab_null": {
-        "url": None,        # TODO after Zenodo upload
-        "sha256": None,
-        "size_mb": None,
-        "notes": "FSPS v4.0 (AFE_FLAG=0), MIST + C3K_LR, Chabrier IMF, "
-                 "n_afe=1. Null model separating C3K-library effects from "
-                 "alpha effects.",
     },
 }
 
 
+def _grid_cache_root() -> Path:
+    """$CERIDWEN_GRID_DIR or ~/.ceridwen/grids, without creating it."""
+    root = os.environ.get("CERIDWEN_GRID_DIR")
+    return Path(root) if root else Path.home() / ".ceridwen" / "grids"
+
+
 def grid_cache_dir() -> Path:
     """Cache directory: $CERIDWEN_GRID_DIR or ~/.ceridwen/grids."""
-    root = os.environ.get("CERIDWEN_GRID_DIR")
-    path = Path(root) if root else Path.home() / ".ceridwen" / "grids"
+    path = _grid_cache_root()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -156,23 +93,88 @@ def _sha256(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _download(url: str, path: Path, *, attempts: int = 8) -> None:
+    """Download ``url`` to ``path`` completely.  A server may close the connection before
+    ``Content-Length`` bytes arrive (Zenodo does, intermittently), and a chunked read then
+    ends as if the file were complete; so the size is checked and a short transfer is
+    resumed with an HTTP Range request, up to ``attempts`` times."""
+    total = None
+    with open(path, "wb"):
+        pass
+    for _ in range(attempts):
+        have = path.stat().st_size
+        if total is not None and have >= total:
+            break
+        req = urllib.request.Request(url)
+        if have:
+            req.add_header("Range", f"bytes={have}-")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if have and r.status != 206:          # server ignored the range: start over
+                    have = 0
+                    mode = "wb"
+                else:
+                    mode = "ab"
+                if total is None or not have:
+                    cl = r.headers.get("Content-Length")
+                    total = (int(cl) + have) if cl is not None else None
+                with open(path, mode) as f:
+                    shutil.copyfileobj(r, f, length=1 << 20)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise                                 # wrong URL / access: retrying cannot help
+            continue                                  # 5xx: retry
+        except (OSError, http.client.HTTPException):
+            continue                                  # retried from the bytes already written
+        if total is None:
+            break                                     # no length to check: the sha256 decides
+    if total is not None and path.stat().st_size != total:
+        raise RuntimeError(
+            f"the download of {url} stopped at {path.stat().st_size} of {total} bytes after "
+            f"{attempts} attempts; the connection keeps dropping.  Try again later.")
+
+
+def _is_earlier_copy(name: str, sha: str) -> bool:
+    """True when ``sha`` is a known earlier file of the registry grid ``name``."""
+    from .grid_metadata import CHASH_TABLE, FILE_SHA_ALIASES
+    ch = FILE_SHA_ALIASES.get(sha)
+    return ch is not None and CHASH_TABLE[ch].name == name
+
+
+def _verify_cached(name: str, dest: Path) -> None:
+    """Raise RuntimeError unless the cached file ``dest`` has the registry checksum of ``name``."""
+    entry = REGISTRY[name]
+    got = _sha256(dest)
+    if entry["sha256"] and got != entry["sha256"]:
+        if _is_earlier_copy(name, got):
+            raise RuntimeError(
+                f"Cached grid {dest} is an earlier release of {name!r} (sha256 "
+                f"{got[:12]}..., without the surviving-mass table); this version expects {entry['sha256'][:12]}....  "
+                f"Refresh it with fetch_grid({name!r}, force=True)."
+            )
+        raise RuntimeError(
+            f"Cached grid {dest} fails its checksum "
+            f"(got {got[:12]}..., expected {entry['sha256'][:12]}...). "
+            f"Delete it or call fetch_grid({name!r}, force=True)."
+        )
+
+
+def cached_grid(name: str) -> Path | None:
+    """The checksum-verified cached copy of the registry grid ``name``, or ``None`` when
+    :func:`fetch_grid` has not downloaded it.  Never downloads and never creates the cache
+    directory; a cached file that fails its checksum raises, as in :func:`fetch_grid`."""
+    if name not in REGISTRY:
+        raise KeyError(f"Unknown grid {name!r}. Available: {sorted(REGISTRY)}.")
+    dest = _grid_cache_root() / f"{name}.h5"
+    if not dest.is_file():
+        return None
+    _verify_cached(name, dest)
+    return dest
+
+
 def fetch_grid(name: str, *, force: bool = False, quiet: bool = False) -> Path:
-    """Return a local, checksum-verified path to a published grid.
-
-    Downloads on first use into :func:`grid_cache_dir`; later calls hit
-    the cache (re-verified against the pinned SHA-256 each time, which
-    costs ~1 s per GB and has caught both truncated downloads and
-    stealth-edited remote files).
-
-    Parameters
-    ----------
-    name : str
-        Registry key, e.g. ``"amist_c3k_lr_chab_afe"``.
-    force : bool
-        Re-download even if a cached file exists.
-    quiet : bool
-        Suppress progress output.
-    """
+    """Return a local, checksum-verified path to the registry grid ``name``,
+    downloading into :func:`grid_cache_dir` on first use (``force`` re-downloads)."""
     if name not in REGISTRY:
         raise KeyError(
             f"Unknown grid {name!r}. Available: {sorted(REGISTRY)}."
@@ -181,21 +183,13 @@ def fetch_grid(name: str, *, force: bool = False, quiet: bool = False) -> Path:
     if entry["url"] is None:
         raise RuntimeError(
             f"Grid {name!r} is defined but not yet published (no URL in the "
-            f"registry). Build it locally with scripts_afe/build_afe_grid.py, "
-            f"or publish it with scripts_afe/publish_grid_zenodo.py and "
-            f"paste the printed REGISTRY entry. Notes: {entry['notes']}"
+            f"registry). Notes: {entry['notes']}"
         )
 
     dest = grid_cache_dir() / f"{name}.h5"
 
     if dest.exists() and not force:
-        got = _sha256(dest)
-        if entry["sha256"] and got != entry["sha256"]:
-            raise RuntimeError(
-                f"Cached grid {dest} fails its checksum "
-                f"(got {got[:12]}..., expected {entry['sha256'][:12]}...). "
-                f"Delete it or call fetch_grid({name!r}, force=True)."
-            )
+        _verify_cached(name, dest)
         return dest
 
     if not quiet:
@@ -203,15 +197,11 @@ def fetch_grid(name: str, *, force: bool = False, quiet: bool = False) -> Path:
         print(f"[ceridwen] fetching grid {name!r}{size} -> {dest}",
               file=sys.stderr)
 
-    # Download to a temp file in the same directory, verify, then move
-    # into place atomically — a killed download never leaves a plausible-
-    # looking partial grid in the cache.
     fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".part")
     os.close(fd)
     tmp = Path(tmp)
     try:
-        with urllib.request.urlopen(entry["url"]) as r, open(tmp, "wb") as f:
-            shutil.copyfileobj(r, f, length=1 << 20)
+        _download(entry["url"], tmp)
         got = _sha256(tmp)
         if entry["sha256"] and got != entry["sha256"]:
             raise RuntimeError(
@@ -229,7 +219,7 @@ def fetch_grid(name: str, *, force: bool = False, quiet: bool = False) -> Path:
 
 
 def available_grids(published_only: bool = False) -> dict[str, str]:
-    """Map of grid name -> one-line description (for docs / CLI help)."""
+    """Map of grid name -> one-line description."""
     return {
         k: v["notes"] for k, v in REGISTRY.items()
         if v["url"] is not None or not published_only

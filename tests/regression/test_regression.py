@@ -49,11 +49,28 @@ CATEGORIES = [
     "nebular",
     "csp_spectrum",
     "likelihood",
+    "outlier_likelihood",
+    "gp_likelihood",
+    "calibration_likelihood",
+    "poly_marginal",
+    "eline_marginal",
+    "igm_damping_dla",
+    "dust_laws",
+    "dust_emission_themis",
+    "lsf_scale",
 ]
 
+#: v1.0.5 metallicity baselines, one per grid family; each is skipped where its grid is absent;
+OPTIONAL_CATEGORIES = ["logzsol_bpass", "logzsol_mist", "logzsol_afe",
+                       # v1.0.6 surviving mass: present when tests/reference holds the
+                       # canonical grid's FSPS mass table (matched by chash)
+                       "stellar_mass"]
 
-@pytest.mark.parametrize("category", CATEGORIES)
+
+@pytest.mark.parametrize("category", CATEGORIES + OPTIONAL_CATEGORIES)
 def test_category_matches_baseline(category, fresh):
+    if category in OPTIONAL_CATEGORIES and category not in fresh:
+        pytest.skip(f"{category}: its SSP grid is not present locally")
     expected = _load(category)
     actual = fresh[category]
     assert set(actual.keys()) == set(expected.keys()), (

@@ -14,7 +14,8 @@ where [alpha/Fe] is both strongest and cleanest to measure. This demo fits:
 
     - a NON-parametric star-formation history: 10 bins with a continuity
       (Student-t on the log SFR ratios) prior
-    - the total stellar metallicity ``Z`` (log10 ABSOLUTE metallicity)
+    - the metallicity ``logzsol`` = [Fe/H] (solar-relative; on this alpha grid the total
+      [Z/H] is the derived ``logzsol_total``)
     - the alpha-enhancement ``afe`` = [alpha/Fe] (the new axis)
     - diffuse-dust optical depth ``diffuse_tau_kc`` and slope
       ``diffuse_dust_index`` (Kriek & Conroy law; no birth-cloud dust)
@@ -32,7 +33,7 @@ on here. The whole-spectrum-to-photometry calibration is a SEPARATE nuisance,
 captures the full galaxy and anchors the absolute flux, while ``spectrum_scaling``
 absorbs the uncertain flux calibration of the spectrograph trace. ``spectrum_scaling``
 and ``eline_scaling`` are independent by construction (see
-CSPBasis._assemble_observer_spectra).
+CSPBasis._project_observations).
 
 The example is self-contained: it builds a mock quiescent galaxy through the
 forward model (injecting a known ``spectrum_scaling`` so the observed spectrum sits
@@ -52,12 +53,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ceridwen import SedModel, fitSED
+from ceridwen import SedModel, fitSED, Kinematics, Instrument, PostProcess
 from ceridwen.csp import CSPBasis_afe
 from ceridwen.ssps import SSPDataAfe
 from ceridwen.observation import Photometry, Spectrum
 from ceridwen.model import logsfr_ratios_to_sfh
 from ceridwen.priors import Uniform, ClippedNormal, StudentT
+from ceridwen.cosmology import Cosmology
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -65,19 +67,19 @@ HERE = pathlib.Path(__file__).resolve().parent
 # [alpha/Fe] in {-0.2, 0.0, +0.2, +0.4, +0.6}). Prefer a local copy; else
 # fall back to the published download helper (Zenodo).
 LOCAL_GRIDS = [
-    HERE / "amist_c3k_lr_chab_afe.h5",
-    HERE.parent / "ceridwen" / "data" / "test_data" / "amist_c3k_lr_chab_afe.h5",
+    HERE / "amist_c3k_hr_krou_afe.h5",
+    HERE.parent / "ceridwen" / "data" / "test_data" / "amist_c3k_hr_krou_afe.h5",
 ]
 
 SEED = 7
 ZRED = 0.10                         # fixed redshift (quiescent, Legacy-observable)
 N_BINS = 10                         # SFH bins -> N_BINS-1 = 9 logsfr_ratios
 GALAXY_LOSVD = 200.0                # stellar velocity dispersion [km/s], FIXED
-SPEC_RES_KMS = 70.0                 # instrument resolution sigma_v [km/s]
+SPEC_RES_KMS = 70.0                 # instrument LSF sigma [km/s]
 SNR_PHOT, SNR_SPEC = 30.0, 30.0
 
 # Legacy Surveys bands: DECam grz + WISE W1/W2 (decam_* / wise_* are valid
-# sedpy_jax filter names). Swap in your own broadband set as needed.
+# ceridwen filter names). Swap in your own broadband set as needed.
 FILTERS = ["decam_g", "decam_r", "decam_z", "wise_w1", "wise_w2"]
 
 # Legacy-Surveys-style optical spectrum: observed-frame vacuum Angstrom.
@@ -90,7 +92,7 @@ SPEC_WAVE = np.linspace(3600.0, 9800.0, 1500)
 LOGSFR_RATIOS_TRUE = -0.5 * jnp.ones(N_BINS - 1)
 TRUTH = {
     "logsfr_ratios":      LOGSFR_RATIOS_TRUE,
-    "Z":                  jnp.array([-2.3]),     # log10 absolute metallicity
+    "logzsol":            jnp.array([-0.6]),     # logzsol = [Fe/H] on an aMIST grid
     "afe":                jnp.array([+0.3]),     # supersolar [alpha/Fe]
     "logmass":            jnp.array([10.8]),
     "diffuse_tau_kc":     jnp.array([0.15]),     # low dust (quiescent)
@@ -108,7 +110,7 @@ def _load_grid() -> SSPDataAfe:
             return SSPDataAfe.load(str(p))
     # Published-grid fallback (cached download).
     from ceridwen.ssps import fetch_grid
-    return SSPDataAfe.load(str(fetch_grid("amist_c3k_lr_chab_afe")))
+    return SSPDataAfe.load(str(fetch_grid("amist_c3k_hr_krou_afe")))
 
 
 def main() -> None:
@@ -116,27 +118,32 @@ def main() -> None:
     ssp = _load_grid()
 
     # Alpha-enhanced, nebular-free CSP. add_dust=False (no birth-cloud dust);
-    # add_diffuse_dust=True gives the diffuse tau + slope we fit. The galaxy
-    # LOSVD is applied source-side here (sigma_losvd_kms); the Spectrum then
-    # adds only the INSTRUMENT broadening, so the dispersion is not double
-    # counted. (We are NOT fitting sigma_smooth in this demo.)
+    # add_diffuse_dust=True gives the diffuse tau + slope we fit.
     csp = CSPBasis_afe(
         ssp,
         lookback_time=jnp.linspace(0.0, 12.0, N_BINS),
         zh_const=True, sfh_interp="step",
         add_dust=False, add_diffuse_dust=True,
-        sigma_losvd_kms=GALAXY_LOSVD,
         verbose=False,
+        cosmo=Cosmology.planck18(),
     )
     sfh_times_yr = np.array(csp.sfh_times)
+
+    # The galaxy dispersion is held FIXED at GALAXY_LOSVD (a float, not a
+    # theta key); the Spectrum carries only the instrument's LSF, and the
+    # projection combines the two in quadrature (library width removed).
+    # NOTE: the low-resolution C3K grid (1936 wavelength points) is coarser
+    # than a 70 km/s instrument, so the library subtraction floors at zero
+    # and the continuum is delivered at the grid's own resolution; the
+    # projector warns about it once. That is the correct model for this grid.
+    kin = Kinematics(sigma_gal=GALAXY_LOSVD)
 
     def make_spectrum(flux=None, uncertainty=None):
         return Spectrum(
             wavelength=SPEC_WAVE,
             flux=flux, uncertainty=uncertainty,
-            resolution=SPEC_RES_KMS, smoothtype="vel",   # instrument broadening
-            fit_sigma_smooth=False,                       # LOSVD held fixed
-            noise_floor=0.01,                             # 1% error floor
+            instrument=Instrument.sigma_kms(SPEC_RES_KMS),   # LSF sigma [km/s]
+            noise_floor=0.01,   # 1 % of the model flux in quadrature (fitSED honours it)
             name="spec",
         )
 
@@ -145,7 +152,10 @@ def main() -> None:
             csp, observations=observations,
             priors={
                 # Stellar population.
-                "Z":   ClippedNormal(mean=-2.0, sigma=0.6, low=-3.9, high=-1.45),
+                # logzsol is [Fe/H] here; the upper edge stays at the +0.25 node because
+                # ([Fe/H] > +0.25) x ([alpha/Fe] > +0.4) is refused (FSPS ships a duplicate
+                # isochrone there -- see csp.refused_cells_logzsol()).
+                "logzsol": ClippedNormal(mean=-0.3, sigma=0.6, low=-2.2, high=0.25),
                 "afe": Uniform(low=-0.2, high=0.6),        # over the grid support
                 "logmass": Uniform(low=9.0, high=12.0),
                 "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=0.3),  # continuity
@@ -167,6 +177,7 @@ def main() -> None:
                 "spectrum_scaling":     jnp.array([1.0]),
             },
             zred=ZRED,                                     # redshift FIXED
+            kinematics=kin,                                # galaxy dispersion FIXED
         )
 
     # -- Mock: photometry + spectrum through the same forward model ---------
@@ -198,15 +209,17 @@ def main() -> None:
         output_dir="./demo_afe_quiescent_output",
     )
 
-    # -- Recovered vs true (weight NS samples by their importance weights) --
-    lw = np.asarray(result.log_weights)
-    w = np.exp(lw - lw.max()); w /= w.sum()
-    idx = rng.choice(w.size, size=4000, p=w)
+    # -- Post-process --------------------------------------------------------
+    params = ("afe", "logzsol", "logmass", "diffuse_tau_kc", "diffuse_dust_index", "spectrum_scaling")
+    truths = {p: float(TRUTH[p][0]) for p in params}
+    pp = PostProcess(model, result, n_samples=4000, uv=False, ionizing=False)
+    out = pp.run()
+    pp.figures("./demo_afe_quiescent_output/figures", title="demo: alpha-enhanced quiescent galaxy",
+               truths=truths)
     print("\nparameter            truth      median      std")
     print("-" * 48)
-    for p in ("afe", "Z", "logmass", "diffuse_tau_kc",
-              "diffuse_dust_index", "spectrum_scaling"):
-        s = np.asarray(result.samples[p])[idx].ravel()
+    for p in params:
+        s = out["theta"][p]
         print(f"{p:>20} {float(TRUTH[p][0]):+8.3f} {np.median(s):+10.3f} "
               f"{np.std(s):8.3f}")
     # Expect: afe recovered near +0.3 from the Mg/Ca vs Fe absorption balance;

@@ -13,11 +13,10 @@ concurrency:
 jobs:
   # ----------------------------------------------------------------------
   # Smoke test: does the package install from a clean environment and import?
-  # Importing ceridwen.sampler also exercises the sedpy-jax / tfp / blackjax
-  # dependency pins, so a bad pin fails here rather than at a user's first fit.
+  # Importing ceridwen.sampler also exercises the tfp / blackjax dependency
+  # pins, so a bad pin fails here rather than at a user's first fit.
   #
-  # Python 3.11+ : nested sampling pins official blackjax (main), which requires
-  # >=3.11. (The git dependency means installs build blackjax from source.)
+  # Python 3.11+ : blackjax >= 1.6 (nested sampling) and jax >= 0.9 require it.
   # ----------------------------------------------------------------------
   smoke:
     name: smoke (import) py${{ matrix.python-version }}
@@ -49,8 +48,8 @@ jobs:
           from ceridwen import DustModel, DustEmission, NebularModel, fitSED, read_result_h5
 
           # Submodule imports that pull the heavier deps, so a broken pin
-          # (sedpy-jax / astropy / tfp / blackjax) is caught at CI time.
-          import ceridwen.csp.csp            # astropy, sedpy_jax
+          # (astropy / tfp / blackjax) is caught at CI time.
+          import ceridwen.csp.csp            # forward model + vendored filters / attenuation laws
           import ceridwen.observation.observation
           import ceridwen.sampler            # tensorflow-probability, blackjax
           from ceridwen.sampler import Uniform, ClippedNormal, StudentT
@@ -58,9 +57,68 @@ jobs:
           PY
 
   # ----------------------------------------------------------------------
+  # Wheel: build the sdist + wheel and install the WHEEL (not the checkout)
+  # into a clean venv, the way `pip install ceridwen` will. Fails on a direct
+  # URL dependency (PyPI refuses those), on missing package data (filters,
+  # reference spectra), and on anything `twine check --strict` rejects.
+  # ----------------------------------------------------------------------
+  wheel:
+    name: wheel (build + clean install) py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --outdir dist
+          twine check --strict dist/*
+
+      - name: No direct-URL requirement in the wheel metadata
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          z = zipfile.ZipFile(whl)
+          meta = z.read(next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))).decode()
+          bad = [l for l in meta.splitlines() if l.startswith("Requires-Dist:") and " @ " in l]
+          assert not bad, f"direct references (PyPI rejects these): {bad}"
+          names = z.namelist()
+          assert sum(n.endswith(".par") for n in names) > 200, "filter curves missing from the wheel"
+          assert not any("test_data" in n for n in names), "test grids leaked into the wheel"
+          stamp = [n for n in names if n.endswith("_buildstamp.py")]
+          assert not stamp, f"stale build stamp in the wheel (build from a clean checkout): {stamp}"
+          print(whl, "metadata OK")
+          PY
+
+      - name: Install the wheel into a clean venv (outside the checkout)
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheelenv/bin/python -c "import ceridwen, blackjax.ns; print('ceridwen', ceridwen.__version__, ceridwen.__file__)"
+          /tmp/wheelenv/bin/python -m ceridwen.check
+
+  # ----------------------------------------------------------------------
   # Test suite (FSPS-free subset). Fixtures live in tests/fixtures/*.h5 via
   # git-lfs, so checkout must pull LFS. FSPS- and GPU-only tests are skipped
-  # by marker. Python 3.11 (matches the blackjax NSS requirement).
+  # by marker. Python 3.11 (the lowest supported version).
+  #
+  # The suite's main test grid is NOT in the repository (tests/_gridfixture.py):
+  # without it the grid-dependent tests skip and a green run proves little. It
+  # is the published BPASS grid (Zenodo doi:10.5281/zenodo.22937956), so it is
+  # fetched by name with ceridwen's own fetch_grid (SHA-256 verified on every
+  # call) and handed to the tests through $CERIDWEN_TEST_SSP / $SSP_FILE.
+  # Tests that need the CLOUDY data under $SPS_HOME still skip here; the -ra
+  # summary lists every skip with its reason. Read it: skips are not passes.
   # ----------------------------------------------------------------------
   tests:
     name: pytest (FSPS-free)
@@ -79,6 +137,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
+
+      # Cache key = grid name + the first 8 hex digits of its SHA-256 in
+      # ceridwen/ssps/grid_fetch.py (REGISTRY); bump it if the registry entry changes.
+      - name: Cache the published test grid
+        uses: actions/cache@v4
+        with:
+          path: ~/.ceridwen/grids
+          key: ceridwen-grid-mist_bpass_v2-c119d19e
+
+      - name: Fetch the test SSP grid (Zenodo, checksummed)
+        run: |
+          GRID=$(python -c "from ceridwen.ssps import fetch_grid; print(fetch_grid('mist_bpass_v2'))" | tail -n 1)
+          test -f "$GRID"
+          echo "CERIDWEN_TEST_SSP=$GRID" >> "$GITHUB_ENV"
+          echo "SSP_FILE=$GRID" >> "$GITHUB_ENV"
 
       - name: Run tests (skip FSPS- and GPU-only tests)
         run: |

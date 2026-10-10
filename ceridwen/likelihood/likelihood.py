@@ -1,88 +1,4 @@
-"""
-ceridwen/likelihood/likelihood.py
-====================================
-Gaussian log-likelihood classes for Ceridwen SED fitting.
-
-Architecture overview
----------------------
-The system has three layers:
-
-1. **Pure kernel** ``lnlike_diag_gaussian``
-   A single pure JAX function.  Takes pre-computed ``inv_var`` and ``log_det``
-   arrays from a noise model and returns a scalar log-likelihood plus a
-   ``LikelihoodOutput`` NamedTuple carrying diagnostics.  No class, no state,
-   no side effects.  This is the hot path -- everything else is scaffolding
-   around it.
-
-2. **Likelihood class** ``DiagonalGaussianLikelihood``
-   A frozen dataclass that holds a ``NoiseModelBase`` instance and sequences
-   the call: noise model → kernel → output.  Its ``__call__`` method has the
-   signature required by ``jax.value_and_grad(has_aux=True)``, returning
-   ``(lnl_total, LikelihoodOutput)``.
-
-3. **Multi-observation wrapper** ``MultiObservationLikelihood``
-   Combines an arbitrary collection of ``(observation_key, likelihood)`` pairs
-   into a single log-likelihood, summed across photometry, spectroscopy, lines,
-   etc.  Provides the same ``make_lnprobfn`` factory method.
-
-Key JAX design decisions
-------------------------
-**Frozen dataclasses + empty PyTree leaves**
-    All configuration (noise model type, flags) is Python-level.  Classes are
-    registered as JAX PyTrees with empty leaves, so they act as static compile-
-    time constants when closed over in ``jax.jit``.  Only ``theta`` is traced.
-
-**``(scalar, aux)`` return convention**
-    ``DiagonalGaussianLikelihood.__call__`` returns ``(lnl_total, aux)``.
-    This matches the ``jax.value_and_grad(fn, has_aux=True)`` pattern exactly::
-
-        (lnl, aux), grad = jax.value_and_grad(
-            lambda t: lhood(y, model(t), sigma, mask, t),
-            has_aux=True
-        )(theta)
-
-    Gradients of ``lnl_total`` w.r.t. ``theta`` (including noise nuisance
-    parameters) come out of one backward pass, with diagnostics in ``aux``.
-
-**``jnp.where`` masking everywhere**
-    Masks are applied with ``jnp.where`` rather than Python boolean indexing.
-    This preserves array shapes across the JIT boundary and keeps gradients
-    well-defined for all elements (masked elements simply contribute 0).
-
-**No Python control flow over traced values**
-    The Python ``for`` loop in ``MultiObservationLikelihood`` iterates over
-    *static* keys -- it is unrolled at trace time.  No ``jax.lax.cond`` is
-    needed here.
-
-**``make_lnprobfn`` factory**
-    Closes over the static objects (observations, model, prior, likelihood) and
-    returns a ``@jax.jit``-compiled function of ``theta`` only.  This is the
-    interface blackjax and other gradient-based samplers expect.
-
-Comparison to Prospector
-------------------------
-Prospector's ``compute_lnlike`` dispatches through a mutable noise model
-object attached to each observation, calls numpy, and returns a scalar.
-The design here differs on every dimension relevant to JAX:
-
-    +-------------------------+---------------------+----------------------------+
-    | Aspect                  | Prospector          | Ceridwen                   |
-    +=========================+=====================+============================+
-    | Noise model state       | Mutable attributes  | Frozen dataclass           |
-    | Array library           | numpy / scipy       | JAX (differentiable)       |
-    | JIT-compilable          | No                  | Yes                        |
-    | Returns gradient        | No                  | Yes (value_and_grad)       |
-    | Masking                 | Boolean indexing    | jnp.where (shape-stable)   |
-    | Multi-modality          | Separate functions  | MultiObservationLikelihood |
-    | Nuisance parameters     | Stored in model     | Passed through theta       |
-    +-------------------------+---------------------+----------------------------+
-
-What is kept from Prospector's philosophy:
-  - Separating noise model computation from the likelihood kernel.
-  - Supporting per-datum contributions and normalised residuals.
-  - Treating masking as a first-class concern.
-  - Making the interface observation-centric (obs carries data + sigma + mask).
-"""
+"""Gaussian log-likelihood kernels and classes."""
 
 from __future__ import annotations
 
@@ -93,47 +9,16 @@ from typing import Any, Callable, Optional
 import jax
 import jax.numpy as jnp
 
-from .calibration import PolynomialCalibration
+from .calibration import PolynomialCalibration as MarginalCalibration
 from .emission_lines import EmissionLineColumns
 from .noise_model import DiagonalNoiseModel, NoiseModelBase, NoiseModelOutput
+from .poly_calibration import PolynomialCalibration
 
-# Type alias matching the ceridwen codebase convention.
 Array = jax.Array
 
 
-# ===========================================================================
-# Diagnostic output container
-# ===========================================================================
-
 class LikelihoodOutput:
-    """
-    Per-datum diagnostics returned alongside the scalar log-likelihood.
-
-    Returned as the ``aux`` element of ``(lnl_total, aux)`` so that
-    ``jax.value_and_grad(fn, has_aux=True)`` delivers gradients *and*
-    diagnostics from a single backward pass.
-
-    Attributes
-    ----------
-    lnl_total : Array, scalar
-        Total log-likelihood (same as the first return value).  Stored here
-        for convenience when calling without ``value_and_grad``.
-    lnl_pointwise : Array, shape (n_data,)
-        Per-datum log-likelihood contributions.  Zero for masked data.
-    residuals : Array, shape (n_data,)
-        Raw residuals ``y - mu``.  Zero for masked data.
-    chi : Array, shape (n_data,)
-        Normalised residuals ``(y - mu) / sigma_eff``.  Zero for masked data.
-        Useful for visualising fit quality; chi^2 / ndof = sum(chi**2) / ndof.
-    ndof : Array, scalar int
-        Number of unmasked (active) data points.
-
-    Notes
-    -----
-    This class is registered as a JAX PyTree so it survives ``jax.jit`` and
-    ``jax.vmap`` boundaries.  All array fields are JAX arrays; ``ndof`` is an
-    integer-dtype JAX scalar.
-    """
+    """Per-datum diagnostics returned as the ``aux`` of ``(lnl_total, aux)``; masked entries are 0."""
 
     __slots__ = ("lnl_total", "lnl_pointwise", "residuals", "chi", "ndof")
 
@@ -170,9 +55,47 @@ jax.tree_util.register_pytree_node(
 )
 
 
-# ===========================================================================
-# Pure kernel  --  the hot path
-# ===========================================================================
+def finite_data(y: Array, sigma: Array) -> tuple[Array, Array]:
+    """``y`` and ``sigma`` with non-finite entries replaced by 0 and 1.  Observations mask
+    those entries at construction, but a NaN left in a masked slot still reaches the
+    gradient as 0 * NaN; every sampled likelihood reads its data through this."""
+    y = jnp.asarray(y)
+    sigma = jnp.asarray(sigma)
+    return (jnp.where(jnp.isfinite(y), y, 0.0),
+            jnp.where(jnp.isfinite(sigma), sigma, 1.0))
+
+
+def observation_data(obs) -> tuple:
+    """``(y - sky, sigma, mask, calibration, upper_limit)`` of ``obs`` as the sampled
+    likelihood uses them (``upper_limit`` None unless some datum is flagged), through
+    :func:`finite_data`."""
+    y = obs.flux
+    sky = getattr(obs, "sky", None)
+    if sky is not None:
+        y = y - sky
+    y, sigma = finite_data(y, obs.uncertainty)
+    ul = getattr(obs, "upper_limit", None)
+    ul = None if ul is None or not bool(jnp.any(ul)) else jnp.asarray(ul, dtype=bool)
+    return (y, sigma, obs.mask, getattr(obs, "calibration", None), ul)
+
+
+def single_observation_data(observations, what: str, upper_limits: bool = False) -> tuple:
+    """:func:`observation_data` for a single-observation ``make_lnprobfn``: sky subtracted,
+    finite data; returns ``(y, sigma, mask, calibration, upper_limit)``.  An observation that
+    flags upper limits is refused unless the likelihood handles them (``upper_limits``)."""
+    y, sigma, mask, calib, ul = observation_data(observations)
+    if ul is not None and not upper_limits:
+        raise ValueError(
+            f"{what}.make_lnprobfn: the observation flags upper limits, which this likelihood "
+            "would treat as detections.  Use DiagonalGaussianLikelihoodWithUpperLimits, or "
+            "MultiObservationLikelihood / fitSED, which pick the one-sided kernel")
+    return y, sigma, mask, calib, ul
+
+
+def calibrated_mu(mu, calibration):
+    """The prediction times the observation's fixed ``calibration`` vector (None: unchanged)."""
+    return mu if calibration is None else mu * calibration
+
 
 def lnlike_diag_gaussian(
     y       : Array,
@@ -181,68 +104,13 @@ def lnlike_diag_gaussian(
     log_det : Array,
     mask    : Array,
 ) -> tuple[Array, LikelihoodOutput]:
-    """
-    Diagonal Gaussian log-likelihood kernel.
-
-    This is a **pure JAX function** with no side effects.  It is safe inside
-    ``jax.jit``, ``jax.grad``, and ``jax.vmap``.  Call it directly when you
-    have already computed ``inv_var`` and ``log_det`` from a noise model.
-
-    The per-datum log-likelihood is:
-
-    .. math::
-
-        \\ell_i = -\\tfrac{1}{2}\\chi_i^2 - \\texttt{log\\_det}_i
-
-    where
-
-    .. math::
-
-        \\chi_i = (y_i - \\mu_i) \\sqrt{\\sigma_{\\rm eff,i}^{-2}}
-
-    and ``log_det_i = 0.5 * log(2 pi sigma_eff_i^2)`` is supplied by the noise
-    model.  Masked data points contribute 0 to every sum.
-
-    Parameters
-    ----------
-    y : Array, shape (n_data,)
-        Observed data vector.
-    mu : Array, shape (n_data,)
-        Model prediction.
-    inv_var : Array, shape (n_data,)
-        Effective inverse variance ``1 / sigma_eff^2``, from ``NoiseModelOutput``.
-    log_det : Array, shape (n_data,)
-        Per-datum log-normalisation ``0.5 * log(2 pi sigma_eff^2)``, from
-        ``NoiseModelOutput``.
-    mask : Array of bool, shape (n_data,)
-        True for data points included in the likelihood.
-
-    Returns
-    -------
-    lnl_total : Array, scalar
-        Total log-likelihood (sum over unmasked data).
-    aux : LikelihoodOutput
-        Per-datum diagnostics (pointwise contributions, residuals, chi,
-        ndof).  Compatible with ``jax.value_and_grad(has_aux=True)``.
-
-    Notes
-    -----
-    Numerical stability: squaring the residual before multiplying by
-    ``inv_var`` (rather than dividing by ``var``) avoids potential overflow
-    when ``var`` is very small.  The ``jnp.sqrt(inv_var)`` path is safe
-    because the noise model guarantees ``inv_var > 0`` for all elements.
-    """
-    # Residual and normalised residual (chi).
-    # Writing chi = resid * sqrt(inv_var) keeps gradient paths symmetric and
-    # avoids catastrophic cancellation that could occur with resid / sigma.
+    """Return ``(lnl_total, LikelihoodOutput)`` with ``lnl_i = -0.5 chi_i^2 - log_det_i``;
+    ``log_det = 0.5 log(2 pi sigma_eff^2)``, masked data contribute 0."""
     resid = y - mu
-    chi   = resid * jnp.sqrt(inv_var)    # (y - mu) / sigma_eff
+    chi   = resid * jnp.sqrt(inv_var)
 
-    # Per-datum log-likelihood (unmasked).
     lnl_i = -0.5 * chi ** 2 - log_det
 
-    # Zero out masked contributions.  Using jnp.where preserves array shapes
-    # and keeps gradients well-defined (gradient through masked elements is 0).
     lnl_masked   = jnp.where(mask, lnl_i,  0.0)
     resid_masked  = jnp.where(mask, resid,  0.0)
     chi_masked    = jnp.where(mask, chi,    0.0)
@@ -260,9 +128,125 @@ def lnlike_diag_gaussian(
     return lnl_total, aux
 
 
-# ===========================================================================
-# Pure kernel  --  diagonal Gaussian with per-datum upper-limit support
-# ===========================================================================
+@jax.custom_jvp
+def _mixture(f: Array, a: Array, b: Array) -> Array:
+    """``ln[(1 - f) e^a + f e^b]`` evaluated as ``logaddexp(log1p(-f) + a, log(f) + b)``."""
+    return jnp.logaddexp(jnp.log1p(-f) + a, jnp.log(f) + b)
+
+
+@_mixture.defjvp
+def _mixture_jvp(primals, tangents):
+    # Exact derivative.  d/df = (e^b - e^a) / L is finite at f = 0, where differentiating
+    # the log(f) above gives 0 * inf = NaN; the values are those of the primal.
+    f, a, b = primals
+    df, da, db = tangents
+    out = _mixture(f, a, b)
+    w_good = jnp.exp(jnp.log1p(-f) + a - out)
+    w_bad  = jnp.exp(jnp.log(f) + b - out)
+    d_f    = jnp.exp(b - out) - jnp.exp(a - out)
+    return out, d_f * df + w_good * da + w_bad * db
+
+
+def _outlier_terms(y, mu, inv_var, log_det, mask, f, nsigma):
+    """``(resid, chi, lnl_i)`` of the mixture; the residual is zeroed on masked data before
+    any arithmetic, so masked (even non-finite) data give finite gradients."""
+    resid = jnp.where(mask, y - mu, 0.0)
+    chi   = resid * jnp.sqrt(inv_var)
+    chi2  = chi ** 2
+    lnp_good = -0.5 * chi2 - log_det
+    lnp_bad  = -0.5 * chi2 / nsigma ** 2 - log_det - jnp.log(nsigma)
+    return resid, chi, _mixture(f, lnp_good, lnp_bad)
+
+
+def lnlike_diag_outlier(
+    y       : Array,
+    mu      : Array,
+    inv_var : Array,
+    log_det : Array,
+    mask    : Array,
+    f       : Array,
+    nsigma  : Array,
+) -> tuple[Array, LikelihoodOutput]:
+    """Outlier mixture (Hogg, Bovy & Lang 2010), Prospector's ``NoiseModel.lnlike`` branch
+    ``f_outlier > 0``: per datum
+
+        lnl_i = logaddexp(log(1 - f) + lnp_good_i, log(f) + lnp_bad_i)
+        lnp_good_i = -0.5 chi_i^2 - log_det_i
+        lnp_bad_i  = -0.5 chi_i^2 / nsigma^2 - log_det_i - log(nsigma)
+
+    with ``sigma_eff`` (``inv_var``, ``log_det``) from the noise model after every term, as
+    Prospector uses its noise model's ``Sigma``.  As f -> 0 it tends to
+    :func:`lnlike_diag_gaussian`, NOT to Prospector's ``f_outlier == 0`` value, whose
+    ``NoiseModel.lnlikelihood`` multiplies chi^2 by ln(2 pi) and drops n ln(2 pi).
+    ``lnl_pointwise`` holds the mixture terms (summing to ``lnl_total``); ``chi`` and
+    ``residuals`` are those of the inlier Gaussian.  Masked data contribute 0 with finite
+    gradients; the derivative in f is the exact ``(e^b - e^a)/L``, finite at f = 0 unless a
+    datum sits beyond ~38 sigma (nsigma = 50) (then +inf: the likelihood rises that steeply)."""
+    resid, chi, lnl_i = _outlier_terms(y, mu, inv_var, log_det, mask, f, nsigma)
+
+    lnl_masked = jnp.where(mask, lnl_i, 0.0)
+    lnl_total  = jnp.sum(lnl_masked)
+
+    aux = LikelihoodOutput(
+        lnl_total     = lnl_total,
+        lnl_pointwise = lnl_masked,
+        residuals     = resid,
+        chi           = chi,
+        ndof          = jnp.sum(mask),
+    )
+    return lnl_total, aux
+
+
+def lnlike_diag_outlier_with_upper_limits(
+    y               : Array,
+    mu              : Array,
+    inv_var         : Array,
+    log_det         : Array,
+    mask            : Array,
+    is_upper_limit  : Array,
+    f               : Array,
+    nsigma          : Array,
+) -> tuple[Array, LikelihoodOutput]:
+    """:func:`lnlike_diag_outlier` on the detections and the one-sided penalty of
+    :func:`lnlike_diag_gaussian_with_upper_limits` (unchanged, no mixture) on data flagged
+    ``is_upper_limit``.  With no flags it equals :func:`lnlike_diag_outlier`."""
+    resid, chi, lnl_mix = _outlier_terms(y, mu, inv_var, log_det, mask, f, nsigma)
+    lnl_ul = -0.5 * jnp.maximum(-chi, 0.0) ** 2 - log_det
+    lnl_i  = jnp.where(is_upper_limit, lnl_ul, lnl_mix)
+
+    lnl_masked = jnp.where(mask, lnl_i, 0.0)
+    lnl_total  = jnp.sum(lnl_masked)
+
+    aux = LikelihoodOutput(
+        lnl_total     = lnl_total,
+        lnl_pointwise = lnl_masked,
+        residuals     = resid,
+        chi           = chi,
+        ndof          = jnp.sum(mask),
+    )
+    return lnl_total, aux
+
+
+def outlier_probability(
+    y       : Array,
+    mu      : Array,
+    inv_var : Array,
+    log_det : Array,
+    mask    : Array,
+    f       : Array,
+    nsigma  : Array,
+) -> Array:
+    """Per-datum posterior probability of belonging to the outlier component,
+    ``exp(log f + lnp_bad_i - lnl_i)``; 0 for masked data.  A diagnostic: the sampled
+    likelihood never computes it."""
+    resid = jnp.where(mask, y - mu, 0.0)
+    chi2  = (resid * jnp.sqrt(inv_var)) ** 2
+    lnp_good = -0.5 * chi2 - log_det
+    lnp_bad  = -0.5 * chi2 / nsigma ** 2 - log_det - jnp.log(nsigma)
+    a = jnp.log1p(-f) + lnp_good
+    b = jnp.log(f) + lnp_bad
+    return jnp.where(mask, jnp.exp(b - jnp.logaddexp(a, b)), 0.0)
+
 
 def lnlike_diag_gaussian_with_upper_limits(
     y               : Array,
@@ -272,98 +256,20 @@ def lnlike_diag_gaussian_with_upper_limits(
     mask            : Array,
     is_upper_limit  : Array,
 ) -> tuple[Array, LikelihoodOutput]:
-    r"""
-    Diagonal Gaussian log-likelihood with per-datum upper-limit support.
-
-    Photometric or line-flux data points flagged as upper limits do not
-    constrain the model from below: only model predictions that *exceed*
-    the observed upper-limit value pay a chi-squared penalty.  This matches
-    Prospector's recommended treatment for non-detections (see
-    :ref:`prospector FAQ on upper limits
-    <https://prospect.readthedocs.io/en/latest/faq.html#what-do-i-do-about-upper-limits>`)
-    and the existing convention used in
-    :class:`ceridwen.observation.Lines` for emission-line non-detections.
-
-    Per-datum log-likelihood
-    ------------------------
-    Let
-
-    .. math::
-
-        \chi_i = (y_i - \mu_i) \,/\, \sigma_{\mathrm{eff},i}.
-
-    For a **detection** (``is_upper_limit[i] = False``):
-
-    .. math::
-
-        \ell_i = -\tfrac{1}{2}\chi_i^2 \;-\; \log\!\det_i
-
-    For an **upper limit** (``is_upper_limit[i] = True``):
-
-    .. math::
-
-        \ell_i^{\mathrm{UL}}
-            = -\tfrac{1}{2}\bigl[\max(\mu_i - y_i,\,0)\bigr]^2 \,
-                \sigma_{\mathrm{eff},i}^{-2} \;-\; \log\!\det_i.
-
-    The :math:`\max(\mu_i - y_i, 0)` clip means that any model prediction
-    consistent with -- or below -- the observed upper limit incurs no penalty.
-    The log-determinant is retained on both branches so the absolute
-    log-likelihood remains a proper Gaussian normalisation (NS log Z stays
-    interpretable); ``log_det`` does not depend on theta and contributes a
-    fixed offset to model-comparison statistics.
-
-    Parameters
-    ----------
-    y : Array, shape (n_data,)
-        Observed data.  For detections this is the measured flux; for upper
-        limits this is the upper-limit value (e.g. 1-sigma, 2-sigma, etc.;
-        the convention is whatever the user used).
-    mu : Array, shape (n_data,)
-        Model prediction.
-    inv_var : Array, shape (n_data,)
-        Effective inverse variance ``1 / sigma_eff^2`` from the noise model.
-    log_det : Array, shape (n_data,)
-        Per-datum log-normalisation ``0.5 * log(2 pi sigma_eff^2)``.
-    mask : Array of bool, shape (n_data,)
-        ``True`` for data points (detections OR upper limits) that contribute
-        to the likelihood.  ``False`` removes the datum entirely.
-    is_upper_limit : Array of bool, shape (n_data,)
-        ``True`` marks band ``i`` as an upper limit (one-sided chi-squared);
-        ``False`` treats it as a normal detection (two-sided Gaussian).
-
-    Returns
-    -------
-    lnl_total : Array, scalar
-        Total log-likelihood (sum over unmasked data).
-    aux : LikelihoodOutput
-        Per-datum diagnostics.  ``aux.chi`` is set to the *signed* normalised
-        residual on both branches; ``aux.lnl_pointwise`` reflects the
-        one-sided clip on upper-limit bands so the chi^2 reported by
-        downstream tooling matches the actual likelihood contribution.
-
-    Notes
-    -----
-    The kernel is pure JAX, JIT-safe, vmap-safe, and differentiable in
-    ``mu``, ``inv_var``, and ``log_det``.  The :math:`\max(\cdot, 0)` clip is
-    implemented with :func:`jnp.maximum`, which has a defined sub-gradient
-    at zero (it returns 0) so HMC / NUTS / SVI gradient paths remain valid.
-    """
-    resid     = y - mu                                # (y - mu)
+    """Like :func:`lnlike_diag_gaussian`, but data flagged ``is_upper_limit`` use a one-sided
+    penalty ``-0.5 max(mu - y, 0)^2 / sigma_eff^2`` (``y`` is the limit value); ``log_det``
+    is kept on both branches and ``aux.chi`` stays signed."""
+    resid     = y - mu
     sqrt_iv   = jnp.sqrt(inv_var)
-    chi       = resid * sqrt_iv                       # signed normalised residual
+    chi       = resid * sqrt_iv
 
-    # Detection branch: full chi^2.
     chi2_det  = chi ** 2
 
-    # Upper-limit branch: penalty only when mu > y, i.e. resid < 0.
-    # Equivalent to (max(mu - y, 0) / sigma_eff)^2 == max(-chi, 0)^2.
     chi2_ul   = jnp.maximum(-chi, 0.0) ** 2
 
     chi2_used = jnp.where(is_upper_limit, chi2_ul, chi2_det)
     lnl_i     = -0.5 * chi2_used - log_det
 
-    # Zero-out masked contributions (preserves shapes for jnp.where).
     lnl_masked   = jnp.where(mask, lnl_i,  0.0)
     resid_masked = jnp.where(mask, resid,  0.0)
     chi_masked   = jnp.where(mask, chi,    0.0)
@@ -381,18 +287,8 @@ def lnlike_diag_gaussian_with_upper_limits(
     return lnl_total, aux
 
 
-# ===========================================================================
-# Abstract base class
-# ===========================================================================
-
 class LikelihoodBase(abc.ABC):
-    """
-    Abstract base for all Ceridwen likelihood classes.
-
-    Every subclass must implement ``__call__`` with the signature below.
-    This ensures all likelihood classes are interchangeable in
-    ``MultiObservationLikelihood`` and ``make_lnprobfn``.
-    """
+    """Abstract base for likelihood classes."""
 
     @abc.abstractmethod
     def __call__(
@@ -403,28 +299,7 @@ class LikelihoodBase(abc.ABC):
         mask      : Array,
         params    : Optional[dict[str, Array]] = None,
     ) -> tuple[Array, LikelihoodOutput]:
-        """
-        Evaluate the log-likelihood.
-
-        Parameters
-        ----------
-        y : Array, shape (n_data,)
-            Observed data vector.
-        mu : Array, shape (n_data,)
-            Model prediction (differentiable w.r.t. theta).
-        sigma_obs : Array, shape (n_data,)
-            Observational 1-sigma uncertainties.
-        mask : Array of bool, shape (n_data,)
-            True where data points are used.
-        params : dict[str, Array], optional
-            Sampled nuisance parameters from theta (e.g. jitter, f_calib).
-
-        Returns
-        -------
-        lnl_total : Array, scalar
-            Differentiable total log-likelihood.
-        aux : LikelihoodOutput
-        """
+        """Return ``(lnl_total, LikelihoodOutput)``; ``params`` carries noise nuisance parameters."""
 
     @abc.abstractmethod
     def make_lnprobfn(
@@ -433,106 +308,37 @@ class LikelihoodBase(abc.ABC):
         model        : Any,
         prior        : Any,
     ) -> Callable[[dict[str, Array]], Array]:
-        """
-        Build a JIT-compiled log-posterior function for use with samplers.
+        """Return a jitted ``theta -> log-posterior`` closing over observations, model and prior."""
 
-        Parameters
-        ----------
-        observations : Observation or dict[str, Observation]
-        model : object with a ``predict(theta)`` method
-        prior : object with a ``log_prob(theta)`` method
-
-        Returns
-        -------
-        Callable[[theta], Array]
-            A ``@jax.jit``-compiled function mapping a parameter PyTree to the
-            scalar log-posterior.  Suitable for blackjax NUTS/HMC/MCLMC.
-        """
-
-
-# ===========================================================================
-# Diagonal Gaussian likelihood
-# ===========================================================================
 
 @dataclass(frozen=True)
 class DiagonalGaussianLikelihood(LikelihoodBase):
-    """
-    Gaussian log-likelihood with an independent (diagonal) noise model.
+    """Gaussian log-likelihood with an independent (diagonal) noise model; with
+    ``noise_model.f_outlier`` set, the outlier mixture :func:`lnlike_diag_outlier`.
 
-    This class sequences three operations:
-
-    1. Call ``noise_model.compute(sigma_obs, mu, mask, params)`` to obtain
-       per-datum ``inv_var`` and ``log_det``.
-    2. Call ``lnlike_diag_gaussian(y, mu, inv_var, log_det, mask)`` to get
-       the scalar log-likelihood and diagnostics.
-
-    Because both steps are pure JAX functions, the entire ``__call__`` is
-    JIT-compilable and differentiable end-to-end.
-
-    Parameters
-    ----------
-    noise_model : DiagonalNoiseModel
-        Noise model instance.  Defaults to a plain observational-uncertainty-
-        only model (no jitter, no fractional error).
-    calibration : PolynomialCalibration, optional
-        Analytic spectrophotometric calibration polynomial.  When set, the
-        model ``mu`` is replaced by ``P(x) * mu`` inside the Gaussian
-        kernel -- the Chebyshev coefficients of ``P`` are solved by
-        weighted least squares at every call, with the noise model's
-        effective sigma (evaluated at the uncalibrated ``mu``) as weights
-        -- and the coefficient prior plus, by default, the Occam factor of
-        the analytic marginalisation are added to the returned
-        log-likelihood.  ``None`` (default) leaves every existing fit
-        bit-for-bit unchanged.  Meant for ``Spectrum`` observations only.
-    emission_lines : EmissionLineColumns, optional
-        Emission lines as free-flux columns of the calibration solve (needs
-        ``calibration``): the model becomes ``P(x) * mu + sum_k f_k L_k``
-        and the line fluxes (flat prior on ``f >= 0``) are integrated out
-        with the coefficients
-        (``PolynomialCalibration.calibrate_with_lines``).  The line profiles
-        follow the sampled ``zred`` and ``sigma_smooth`` in ``params``.
-        ``None`` (default) leaves the likelihood unchanged.
-
-    Examples
-    --------
-    Basic usage with no nuisance parameters::
-
-        lhood = DiagonalGaussianLikelihood()
-        lnl, aux = lhood(y, mu, sigma_obs, mask)
-        # aux.chi      -- normalised residuals
-        # aux.lnl_pointwise  -- per-datum contributions
-
-    With jitter as a sampled parameter::
-
-        lhood = DiagonalGaussianLikelihood(
-            noise_model=DiagonalNoiseModel(use_jitter=True)
-        )
-        lnl, aux = lhood(y, mu, sigma_obs, mask,
-                         params={"log_jitter": theta["log_jitter"]})
-
-    Gradient of log-likelihood w.r.t. theta (for HMC/gradient-based samplers)::
-
-        def lnl_fn(theta):
-            mu = model.predict(theta)
-            return lhood(y, mu, sigma_obs, mask, params=theta)[0]
-
-        grad = jax.grad(lnl_fn)(theta)
-
-    Using ``has_aux=True`` to get diagnostics and gradient in one pass::
-
-        (lnl, aux), grad = jax.value_and_grad(
-            lambda t: lhood(y, model.predict(t), sigma_obs, mask, t),
-            has_aux=True,
-        )(theta)
-    """
+    ``calibration`` (:class:`ceridwen.likelihood.PolynomialCalibration`) multiplies ``mu`` by
+    a Chebyshev polynomial whose coefficients are integrated out analytically at every call;
+    ``emission_lines`` (:class:`EmissionLineColumns`, needs ``calibration``) adds free-flux
+    line columns (flat prior on ``f >= 0``) integrated out with them.  Both None (default)
+    leave the likelihood unchanged."""
 
     noise_model: DiagonalNoiseModel = field(
         default_factory=DiagonalNoiseModel
     )
-    calibration: Optional[PolynomialCalibration] = None
+    #: profiled polynomial calibration (Spectrum(polynomial_order > 0)); None = off
+    poly_calibration: Optional[PolynomialCalibration] = None
+    #: analytic calibration polynomial (ceridwen.likelihood.PolynomialCalibration); None = off
+    calibration: Optional[MarginalCalibration] = None
+    #: emission lines as free-flux columns of ``calibration``; None = off
     emission_lines: Optional[EmissionLineColumns] = None
 
-    # ------------------------------------------------------------------
+    def _calibrated(self, y, mu, sigma_obs, mask, params):
+        """``mu`` times the profiled calibration response (unchanged when off)."""
+        if self.poly_calibration is None:
+            return mu
+        return self.poly_calibration.calibrate(y, mu, sigma_obs, mask, params,
+                                               self.noise_model)
+
     def __call__(
         self,
         y         : Array,
@@ -541,48 +347,42 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         mask      : Array,
         params    : Optional[dict[str, Array]] = None,
     ) -> tuple[Array, LikelihoodOutput]:
-        """
-        Evaluate log-likelihood and return diagnostics.
-
-        This method is the intended hot path for sampling.  It is safe inside
-        ``jax.jit``, ``jax.grad``, and ``jax.vmap``.
-
-        Parameters
-        ----------
-        y : Array, shape (n_data,)
-        mu : Array, shape (n_data,)
-        sigma_obs : Array, shape (n_data,)
-        mask : Array of bool, shape (n_data,)
-        params : dict, optional
-            Nuisance parameters expected by the noise model.
-
-        Returns
-        -------
-        lnl_total : Array, scalar
-        aux : LikelihoodOutput
-        """
-        # The noise model is evaluated once, at the uncalibrated model, so the
-        # polynomial is solved with the same effective sigma the Gaussian
-        # kernel then uses (see PolynomialCalibration).
+        """Return ``(lnl_total, LikelihoodOutput)``.  The noise model is evaluated once, at
+        the uncalibrated model, so the analytic polynomial (``calibration``) is solved with the
+        same effective sigma the Gaussian kernel then uses."""
+        mu = self._calibrated(y, mu, sigma_obs, mask, params)
         noise_out: NoiseModelOutput = self.noise_model.compute(
             sigma_obs, mu, mask, params, data=y
         )
-        ln_extra = jnp.zeros(())
-        if self.emission_lines is not None:
-            if self.emission_lines.photometry_key is not None:
+        if self.emission_lines is not None or self.calibration is not None:
+            if getattr(self.noise_model, "use_outlier", False):
                 raise ValueError(
-                    "emission lines shared with photometry: evaluate through "
-                    "MultiObservationLikelihood.loglike")
-            mu, _, _, ln_extra = self.calibration.calibrate_with_lines(
-                y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
-                self.emission_lines.columns(params), self.emission_lines.pairs,
-                self.emission_lines.ridge
+                    "the analytic calibration polynomial and emission-line columns are not "
+                    "defined with the outlier mixture")
+            if self.emission_lines is not None:
+                if self.emission_lines.photometry_key is not None:
+                    raise ValueError(
+                        "emission lines shared with photometry: evaluate through "
+                        "MultiObservationLikelihood.loglike")
+                mu, _, _, ln_extra = self.calibration.calibrate_with_lines(
+                    y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
+                    self.emission_lines.columns(params), self.emission_lines.pairs,
+                    self.emission_lines.ridge
+                )
+            else:
+                mu, _, ln_extra = self.calibration.calibrate(
+                    y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask
+                )
+            lnl, aux = lnlike_diag_gaussian(
+                y, mu, noise_out.inv_var, noise_out.log_det, mask
             )
-        elif self.calibration is not None:
-            mu, _, ln_extra = self.calibration.calibrate(
-                y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask
+            return lnl + ln_extra, aux
+        if getattr(self.noise_model, "use_outlier", False):
+            f, nsigma = self.noise_model.outlier_params(params)
+            return lnlike_diag_outlier(
+                y, mu, noise_out.inv_var, noise_out.log_det, mask, f, nsigma
             )
-        lnl, aux = lnlike_diag_gaussian(
+        return lnlike_diag_gaussian(
             y, mu, noise_out.inv_var, noise_out.log_det, mask
         )
         return lnl + ln_extra, aux
@@ -612,62 +412,63 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
                                         noise_p.log_det, mask_p)
         return lnl + lnl_p + ln_extra
 
-    # ------------------------------------------------------------------
+    def outlier_probability(
+        self,
+        y         : Array,
+        mu        : Array,
+        sigma_obs : Array,
+        mask      : Array,
+        params    : Optional[dict[str, Array]] = None,
+    ) -> Array:
+        """Per-datum probability of being an outlier (see :func:`outlier_probability`);
+        raises when the mixture is off."""
+        if not getattr(self.noise_model, "use_outlier", False):
+            raise ValueError("the outlier mixture is off (noise_model.f_outlier is None)")
+        noise_out = self.noise_model.compute(sigma_obs, mu, mask, params, data=y)
+        f, nsigma = self.noise_model.outlier_params(params)
+        return outlier_probability(
+            y, mu, noise_out.inv_var, noise_out.log_det, mask, f, nsigma
+        )
+
     def make_lnprobfn(
         self,
         observations : Any,
         model        : Any,
         prior        : Any,
     ) -> Callable[[dict[str, Array]], Array]:
-        """
-        Build a JIT-compiled log-posterior for a single observation type.
-
-        ``observations`` must have attributes ``.flux``, ``.uncertainty``, and
-        ``.mask`` (the interface defined by ``ceridwen.observation.Observation``).
-
-        The returned function has the exact signature expected by blackjax::
-
-            kernel = blackjax.nuts(lnprobfn, step_size)
-            state  = kernel.init(initial_theta)
-
-        Parameters
-        ----------
-        observations : Observation
-            A single observation object (photometry *or* spectroscopy *or*
-            lines).  For multiple modalities use ``MultiObservationLikelihood``.
-        model : object
-            Must implement ``predict(theta) -> Array``.
-        prior : object
-            Must implement ``log_prob(theta) -> Array``.
-
-        Returns
-        -------
-        Callable[[theta], Array]
-            JIT-compiled log-posterior.
-
-        Notes
-        -----
-        ``observations``, ``model``, ``prior``, and ``self`` are all closed
-        over at factory time and become compile-time constants.  Only ``theta``
-        is traced.  This means the first call incurs a one-time XLA compilation
-        cost; subsequent calls are fully compiled and have minimal Python
-        overhead.
-        """
-        # Hoist static data out of the closure so JAX sees them as constants.
-        y         : Array = observations.flux
-        sigma_obs : Array = observations.uncertainty
-        mask      : Array = observations.mask
+        """Return a jitted log-posterior for one observation (needs ``.flux``, ``.uncertainty``,
+        ``.mask``; honours ``sky`` and ``calibration`` as MultiObservationLikelihood does, and
+        refuses flagged upper limits)."""
+        y, sigma_obs, mask, calib, _ = single_observation_data(
+            observations, "DiagonalGaussianLikelihood")
         noise_model       = self.noise_model
+        calibrate         = self._calibrated
         calibration       = self.calibration
         emission_lines    = self.emission_lines
 
+        if getattr(noise_model, "use_outlier", False):
+            if calibration is not None or emission_lines is not None:
+                raise ValueError(
+                    "the analytic calibration polynomial and emission-line columns are not "
+                    "defined with the outlier mixture")
+
+            @jax.jit
+            def lnprobfn_outlier(theta: dict[str, Array]) -> Array:
+                mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
+                               theta)
+                noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
+                f, nsigma = noise_model.outlier_params(theta)
+                lnl, _    = lnlike_diag_outlier(
+                    y, mu, noise_out.inv_var, noise_out.log_det, mask, f, nsigma
+                )
+                return lnl + prior.log_prob(theta)
+
+            return lnprobfn_outlier
+
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
-            mu = model.predict(theta)
-            # Pass the full theta as params.  The noise model extracts only
-            # the keys it needs (log_jitter, log_f_calib); all other keys are
-            # ignored.  This avoids conditional dict construction inside the
-            # JIT-compiled hot path and is safe for any noise model subclass.
+            mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
+                               theta)
             noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
             lnl = jnp.zeros(())
             if emission_lines is not None:
@@ -693,85 +494,46 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
 
         return lnprobfn
 
-    # ------------------------------------------------------------------
     def __repr__(self) -> str:
-        cal = ("" if self.calibration is None
-               else f", calibration={self.calibration!r}")
+        pc = "" if self.poly_calibration is None else f", poly_calibration={self.poly_calibration!r}"
+        if self.calibration is not None:
+            pc += f", calibration={self.calibration!r}"
         if self.emission_lines is not None:
-            cal += f", emission_lines={self.emission_lines!r}"
-        return f"DiagonalGaussianLikelihood(noise_model={self.noise_model!r}{cal})"
+            pc += f", emission_lines={self.emission_lines!r}"
+        return f"DiagonalGaussianLikelihood(noise_model={self.noise_model!r}{pc})"
 
 
-# PyTree: no dynamic leaves; the frozen dataclass config is all auxiliary.
 jax.tree_util.register_pytree_node(
     DiagonalGaussianLikelihood,
-    flatten_func   = lambda lh: ([], (lh.noise_model, lh.calibration,
+    flatten_func   = lambda lh: ([], (lh.noise_model, lh.poly_calibration, lh.calibration,
                                       lh.emission_lines)),
     unflatten_func = lambda aux, _: DiagonalGaussianLikelihood(
-        noise_model=aux[0], calibration=aux[1], emission_lines=aux[2]
+        noise_model=aux[0], poly_calibration=aux[1], calibration=aux[2],
+        emission_lines=aux[3]
     ),
 )
 
 
-# ===========================================================================
-# Diagonal Gaussian likelihood with per-datum upper-limit support
-# ===========================================================================
-
 @dataclass(frozen=True)
 class DiagonalGaussianLikelihoodWithUpperLimits(LikelihoodBase):
-    r"""
-    Diagonal Gaussian log-likelihood that honours per-datum upper-limit flags.
-
-    Identical in interface to :class:`DiagonalGaussianLikelihood`, except that
-    ``__call__`` and ``make_lnprobfn`` additionally consume an
-    ``is_upper_limit`` boolean array that marks each datum as either a normal
-    detection (two-sided Gaussian) or an upper limit (one-sided chi-squared,
-    no penalty when ``mu_i <= y_i``).
-
-    The likelihood kernel used is
-    :func:`lnlike_diag_gaussian_with_upper_limits` -- see that function for
-    the per-datum mathematical form and gradient behaviour.
-
-    When ``is_upper_limit`` is ``None`` or all-``False``, this class reduces
-    bit-for-bit to :class:`DiagonalGaussianLikelihood`.  The intended use is
-    therefore drop-in replacement: callers who do not have non-detections pay
-    no performance penalty (the ``jnp.where`` on a constant mask is folded
-    away at trace time).
-
-    Parameters
-    ----------
-    noise_model : DiagonalNoiseModel
-        Noise model instance (default: bare observational sigma, no nuisance
-        parameters).  Identical role to :class:`DiagonalGaussianLikelihood`.
-
-    Examples
-    --------
-    Construct an upper-limit-aware photometric likelihood and evaluate it:
-
-    >>> from ceridwen.likelihood import (
-    ...     DiagonalGaussianLikelihoodWithUpperLimits,
-    ...     DiagonalNoiseModel,
-    ... )
-    >>> lhood = DiagonalGaussianLikelihoodWithUpperLimits()
-    >>> # Three bands; the third is a 1-sigma upper limit at 5.0 nJy.
-    >>> y          = jnp.array([12.3,  8.1,  5.0])
-    >>> sigma_obs  = jnp.array([ 0.5,  0.4,  5.0])
-    >>> mu         = jnp.array([12.1,  8.4,  3.2])   # model below the limit
-    >>> mask       = jnp.array([True, True, True])
-    >>> is_ul      = jnp.array([False, False, True])
-    >>> lnl, aux   = lhood(y, mu, sigma_obs, mask, is_upper_limit=is_ul)
-
-    The third datum contributes zero penalty because ``mu < y``; switch the
-    third element of ``mu`` to ``7.0`` (exceeds the upper limit) and the
-    contribution becomes
-    ``-0.5 * ((7.0 - 5.0) / 5.0)^2 - log_det``.
-    """
+    """Diagonal Gaussian log-likelihood honouring per-datum upper-limit flags
+    (one-sided penalty; reduces to :class:`DiagonalGaussianLikelihood` when no flags are set).
+    With ``noise_model.f_outlier`` set, the detections use the outlier mixture and the limits
+    keep the one-sided penalty (:func:`lnlike_diag_outlier_with_upper_limits`)."""
 
     noise_model: DiagonalNoiseModel = field(
         default_factory=DiagonalNoiseModel
     )
+    #: profiled polynomial calibration (Spectrum(polynomial_order > 0)); None = off
+    poly_calibration: Optional[PolynomialCalibration] = None
 
-    # ------------------------------------------------------------------
+    def _calibrated(self, y, mu, sigma_obs, mask, params):
+        """``mu`` times the profiled calibration response (unchanged when off)."""
+        if self.poly_calibration is None:
+            return mu
+        return self.poly_calibration.calibrate(y, mu, sigma_obs, mask, params,
+                                               self.noise_model)
+
     def __call__(
         self,
         y               : Array,
@@ -781,72 +543,58 @@ class DiagonalGaussianLikelihoodWithUpperLimits(LikelihoodBase):
         params          : Optional[dict[str, Array]] = None,
         is_upper_limit  : Optional[Array]            = None,
     ) -> tuple[Array, LikelihoodOutput]:
-        """
-        Evaluate the upper-limit-aware Gaussian log-likelihood.
-
-        Parameters
-        ----------
-        y, mu, sigma_obs, mask : Array
-            See :class:`DiagonalGaussianLikelihood.__call__`.
-        params : dict, optional
-            Noise-model nuisance parameters (passed through to
-            ``noise_model.compute``).
-        is_upper_limit : Array of bool, shape (n_data,), optional
-            Per-datum upper-limit flags.  ``None`` is equivalent to an
-            all-``False`` array (every datum is a detection).
-
-        Returns
-        -------
-        lnl_total : Array, scalar
-        aux : LikelihoodOutput
-        """
+        """Return ``(lnl_total, LikelihoodOutput)``; ``is_upper_limit=None`` means all detections."""
+        mu = self._calibrated(y, mu, sigma_obs, mask, params)
         noise_out: NoiseModelOutput = self.noise_model.compute(
             sigma_obs, mu, mask, params, data=y
         )
         if is_upper_limit is None:
             is_upper_limit = jnp.zeros_like(mask, dtype=bool)
+        if getattr(self.noise_model, "use_outlier", False):
+            f, nsigma = self.noise_model.outlier_params(params)
+            return lnlike_diag_outlier_with_upper_limits(
+                y, mu, noise_out.inv_var, noise_out.log_det, mask, is_upper_limit, f, nsigma,
+            )
         return lnlike_diag_gaussian_with_upper_limits(
             y, mu, noise_out.inv_var, noise_out.log_det, mask, is_upper_limit,
         )
 
-    # ------------------------------------------------------------------
     def make_lnprobfn(
         self,
         observations : Any,
         model        : Any,
         prior        : Any,
     ) -> Callable[[dict[str, Array]], Array]:
-        """
-        Build a JIT-compiled log-posterior that consumes the observation's
-        ``upper_limit`` array (if present) and applies one-sided chi-squared
-        to flagged data points.
-
-        Falls back to an all-``False`` array of the appropriate shape when
-        ``observations.upper_limit`` is ``None`` or missing -- making this
-        method a drop-in replacement for the standard
-        :class:`DiagonalGaussianLikelihood.make_lnprobfn`.
-
-        Parameters
-        ----------
-        observations : Observation
-            Single observation with ``.flux``, ``.uncertainty``, ``.mask``,
-            and optionally ``.upper_limit``.
-        model, prior : object
-            See :class:`DiagonalGaussianLikelihood.make_lnprobfn`.
-        """
-        y         : Array = observations.flux
-        sigma_obs : Array = observations.uncertainty
-        mask      : Array = observations.mask
+        """Return a jitted log-posterior using ``observations.upper_limit`` (all-False if absent);
+        honours ``sky`` and ``calibration`` as MultiObservationLikelihood does."""
+        y, sigma_obs, mask, calib, _ = single_observation_data(
+            observations, "DiagonalGaussianLikelihoodWithUpperLimits", upper_limits=True)
         is_ul = getattr(observations, "upper_limit", None)
         if is_ul is None:
             is_ul = jnp.zeros_like(mask, dtype=bool)
         else:
             is_ul = jnp.asarray(is_ul, dtype=bool)
         noise_model = self.noise_model
+        calibrate   = self._calibrated
+
+        if getattr(noise_model, "use_outlier", False):
+            @jax.jit
+            def lnprobfn_outlier(theta: dict[str, Array]) -> Array:
+                mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
+                               theta)
+                noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
+                f, nsigma = noise_model.outlier_params(theta)
+                lnl, _    = lnlike_diag_outlier_with_upper_limits(
+                    y, mu, noise_out.inv_var, noise_out.log_det, mask, is_ul, f, nsigma,
+                )
+                return lnl + prior.log_prob(theta)
+
+            return lnprobfn_outlier
 
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
-            mu = model.predict(theta)
+            mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
+                               theta)
             noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
             lnl, _    = lnlike_diag_gaussian_with_upper_limits(
                 y, mu, noise_out.inv_var, noise_out.log_det, mask, is_ul,
@@ -856,76 +604,37 @@ class DiagonalGaussianLikelihoodWithUpperLimits(LikelihoodBase):
 
         return lnprobfn
 
-    # ------------------------------------------------------------------
     def __repr__(self) -> str:
         return (
             f"DiagonalGaussianLikelihoodWithUpperLimits("
-            f"noise_model={self.noise_model!r})"
+            f"noise_model={self.noise_model!r}"
+            + ("" if self.poly_calibration is None
+               else f", poly_calibration={self.poly_calibration!r}") + ")"
         )
 
 
-# PyTree: identical structure to DiagonalGaussianLikelihood.
 jax.tree_util.register_pytree_node(
     DiagonalGaussianLikelihoodWithUpperLimits,
-    flatten_func   = lambda lh: ([], (lh.noise_model,)),
+    flatten_func   = lambda lh: ([], (lh.noise_model, lh.poly_calibration)),
     unflatten_func = lambda aux, _: DiagonalGaussianLikelihoodWithUpperLimits(
-        noise_model=aux[0]
+        noise_model=aux[0], poly_calibration=aux[1]
     ),
 )
 
 
-# ===========================================================================
-# Multi-observation likelihood
-# ===========================================================================
-
 @dataclass(frozen=True)
 class MultiObservationLikelihood(LikelihoodBase):
-    """
-    Combine log-likelihoods across multiple independent data modalities.
-
-    In SED fitting, the posterior typically conditions on several observation
-    types simultaneously -- broadband photometry (in maggies), a spectrum (in
-    F_lambda), and emission-line fluxes.  Each has different units, different
-    noise properties, and potentially different noise model nuisance parameters.
-
-    This class owns a **static** mapping from string keys to likelihood
-    objects.  At trace time the Python loop over keys is unrolled by XLA;
-    there is no runtime dispatch overhead.
+    """Sum of independent likelihoods over several observation keys.
 
     Parameters
     ----------
-    keys : tuple of str
-        Ordered observation keys, e.g. ``("phot", "spec", "lines")``.
-    likelihoods : tuple of LikelihoodBase
-        One likelihood per key, in the same order.  Different elements may
-        have different noise models (e.g. photometry with fractional error,
-        spectroscopy with jitter).
-
-    Examples
-    --------
-    Combine photometry and spectroscopy::
-
-        multi = MultiObservationLikelihood(
-            keys=("phot", "spec"),
-            likelihoods=(
-                DiagonalGaussianLikelihood(
-                    DiagonalNoiseModel(use_fractional=True)
-                ),
-                DiagonalGaussianLikelihood(
-                    DiagonalNoiseModel(use_jitter=True)
-                ),
-            ),
-        )
-        lnprobfn = multi.make_lnprobfn(observations, model, prior)
-
-    where ``observations`` is a dict ``{"phot": phot_obs, "spec": spec_obs}``
-    and ``model.predict(theta)`` returns a dict with the same keys.
+    keys : tuple of str -- observation keys, e.g. ``("phot", "spec", "lines")``
+    likelihoods : tuple of LikelihoodBase -- one per key, same order
     """
 
     keys        : tuple[str, ...]          = field(default_factory=tuple)
     likelihoods : tuple[LikelihoodBase, ...] = field(default_factory=tuple)
 
-    # ------------------------------------------------------------------
     def __call__(
         self,
         y         : dict[str, Array],
@@ -933,44 +642,31 @@ class MultiObservationLikelihood(LikelihoodBase):
         sigma_obs : dict[str, Array],
         mask      : dict[str, Array],
         params    : Optional[dict[str, Array]] = None,
+        is_upper_limit : Optional[dict[str, Array]] = None,
     ) -> tuple[Array, dict[str, LikelihoodOutput]]:
-        """
-        Evaluate total log-likelihood across all modalities.
-
-        Parameters
-        ----------
-        y, mu, sigma_obs, mask : dict[str, Array]
-            Per-modality data arrays, keyed by the same strings as ``self.keys``.
-        params : dict[str, Array], optional
-            All nuisance parameters (shared across modalities).  Each
-            likelihood/noise model extracts only the keys it needs.
-
-        Returns
-        -------
-        lnl_total : Array, scalar
-            Sum of log-likelihoods across all modalities.
-        aux : dict[str, LikelihoodOutput]
-            Per-modality diagnostics.
-        """
+        """Return ``(lnl_total, {key: LikelihoodOutput})``; all inputs are dicts keyed like ``self.keys``
+        (``is_upper_limit`` only needs the keys whose likelihood honours upper limits)."""
         lnl_total = jnp.zeros(())
         aux: dict[str, LikelihoodOutput] = {}
         for key, lhood in zip(self.keys, self.likelihoods):
-            lnl_i, aux_i = lhood(y[key], mu[key], sigma_obs[key], mask[key], params)
+            ul = None if is_upper_limit is None else is_upper_limit.get(key)
+            if ul is not None:
+                lnl_i, aux_i = lhood(y[key], mu[key], sigma_obs[key], mask[key], params,
+                                     is_upper_limit=ul)
+            else:
+                lnl_i, aux_i = lhood(y[key], mu[key], sigma_obs[key], mask[key], params)
             lnl_total    = lnl_total + lnl_i
             aux[key]     = aux_i
         return lnl_total, aux
 
-    # ------------------------------------------------------------------
     def loglike(self, data, predictions, theta) -> Array:
-        """
-        Total log-likelihood, the sum over observations.
+        """Total log-likelihood, the sum over observations.
 
-        ``data[key] = (y, sigma_obs, mask)``, ``predictions[key] = mu``.  A
-        spectrum whose emission lines are shared with a Photometry
-        (``emission_lines.photometry_key``) is evaluated together with it by
-        :meth:`DiagonalGaussianLikelihood.with_photometry`; that
-        Photometry's own term is then skipped.
-        """
+        ``data[key] = observation_data(obs)`` (``(y, sigma, mask, calibration, upper_limit)``),
+        ``predictions[key] = mu``.  A spectrum whose emission lines are shared with a
+        Photometry (``emission_lines.photometry_key``) is evaluated together with it by
+        :meth:`DiagonalGaussianLikelihood.with_photometry`; that Photometry's own term is
+        then skipped."""
         by_key = dict(zip(self.keys, self.likelihoods))
         shared = {getattr(getattr(lh, "emission_lines", None), "photometry_key", None): key
                   for key, lh in by_key.items()}
@@ -979,58 +675,50 @@ class MultiObservationLikelihood(LikelihoodBase):
         for key, lhood in zip(self.keys, self.likelihoods):
             if key in shared:
                 continue
-            y_k, sig_k, mask_k = data[key]
-            mu_k = predictions[key]
+            y_k, sig_k, mask_k, calib_k, ul_k = data[key]
+            mu_k = calibrated_mu(predictions[key], calib_k)
             phot_key = getattr(getattr(lhood, "emission_lines", None), "photometry_key", None)
-            if phot_key is None:
-                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta)
-            else:
-                y_p, sig_p, mask_p = data[phot_key]
+            if phot_key is not None:
+                y_p, sig_p, mask_p, calib_p, ul_p = data[phot_key]
+                if ul_p is not None:
+                    raise ValueError(
+                        "emission lines shared with a Photometry that flags upper limits")
                 lnl_k = lhood.with_photometry(
                     y_k, mu_k, sig_k, mask_k, theta,
-                    (y_p, predictions[phot_key], sig_p, mask_p, by_key[phot_key].noise_model))
+                    (y_p, calibrated_mu(predictions[phot_key], calib_p), sig_p, mask_p,
+                     by_key[phot_key].noise_model))
+            elif ul_k is not None:
+                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta, is_upper_limit=ul_k)
+            else:
+                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta)
             lnl = lnl + lnl_k
         return lnl
 
-    # ------------------------------------------------------------------
     def make_lnprobfn(
         self,
         observations : dict[str, Any],
         model        : Any,
         prior        : Any,
     ) -> Callable[[dict[str, Array]], Array]:
-        """
-        Build a JIT-compiled log-posterior for multiple observation types.
+        """Return a jitted log-posterior; ``observations`` and ``model.predict(theta)`` are dicts keyed
+        like ``self.keys``.  Each observation's ``sky``, ``calibration`` and ``upper_limit`` are honoured
+        as in ``ceridwen.sampler.runner.run_sampler``."""
+        static_data = {key: observation_data(observations[key]) for key in self.keys}
+        keys        = self.keys
+        likelihoods = self.likelihoods
 
-        Parameters
-        ----------
-        observations : dict[str, Observation]
-            Keyed by the same strings as ``self.keys``.  Each value must have
-            ``.flux``, ``.uncertainty``, and ``.mask`` attributes.
-        model : object
-            Must implement ``predict(theta) -> dict[str, Array]``.
-        prior : object
-            Must implement ``log_prob(theta) -> Array``.
+        if getattr(model, "_eline_system", None) is not None:
+            from .eline_marginal import joint_loglike
 
-        Returns
-        -------
-        Callable[[theta], Array]
-            JIT-compiled log-posterior, suitable for blackjax.
-        """
-        # Pre-extract static data arrays from observations to avoid attribute
-        # lookups inside the JIT-compiled hot path.
-        static_data: dict[str, tuple[Array, Array, Array]] = {
-            key: (
-                observations[key].flux,
-                observations[key].uncertainty,
-                observations[key].mask,
-            )
-            for key in self.keys
-        }
+            @jax.jit
+            def lnprobfn_elines(theta: dict[str, Array]) -> Array:
+                return (joint_loglike(model, keys, likelihoods, static_data, theta)
+                        + prior.log_prob(theta))
+
+            return lnprobfn_elines
+
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
-            # Each likelihood's __call__ handles its noise model; the full
-            # theta is passed as params (see ``loglike``).
             lnl = self.loglike(static_data, model.predict(theta), theta)
             lnp = prior.log_prob(theta)
             return lnl + lnp
@@ -1044,7 +732,6 @@ class MultiObservationLikelihood(LikelihoodBase):
         return f"MultiObservationLikelihood({{{pairs}}})"
 
 
-# PyTree: no leaves; keys and likelihoods go into auxiliary (static).
 jax.tree_util.register_pytree_node(
     MultiObservationLikelihood,
     flatten_func=lambda ml: (
@@ -1057,41 +744,11 @@ jax.tree_util.register_pytree_node(
 )
 
 
-# ===========================================================================
-# Standalone factory (convenience)
-# ===========================================================================
-
 def make_lnprobfn(
     observations : Any,
     model        : Any,
     prior        : Any,
     likelihood   : LikelihoodBase,
 ) -> Callable[[dict[str, Array]], Array]:
-    """
-    Convenience wrapper: build a JIT-compiled log-posterior function.
-
-    This is a module-level function that delegates to ``likelihood.make_lnprobfn``.
-    Prefer calling ``likelihood.make_lnprobfn(...)`` directly when you have a
-    ``LikelihoodBase`` instance; use this function when you want a functional-
-    style call without constructing the class explicitly.
-
-    Parameters
-    ----------
-    observations : Observation or dict[str, Observation]
-    model : object with ``predict(theta)``
-    prior : object with ``log_prob(theta)``
-    likelihood : LikelihoodBase
-
-    Returns
-    -------
-    Callable[[theta], Array]
-
-    Example
-    -------
-    ::
-
-        lnprobfn = make_lnprobfn(obs, model, prior,
-                                  DiagonalGaussianLikelihood())
-        blackjax.nuts(lnprobfn, step_size).init(theta0)
-    """
+    """Return ``likelihood.make_lnprobfn(observations, model, prior)``."""
     return likelihood.make_lnprobfn(observations, model, prior)

@@ -1,70 +1,5 @@
-"""
-ceridwen/likelihood/noise_model.py
-====================================
-Noise models for the Ceridwen likelihood system.
-
-Design philosophy
------------------
-A noise model is a **pure, stateless transformation**:
-
-    (sigma_obs, mu, mask, nuisance_params) --> NoiseModelOutput(inv_var, log_det)
-
-``inv_var`` and ``log_det`` are the two per-datum quantities consumed by any
-Gaussian likelihood kernel:
-
-    lnl_i = -0.5 * chi_i^2 - log_det_i
-          = -0.5 * (y_i - mu_i)^2 * inv_var_i  -  0.5 * log(2 pi sigma_eff_i^2)
-
-Separating these two quantities from the likelihood kernel means:
-  - The kernel is a fixed, simple dot-product regardless of the noise model.
-  - Heteroscedastic, jitter-inflated, or correlated noise all plug in through
-    the same interface without touching the kernel.
-  - Both quantities are differentiable w.r.t. any nuisance parameter in theta,
-    so gradient-based samplers (HMC/NUTS) see smooth gradients through the
-    noise model without special casing.
-
-JAX design rules applied here
-------------------------------
-1. **Frozen dataclasses**: all config is Python-level (bools, floats).  No JAX
-   arrays are stored in the class, so the class is fully static from JAX's
-   perspective and never triggers retracing when closed over in jax.jit.
-
-2. **PyTree registration with empty leaves**: each class is registered as a
-   JAX PyTree with no dynamic leaves.  This allows the noise model to appear
-   inside JIT-compiled functions, vmap, and grad transformations safely.
-
-3. **Nuisance parameters live in theta**: sampled noise parameters (jitter,
-   calibration errors) are *never* stored in the noise model instance.  They
-   are passed at call time via ``params``, which is typically a sub-dict of the
-   full parameter dict ``theta``.  This is essential for HMC/NUTS, which must
-   be able to differentiate through the noise model w.r.t. those parameters.
-
-4. **Log-space nuisance parameters**: jitter and fractional errors are passed
-   as ``log_jitter``, ``log_f_calib`` and ``log_f_data`` in ``params`` and
-   exponentiated inside ``compute``.  This guarantees positivity without
-   requiring constrained samplers, and gives better geometry for
-   gradient-based methods.
-
-Extension pattern
------------------
-Subclass ``NoiseModelBase`` and override ``compute``.  The only contract is
-that ``compute`` is a pure JAX function returning a ``NoiseModelOutput``.
-Examples of future subclasses::
-
-    CorrelatedNoiseModel     -- full covariance matrix via GP kernel
-    HeteroscedasticNoiseModel -- per-datum variance from a parametric model
-    MixtureNoiseModel        -- Gaussian + outlier mixture
-
-Comparison to Prospector
-------------------------
-Prospector's ``NoiseModel`` is a **mutable object** that stores intermediate
-quantities (``self.Sigma``, ``self.log_det``) as instance attributes and calls
-``numpy`` and ``scipy``.  It is not JIT-compilable, not differentiable, and
-cannot be used inside ``jax.vmap``.
-
-Here we make the noise model a **frozen, stateless function object**:
-no mutation, no side effects, pure JAX arithmetic throughout.
-"""
+"""Stateless noise models mapping (sigma_obs, mu, mask, params) to per-datum
+inverse variance and log-normalisation for Gaussian likelihood kernels."""
 
 from __future__ import annotations
 
@@ -75,44 +10,14 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 
-# Type alias matching the rest of the ceridwen codebase.
 Array = jax.Array
 
-# ---------------------------------------------------------------------------
-# Pre-computed constant
-# ---------------------------------------------------------------------------
-
-# 0.5 * log(2 pi)  -- the fixed part of the Gaussian log-normalisation.
-# Computed once at module import time (scalar JAX device array).
 _HALF_LOG_2PI: Array = 0.5 * jnp.log(2.0 * jnp.pi)
 
 
-# ===========================================================================
-# Output container
-# ===========================================================================
-
 class NoiseModelOutput:
-    """
-    Per-datum quantities consumed by a Gaussian likelihood kernel.
-
-    Both arrays have shape ``(n_data,)`` and correspond to the *effective*
-    noise after adding any nuisance contributions.
-
-    Attributes
-    ----------
-    inv_var : Array, shape (n_data,)
-        Inverse effective variance ``1 / sigma_eff^2`` per datum.
-        Used to form the chi-squared: ``chi_i^2 = (y_i - mu_i)^2 * inv_var_i``.
-    log_det : Array, shape (n_data,)
-        Per-datum log-normalisation: ``0.5 * log(2 pi sigma_eff^2)``.
-        Summed over unmasked data, this is the ``-0.5 * log|Sigma|`` term
-        of the Gaussian log-likelihood.
-
-    Notes
-    -----
-    This is a plain class rather than a NamedTuple so that it can be
-    registered as a JAX PyTree with named fields accessible by attribute.
-    """
+    """Per-datum ``inv_var`` (1/sigma_eff^2) and ``log_det`` (0.5*log(2 pi sigma_eff^2)),
+    both shape (n_data,)."""
 
     __slots__ = ("inv_var", "log_det")
 
@@ -128,8 +33,6 @@ class NoiseModelOutput:
         )
 
 
-# Register NoiseModelOutput as a JAX PyTree so it can flow through
-# jax.jit / jax.grad / jax.vmap boundaries.
 jax.tree_util.register_pytree_node(
     NoiseModelOutput,
     flatten_func=lambda o: ([o.inv_var, o.log_det], None),
@@ -139,25 +42,9 @@ jax.tree_util.register_pytree_node(
 )
 
 
-# ===========================================================================
-# Abstract base class
-# ===========================================================================
-
 class NoiseModelBase(abc.ABC):
-    """
-    Abstract base class for all Ceridwen noise models.
-
-    Subclasses implement a single method, ``compute``, which is a pure JAX
-    function mapping observational uncertainties and (optionally) model
-    predictions and nuisance parameters to a ``NoiseModelOutput``.
-
-    The ``compute`` method **must**:
-    - contain no Python side effects
-    - be JIT-safe (no dynamic Python control flow over traced values)
-    - return finite values for all inputs (guard against zeros internally)
-    - be differentiable w.r.t. ``sigma_obs``, ``mu``, and all elements of
-      ``params`` that are JAX arrays
-    """
+    """Abstract noise model; subclasses implement ``compute`` as a pure,
+    JIT-safe, differentiable JAX function."""
 
     @abc.abstractmethod
     def compute(
@@ -168,118 +55,104 @@ class NoiseModelBase(abc.ABC):
         params: Optional[dict[str, Array]] = None,
         data: Optional[Array] = None,
     ) -> NoiseModelOutput:
-        """
-        Compute effective inverse variance and log-normalisation per datum.
-
-        Parameters
-        ----------
-        sigma_obs : Array, shape (n_data,)
-            Observational 1-sigma uncertainties in the same units as the data.
-        mu : Array, shape (n_data,)
-            Current model prediction.  Required when the effective noise
-            depends on the predicted flux (e.g. fractional calibration error).
-        mask : Array of bool, shape (n_data,)
-            True for data points that contribute to the likelihood.  Masked
-            points receive a safe fill value for ``inv_var`` so that no NaN
-            or infinity propagates into the kernel; the kernel itself zeros
-            their contribution via ``jnp.where``.
-        params : dict[str, Array], optional
-            Sampled nuisance parameters extracted from ``theta``.  Keys and
-            meanings are noise-model-specific.  Pass ``None`` or ``{}`` when
-            the model has no nuisance parameters.
-        data : Array, shape (n_data,), optional
-            The observed flux ``y``.  Required only by noise models whose
-            effective variance depends on the *measured* flux rather than the
-            model prediction (the data-anchored fractional floor).  Pass
-            ``None`` when the model does not use it.
-
-        Returns
-        -------
-        NoiseModelOutput
-        """
+        """Return ``NoiseModelOutput`` for 1-sigma ``sigma_obs`` (data units), model ``mu``,
+        bool ``mask``, nuisance ``params`` from theta, and optional observed ``data``;
+        masked points must get a finite ``inv_var``."""
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"
 
 
-# ===========================================================================
-# Diagonal (independent) Gaussian noise model
-# ===========================================================================
-
 @dataclass(frozen=True)
 class DiagonalNoiseModel(NoiseModelBase):
-    """
-    Independent Gaussian noise model with optional nuisance variance terms.
-
-    The effective variance per datum is:
-
-    .. math::
-
-        \\sigma_{\\rm eff,i}^2 = \\sigma_{\\rm obs,i}^2
-            + [\\exp(\\log f_{\\rm calib}) \\cdot |\\mu_i|]^2   \\quad (\\text{if use\\_fractional})
-            + [\\exp(\\log f_{\\rm data})  \\cdot |y_i|]^2       \\quad (\\text{if use\\_data\\_fractional})
-            + \\exp(2 \\log j)                                    \\quad (\\text{if use\\_jitter})
-
-    The **model-anchored** fractional term (``use_fractional``) scales the
-    systematic floor with the model flux ``|mu|`` -- standard in photometric
-    SED fitting where the flux calibration is uncertain at the percent level.
-    Because the resulting variance depends on the parameters, it biases the
-    posterior weakly toward smaller predicted fluxes (an Eddington-type effect).
-
-    The **data-anchored** fractional term (``use_data_fractional``) instead
-    scales the floor with the *observed* flux ``|y|``.  The variance is then
-    independent of ``theta``, so it introduces no Eddington-type bias -- the
-    natural choice for pure zero-point / flux-calibration uncertainties, and
-    for absorbing residual systematics (e.g. the CLOUDY line-ratio error) that
-    should be anchored to the measurement rather than the current model.
-
-    The jitter (noise-floor) term (``use_jitter``) represents unmodelled noise
-    that is independent of flux -- common in spectroscopy where sky subtraction
-    residuals or read noise exceed the formal photon-noise estimate.
-
-    All nuisance parameters are sampled in **log space** (see ``params``
-    below).  Log-space sampling ensures positivity without hard constraints,
-    giving gradient-based samplers a smooth, unconstrained parameter space.
+    """Independent Gaussian noise: sigma_obs^2 (optionally rescaled by a common
+    factor) plus optional (f_calib*|mu|)^2, (f_data*|y|)^2 and jitter^2 terms,
+    nuisance parameters sampled in log space.
 
     Parameters
     ----------
-    use_jitter : bool, default False
-        If True, add an additive noise floor ``exp(log_jitter)`` in
-        quadrature.  Reads ``params["log_jitter"]`` at compute time.
-    use_fractional : bool, default False
-        If True, add a model-anchored fractional calibration error
-        ``exp(log_f_calib) * |mu|`` in quadrature.  Reads
-        ``params["log_f_calib"]`` at compute time.
-    use_data_fractional : bool, default False
-        If True, add a data-anchored fractional systematic floor
-        ``exp(log_f_data) * |y|`` in quadrature, where ``y`` is the observed
-        flux passed as ``compute(..., data=y)``.  Reads
-        ``params["log_f_data"]`` at compute time.
-
-    Notes
-    -----
-    This class has **no JAX array fields**.  All configuration is Python-level.
-    It is therefore registered as a JAX PyTree with empty leaves, making it a
-    fully static compile-time constant when closed over inside ``jax.jit``.
-    No retracing occurs when only ``theta`` changes between calls.
-
-    Usage
-    -----
-    >>> nm = DiagonalNoiseModel(use_jitter=True)
-    >>> out = nm.compute(sigma_obs, mu, mask, params={"log_jitter": jnp.log(0.02)})
-    >>> out.inv_var   # shape (n_data,)
-    >>> out.log_det   # shape (n_data,)
-
-    >>> nm = DiagonalNoiseModel(use_data_fractional=True)
-    >>> out = nm.compute(sigma_obs, mu, mask,
-    ...                  params={"log_f_data": jnp.log(0.05)}, data=y)
+    use_error_scale : bool -- multiply sigma_obs^2 by exp(params[err_scale_key])^2, a
+        common rescaling of the quoted uncertainties (the log-normalisation term keeps it
+        from running away)
+    use_jitter : bool -- add exp(params[jitter_key])^2 (data units)
+    use_fractional : bool -- add (exp(params[f_calib_key]) * |mu|)^2, model-anchored
+    use_data_fractional : bool -- add (exp(params[f_data_key]) * |y|)^2, data-anchored, needs ``data``
+    noise_floor : float -- fixed fractional floor on |mu|
+    f_outlier : None, float or str -- outlier mixture (Hogg, Bovy & Lang 2010): the fraction
+        of data drawn from a Gaussian ``nsigma_outlier`` times broader than sigma_eff.  Default
+        None = 0 = off: the mixture is on only when switched on explicitly, with a float in
+        (0, 1) (fixed; 0.0 means off) or a str (the theta key of a sampled fraction).  Applied
+        by the likelihood classes, not by ``compute``.
+    nsigma_outlier : float or str -- width of the outlier Gaussian in units of sigma_eff,
+        fixed (default 50, Prospector's) or a theta key
+    err_scale_key, jitter_key, f_calib_key, f_data_key : str or float -- where each switched-on
+        term reads its (log) value: a theta key (default ``log_err_scale`` /
+        ``log_jitter`` / ``log_f_calib`` / ``log_f_data``; ``fitSED`` passes the per-observation
+        names ``log_jitter_<kind>[_<obs>]``) or a fixed float
     """
 
     use_jitter          : bool = False
     use_fractional      : bool = False
     use_data_fractional : bool = False
+    noise_floor         : float = 0.0
+    use_error_scale     : bool = False
+    f_outlier           : Optional[float | str] = None
+    nsigma_outlier      : float | str = 50.0
+    err_scale_key       : float | str = "log_err_scale"
+    jitter_key          : float | str = "log_jitter"
+    f_calib_key         : float | str = "log_f_calib"
+    f_data_key          : float | str = "log_f_data"
 
-    # ------------------------------------------------------------------
+    def __post_init__(self) -> None:
+        f, ns = self.f_outlier, self.nsigma_outlier
+        if f is not None and not isinstance(f, str):
+            if isinstance(f, bool) or not isinstance(f, (int, float)):
+                raise TypeError(f"f_outlier must be None, a float or a theta key, got {f!r}")
+            if not 0.0 <= float(f) < 1.0:
+                raise ValueError(f"a fixed f_outlier must lie in [0, 1), got {f!r}")
+            # f = 0 is the ordinary Gaussian: switch the mixture off so the graph is unchanged
+            object.__setattr__(self, "f_outlier", None if float(f) == 0.0 else float(f))
+        if isinstance(f, str) and not f:
+            raise ValueError("f_outlier theta key must be a non-empty string")
+        if not isinstance(ns, str):
+            if isinstance(ns, bool) or not isinstance(ns, (int, float)) or not float(ns) > 0.0:
+                raise ValueError(f"a fixed nsigma_outlier must be a positive number, got {ns!r}")
+            object.__setattr__(self, "nsigma_outlier", float(ns))
+        elif not ns:
+            raise ValueError("nsigma_outlier theta key must be a non-empty string")
+        for k in ("err_scale_key", "jitter_key", "f_calib_key", "f_data_key"):
+            v = getattr(self, k)
+            if isinstance(v, str):
+                if not v:
+                    raise ValueError(f"{k} must be a non-empty theta key or a float")
+            elif isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError(f"{k} must be a theta key (str) or a fixed float, got {v!r}")
+            else:
+                object.__setattr__(self, k, float(v))
+
+    @property
+    def use_outlier(self) -> bool:
+        """True when the outlier mixture is on (static: it selects the likelihood kernel)."""
+        return self.f_outlier is not None
+
+    @property
+    def outlier_param_names(self) -> tuple[str, ...]:
+        """theta keys of the sampled outlier parameters (empty when fixed or off)."""
+        if not self.use_outlier:
+            return ()
+        return tuple(v for v in (self.f_outlier, self.nsigma_outlier) if isinstance(v, str))
+
+    def outlier_params(self, params: Optional[dict[str, Array]]) -> tuple[Array, Array]:
+        """``(f, nsigma)`` for the mixture kernel: the fixed values, or looked up in ``params``."""
+        def get(v, what):
+            if not isinstance(v, str):
+                return v
+            if params is None or v not in params:
+                raise KeyError(f"the outlier model reads {what} from theta[{v!r}], which is "
+                               "missing: sample it (with a prior) or give a fixed value")
+            return params[v]
+        return get(self.f_outlier, "f_outlier"), get(self.nsigma_outlier, "nsigma_outlier")
+
     def compute(
         self,
         sigma_obs : Array,
@@ -288,93 +161,57 @@ class DiagonalNoiseModel(NoiseModelBase):
         params    : Optional[dict[str, Array]] = None,
         data      : Optional[Array] = None,
     ) -> NoiseModelOutput:
-        """
-        Compute ``inv_var`` and ``log_det`` for the diagonal Gaussian model.
-
-        Parameters
-        ----------
-        sigma_obs : Array, shape (n_data,)
-        mu : Array, shape (n_data,)
-        mask : Array of bool, shape (n_data,)
-        params : dict, optional
-            Expected keys (depending on configuration):
-
-            ``"log_jitter"``
-                Log of the additive noise floor (same units as ``sigma_obs``).
-                Must be present when ``use_jitter=True``.
-            ``"log_f_calib"``
-                Log of the model-anchored fractional calibration error
-                (dimensionless).  Must be present when ``use_fractional=True``.
-            ``"log_f_data"``
-                Log of the data-anchored fractional systematic floor
-                (dimensionless).  Must be present when
-                ``use_data_fractional=True``.
-        data : Array, shape (n_data,), optional
-            Observed flux ``y``.  Must be provided when
-            ``use_data_fractional=True`` (it anchors that term); ignored
-            otherwise.
-
-        Returns
-        -------
-        NoiseModelOutput
-        """
+        """Return ``NoiseModelOutput``; ``params`` holds the theta keys ``err_scale_key`` /
+        ``jitter_key`` / ``f_calib_key`` / ``f_data_key`` of the switched-on terms (a float key
+        is a fixed value), ``data`` (observed y) required when ``use_data_fractional``."""
         if params is None:
             params = {}
 
-        # Start with observational variance.
-        var: Array = sigma_obs ** 2
+        def get(key):
+            return params[key] if isinstance(key, str) else key
 
-        # Model-anchored fractional calibration error: sigma = f_calib * |mu|.
-        # Gradient flows through mu -> var -> inv_var -> lnl cleanly.
+        var: Array = sigma_obs ** 2
+        if self.use_error_scale:
+            var = var * jnp.exp(2.0 * get(self.err_scale_key))
+        if self.noise_floor > 0.0:
+            var = var + (self.noise_floor * jnp.abs(mu)) ** 2
+
         if self.use_fractional:
-            f_calib = jnp.exp(params["log_f_calib"])
+            f_calib = jnp.exp(get(self.f_calib_key))
             var = var + (f_calib * jnp.abs(mu)) ** 2
 
-        # Data-anchored fractional systematic floor: sigma = f_data * |y|.
-        # Scales with the *observed* flux, so the variance does not depend on
-        # theta (no Eddington-type bias).  The natural form for pure zero-point
-        # uncertainties.  Requires the observed data to be passed explicitly.
         if self.use_data_fractional:
             if data is None:
                 raise ValueError(
                     "DiagonalNoiseModel(use_data_fractional=True) requires the "
                     "observed data array; call compute(..., data=y)."
                 )
-            f_data = jnp.exp(params["log_f_data"])
+            f_data = jnp.exp(get(self.f_data_key))
             var = var + (f_data * jnp.abs(data)) ** 2
 
-        # Additive noise floor (jitter).
-        # Parameterised as log_jitter so sampling is unconstrained.
         if self.use_jitter:
-            jitter = jnp.exp(params["log_jitter"])
+            jitter = jnp.exp(get(self.jitter_key))
             var = var + jitter ** 2
 
-        # Safety: masked data points receive var = 1 so that inv_var stays
-        # finite.  The likelihood kernel will zero their contribution via
-        # jnp.where(mask, ...) anyway, but we must avoid NaN gradients.
         var = jnp.where(mask, var, jnp.ones_like(var))
 
-        # Hard floor: prevent numerical underflow for extremely small variances.
-        # Uses the smallest representable positive float64 as a floor.
         var = jnp.maximum(var, jnp.finfo(var.dtype).tiny)
 
         inv_var = 1.0 / var
-        # 0.5 * log(2 pi sigma^2) = 0.5*log(sigma^2) + 0.5*log(2pi)
         log_det = 0.5 * jnp.log(var) + _HALF_LOG_2PI
 
         return NoiseModelOutput(inv_var=inv_var, log_det=log_det)
 
-    # ------------------------------------------------------------------
     @property
     def nuisance_param_names(self) -> tuple[str, ...]:
         """Names of nuisance parameters expected in ``params`` at compute time."""
         names: list[str] = []
-        if self.use_fractional:
-            names.append("log_f_calib")
-        if self.use_data_fractional:
-            names.append("log_f_data")
-        if self.use_jitter:
-            names.append("log_jitter")
+        for on, key in ((self.use_error_scale, self.err_scale_key),
+                        (self.use_fractional, self.f_calib_key),
+                        (self.use_data_fractional, self.f_data_key),
+                        (self.use_jitter, self.jitter_key)):
+            if on and isinstance(key, str):
+                names.append(key)
         return tuple(names)
 
     def __repr__(self) -> str:
@@ -382,25 +219,32 @@ class DiagonalNoiseModel(NoiseModelBase):
             f"DiagonalNoiseModel("
             f"use_jitter={self.use_jitter}, "
             f"use_fractional={self.use_fractional}, "
-            f"use_data_fractional={self.use_data_fractional})"
+            f"use_data_fractional={self.use_data_fractional}, "
+            f"noise_floor={self.noise_floor}, "
+            f"use_error_scale={self.use_error_scale}"
+            + (f", f_outlier={self.f_outlier!r}, nsigma_outlier={self.nsigma_outlier!r}"
+               if self.use_outlier else "")
+            + "".join(f", {k}={getattr(self, k)!r}" for k, d in _DEFAULT_KEYS.items()
+                      if getattr(self, k) != d)
+            + ")"
         )
 
 
-# ---------------------------------------------------------------------------
-# PyTree registration for DiagonalNoiseModel
-#
-# Empty leaves [] means there are no JAX-traced arrays stored in the class.
-# The config booleans go into auxiliary data (static, compile-time).
-# JAX treats this object as a constant when it is closed over in jax.jit,
-# so changing only theta between calls never triggers retracing.
-# ---------------------------------------------------------------------------
+_DEFAULT_KEYS = {"err_scale_key": "log_err_scale", "jitter_key": "log_jitter",
+                 "f_calib_key": "log_f_calib", "f_data_key": "log_f_data"}
+
+
 jax.tree_util.register_pytree_node(
     DiagonalNoiseModel,
     flatten_func=lambda nm: (
-        [],                                                    # leaves  (none)
-        (nm.use_jitter, nm.use_fractional, nm.use_data_fractional),  # aux (static)
+        [],
+        (nm.use_jitter, nm.use_fractional, nm.use_data_fractional, nm.noise_floor,
+         nm.use_error_scale, nm.f_outlier, nm.nsigma_outlier,
+         nm.err_scale_key, nm.jitter_key, nm.f_calib_key, nm.f_data_key),
     ),
     unflatten_func=lambda aux, _: DiagonalNoiseModel(
-        use_jitter=aux[0], use_fractional=aux[1], use_data_fractional=aux[2]
+        use_jitter=aux[0], use_fractional=aux[1], use_data_fractional=aux[2],
+        noise_floor=aux[3], use_error_scale=aux[4], f_outlier=aux[5], nsigma_outlier=aux[6],
+        err_scale_key=aux[7], jitter_key=aux[8], f_calib_key=aux[9], f_data_key=aux[10],
     ),
 )

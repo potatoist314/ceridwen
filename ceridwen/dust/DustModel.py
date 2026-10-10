@@ -2,54 +2,43 @@ import jax.numpy as jnp
 from jax import vmap, lax
 from functools import partial
 from collections import defaultdict
-from sedpy_jax.attenuation_dust import ATTENUATION_LAWS
+from ceridwen.dust.attenuation_laws import ATTENUATION_LAWS
 
 import inspect
 from typing import Callable, Sequence
 
 
-# ---------------------------------------------------------------------------
-# make_law_wrapper
-#
-# Extracts named params from a plain dict (``fit_params[name]``), which is
-# fully traceable inside jax.lax.switch because the string key is a static
-# Python value resolved at trace time.
-# ---------------------------------------------------------------------------
-
 def make_law_wrapper(f, param_names, defaults=None):
-    """Return a JAX-traceable wrapper that extracts named params from a dict.
-
-    Parameters missing from ``fit_params`` fall back to ``defaults`` (the
-    registry defaults), so a law parameter can be pinned via theta without
-    breaking older suites whose theta dicts never carried it.  The
-    membership test is a static Python check resolved at trace time.
-    """
+    """Return ``wrapped(wave, fit_params)`` calling ``f(wave, *params)``; missing keys fall back
+    to ``defaults`` with a warning (once per law), and without a default raise a KeyError that
+    names the law and the key."""
     defaults = defaults or {}
+    warned = []
 
     def wrapped(wave, fit_params):
+        missing = [n for n in param_names if n not in fit_params]
+        if missing:
+            nodef = [n for n in missing if n not in defaults]
+            if nodef:
+                raise KeyError(
+                    f"attenuation law {getattr(f, '__name__', f)!r}: theta has no {nodef} "
+                    "(csp.theta_init lists every key the forward model reads)")
+            if not warned:
+                import warnings
+                warnings.warn(
+                    f"attenuation law {getattr(f, '__name__', f)!r}: theta has no {missing}; "
+                    f"using the registry default(s) {[defaults[n] for n in missing]}",
+                    stacklevel=2)
+                warned.append(True)
         args = tuple(fit_params[name] if name in fit_params else defaults[name]
                      for name in param_names)
         return f(wave, *args)
     return wrapped
 
 
-# In case the same dust law is applied multiple times, this function renames
-# the parameters so they do not collide in a shared theta dict.
-
 def modify_function(func, number, defaults_dict=None):
-    """Return a parameter-renamed wrapper of ``func`` (no ``exec``).
-
-    When the same attenuation law is used for multiple age bins, its parameters
-    are suffixed with the bin ``number`` so they do not collide in the shared
-    theta dict (e.g. ``tau_pow`` → ``tau_pow{number}``).  The returned wrapper
-    is invoked *positionally* by :func:`make_law_wrapper`
-    (``func(wave, *args)``); the renaming is purely so that
-    ``inspect.signature`` reports the suffixed names (which :class:`Dust` reads
-    to build the per-bin parameter-extraction list).  We therefore forward the
-    positional arguments unchanged and attach a renamed ``__signature__``.
-
-    The single-law path never calls this function and is unaffected.
-    """
+    """Return a wrapper of ``func`` whose ``__signature__`` has parameters suffixed with ``number``
+    (only the signature is renamed; arguments are forwarded positionally)."""
     sig = inspect.signature(func)
 
     new_params = []
@@ -68,9 +57,6 @@ def modify_function(func, number, defaults_dict=None):
     new_sig = sig.replace(parameters=new_params)
 
     def wrapper(wave, *args, **kwargs):
-        # make_law_wrapper calls positionally: wrapper(wave, *param_values).
-        # Forward positionally to the original law; the parameter renaming is
-        # only for the dict-key lookup, not for this call.
         return func(wave, *args)
 
     wrapper.__name__ = wrapper.__qualname__ = f"{func.__name__}{number}"
@@ -79,12 +65,12 @@ def modify_function(func, number, defaults_dict=None):
 
 
 class Dust:
-    """
-    JAX-compatible modular dust model that supports multiple attenuation laws per bin.
+    """Modular dust attenuation model: one attenuation law per age bin, parameters read from a plain theta dict.
 
-    Parameters are passed as plain dicts (``dict[str, Array]``).
-
-    Call ``Dust.describe_attenuation_laws()`` to list all available models.
+    Parameters
+    ----------
+    bin_edges : list of (lo, hi), log10(Gyr) -- age range of each bin
+    laws : list of str -- attenuation-law name per bin (see ``describe_attenuation_laws``)
     """
 
     def __init__(self, bin_edges=[(-jnp.inf, -1.97)], laws=['powerlaw']):
@@ -179,7 +165,7 @@ class Dust:
             "Dust Model Configuration",
             "=" * 60,
             f"Number of bins          : {self.num_bins}",
-            f"Bin edges (Gyr)         : {format_array(self.bin_edges)}",
+            f"Bin edges (log10 Gyr)   : {format_array(self.bin_edges)}",
             f"Dust laws               : {', '.join(self.laws)}",
             f"Dust parameters         : {', '.join(map(str, self.law_params))}",
             "-" * 60,
@@ -196,28 +182,12 @@ class Dust:
         return "\n".join(info)
 
     def compute_attenuation(self, wave, fit_params):
-        """
-        Compute bin-wise attenuation curves.
-
-        Parameters
-        ----------
-        wave : jnp.ndarray
-            Wavelength array in Angstroms.
-        fit_params : dict[str, Array]
-            Parameter dict.  Each law wrapper extracts only the keys it needs.
-
-        Returns
-        -------
-        jnp.ndarray, shape (num_bins, len(wave))
-        """
-        def curve_fn(i, wave):
-            return lax.switch(i, self.law_funcs, wave, fit_params)
-
-        return vmap(curve_fn, in_axes=(0, None))(jnp.arange(self.num_bins), wave)
+        """Per-bin attenuation curves, shape ``(num_bins, len(wave))``; ``wave`` in Angstroms."""
+        return jnp.stack([f(wave, fit_params) for f in self.law_funcs])
 
     def display(self, fit_params=None):
         import matplotlib.pyplot as plt
-        wave = jnp.linspace(0, 10000, 1000)
+        wave = jnp.linspace(912.0, 10000.0, 1000)       # the laws are not finite at 0 A
         if fit_params is None:
             fit_params = self.get_default_fit_params()
         curves = self.compute_attenuation(wave, fit_params=fit_params)
@@ -225,7 +195,7 @@ class Dust:
         for i in range(len(curves)):
             law = self.law_names_resolved[i]
             t_start, t_end = self.bin_edges[i]
-            ax.plot(wave, curves[i], label=f"Bin {i+1}: {law} ({t_start:.0f}–{t_end:.0f} Myr)")
+            ax.plot(wave, curves[i], label=f"Bin {i+1}: {law} (log10 age/Gyr {t_start:.2f} to {t_end:.2f})")
         ax.set_xlabel("Wavelength (Angstroms)")
         ax.set_ylabel("Attenuation")
         ax.set_yscale("log")
@@ -236,7 +206,7 @@ class Dust:
     @staticmethod
     def describe_attenuation_laws():
         print("=" * 70)
-        print("Available Dust Attenuation Laws in sedpy_jax:\n")
+        print("Available Dust Attenuation Laws in ceridwen:\n")
         for name, info in ATTENUATION_LAWS.items():
             print(f"• {name}")
             print(f"  Description: {info.get('doc', 'No description.')}")
@@ -246,13 +216,7 @@ class Dust:
             print("-" * 70)
 
     def get_default_fit_params(self):
-        """
-        Return a plain dict of default fit parameters.
-
-        Keys are the parameter names used in the active dust laws; values are
-        JAX scalars.  Returned as a dict so it merges directly into the global
-        theta dict.
-        """
+        """Dict of default fit parameters (JAX scalars) for the active laws."""
         defaults = {}
         for law in self.law_names_resolved:
             for k, v in ATTENUATION_LAWS[law].get("defaults", {}).items():
@@ -267,11 +231,7 @@ class Dust:
 
 
 class DiffuseDust(Dust):
-    """
-    Single-bin dust model (one law covering all ages) with ``diffuse_`` prefixed
-    parameter names to avoid collisions with birth-cloud parameters in a shared
-    theta dict.
-    """
+    """Single-bin dust model covering all ages, with ``diffuse_``-prefixed parameter names."""
 
     def __init__(self, law="kriek_conroy"):
         super().__init__(bin_edges=[(-jnp.inf, jnp.inf)], laws=[law])
@@ -300,9 +260,7 @@ class DiffuseDust(Dust):
         self.dust_param_names = param_names
 
     def get_default_params(self):
-        """
-        Return a plain dict of default diffuse-dust parameters (``diffuse_*`` keys).
-        """
+        """Dict of default diffuse-dust parameters (``diffuse_*`` keys)."""
         defaults = {}
         law = self.law_names_resolved[0]
         for k, v in ATTENUATION_LAWS[law].get("defaults", {}).items():
@@ -310,18 +268,7 @@ class DiffuseDust(Dust):
         return defaults
 
     def compute_attenuation(self, wave, fit_params):
-        """
-        Compute the diffuse attenuation curve (single bin).
-
-        Parameters
-        ----------
-        wave : jnp.ndarray
-        fit_params : dict[str, Array]
-
-        Returns
-        -------
-        jnp.ndarray, shape (len(wave),)
-        """
+        """Diffuse attenuation curve, shape ``(len(wave),)``."""
         return self.law_funcs[0](wave, fit_params)
 
     def get_param_names(self):

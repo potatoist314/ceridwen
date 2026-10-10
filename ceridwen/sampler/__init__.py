@@ -1,13 +1,11 @@
-# ceridwen/sampler/__init__.py
-
 from .priors import (
     Prior,
     Uniform,
     TopHat,
     Normal,
-    #MultiVariateNormal,
     ClippedNormal,
     LogNormal,
+    LogUniform,
     StudentT,
 )
 from .runner import SamplerAdapter, SamplingResult, run_sampler
@@ -18,23 +16,19 @@ from .vi     import (
 )
 
 __all__ = [
-    # Priors
     "Prior",
     "Uniform",
     "TopHat",
     "Normal",
-    #"MultiVariateNormal",
     "ClippedNormal",
     "LogNormal",
+    "LogUniform",
     "StudentT",
-    # Sampler protocol
     "SamplerAdapter",
     "SamplingResult",
     "run_sampler",
-    # Backends
     "BlackJAXNestedSamplerAdapter",
     "BlackJAXNUTSAdapter",
-    # Variational-inference preconditioning (NeuTra HMC)
     "VariationalMap",
     "TriLMap",
     "IAFMap",

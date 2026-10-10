@@ -7,7 +7,7 @@ from typing import Literal, Sequence
 
 import jax.numpy as jnp
 import numpy as np
-from sedpy_jax.observate import air2vac
+from .filters import air2vac
 
 from .base import Observation
 from .spectrum import Spectrum

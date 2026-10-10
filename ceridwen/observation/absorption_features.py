@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
-from sedpy_jax.observate import air2vac
+from .filters import air2vac
 
 C_KMS = 2.998e5
 

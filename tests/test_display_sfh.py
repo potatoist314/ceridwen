@@ -31,6 +31,7 @@ jax.config.update("jax_enable_x64", True)
 
 from ceridwen.ssps.ssp_data import SSPData
 from ceridwen.csp.csp import CSPBasis
+from ceridwen.cosmology import Cosmology
 
 
 from _gridfixture import require_test_grid
@@ -66,12 +67,11 @@ def _build_csp(ssp, *, sfh_interp, per_bin, n_time=10, tuniv=13.8):
     theta    = {
         "lookback_time": lookback,
         "sfh":           sfh,
-        "Z":             jnp.array([-2.0]),   # log10 absolute Z, within the grid
+        "logzsol":       jnp.array([-0.3]),   # log10(Z/Z_sun), within the grid
     }
     return CSPBasis(
         ssp,
         theta             = theta,
-        tuniv             = tuniv,
         zh_const          = True,
         add_dust          = False,
         add_diffuse_dust  = False,
@@ -79,6 +79,7 @@ def _build_csp(ssp, *, sfh_interp, per_bin, n_time=10, tuniv=13.8):
         add_neb           = False,
         verbose           = False,
         sfh_interp        = sfh_interp,
+        cosmo=Cosmology.planck18(),
     )
 
 

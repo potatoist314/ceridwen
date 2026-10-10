@@ -1,76 +1,15 @@
-"""
-ceridwen/model/model.py
-=======================
-Parameter manager and model-prediction layer for Ceridwen SED fitting.
-
-Design
-------
-``SedModel`` is the central object connecting the forward model (CSPBasis) to
-a set of observations and a prior specification.  It satisfies two interfaces
-simultaneously:
-
-1. **Model interface** (consumed by ``MultiObservationLikelihood``):
-   ``model.predict(theta)`` must return a ``dict[str, Array]`` keyed by
-   observation name, where each value is the model prediction for that
-   datum type.
-
-2. **Prior interface** (consumed by ``MultiObservationLikelihood.make_lnprobfn``
-   as the ``prior`` argument):
-   ``prior.log_prob(theta)`` must return a scalar log-prior.
-
-Both are implemented on this single class; there is no separate "prior manager"
-object.  This mirrors Prospector's ``SpecModel`` pattern while keeping the
-code as lean as possible.
-
-Architecture::
-
-    SedModel
-    ├── csp             : CSPBasis instance (forward model)
-    ├── observations    : list[Observation]
-    ├── priors          : dict[str, Prior]
-    ├── transforms      : dict[derived_name → callable(free_theta)]
-    ├── predict(theta)       → dict[obs.name → Array]  (calls csp.predict)
-    ├── apply_transforms(θ)  → dict  (free_theta → model_theta)
-    ├── ln_prior(theta)      → scalar  (sum of log-priors on free params)
-    ├── log_prob(theta)      → scalar  (alias for ln_prior)
-    ├── theta_init           → dict[str → Array]  (free parameters only)
-    ├── param_names          → list[str]  (free parameters only)
-    └── obs_dict             → dict[str → Observation]
-
-Compatibility with ``likelihood.py``
--------------------------------------
-``MultiObservationLikelihood.make_lnprobfn(observations, model, prior)``
-expects::
-
-    observations : dict[str, Observation]   # keyed by obs.name
-    model.predict(theta) → dict[str, Array] # same keys
-    prior.log_prob(theta) → Array           # scalar
-
-Usage::
-
-    model = SedModel(csp, observations=[phot, spec], priors={
-        "sfh":  Uniform(low=0.0, high=1.0),
-        "Z":    Normal(mean=-1.5, sigma=0.5),
-    })
-
-    # Forward prediction
-    preds = model.predict(theta)   # {"my_phot": Array(n_filters,), ...}
-
-    # Prior
-    lnp = model.ln_prior(theta)
-
-    # Build JIT-compiled posterior for blackjax
-    from ceridwen.likelihood.likelihood import MultiObservationLikelihood
-    lnprobfn = multi_lhood.make_lnprobfn(model.obs_dict, model, model)
-"""
+"""SedModel: parameter manager, transforms, prior and prediction layer between a
+CSPBasis and a set of observations."""
 
 from __future__ import annotations
 
+import warnings
 from functools import cached_property
 from typing import Any, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ceridwen.observation.observation import (
     Lines,
@@ -79,68 +18,28 @@ from ceridwen.observation.observation import (
     Spectrum,
     StellarIndices,
 )
+from ceridwen.broadening import Kinematics, DEFAULT_KINEMATICS, TIED
 
 Array = jax.Array
 
 
 class SedModel:
-    """
-    Parameter manager + prediction layer for Ceridwen SED fitting.
+    """Parameter manager and prediction layer: ``predict(theta)`` returns a dict keyed
+    by observation name, ``log_prob(theta)`` the summed log-prior on free parameters.
 
     Parameters
     ----------
-    csp : CSPBasis
-        Initialised composite stellar population model.  Must expose
-        ``csp.wave``, ``csp.theta_init``, and
-        ``csp.predict(theta, observations)``.
-    observations : list of Observation
-        Data containers (Photometry, Spectrum, Lines, StellarIndices). Each must have a
-        unique ``.name`` attribute.
-    priors : dict[str, Prior], optional
-        Mapping from *free*-parameter name to a prior object implementing
-        ``logpdf(x) -> Array``.  Parameters absent from this dict receive
-        no prior contribution (flat improper prior).
-    transforms : dict[str, callable], optional
-        Mapping from *derived* (CSP) parameter name to a callable that
-        computes its value from the free-parameter dict::
-
-            model_theta[derived] = fn(free_theta)
-
-        Derived parameters listed here are removed from the free-parameter
-        list and replaced by the new free parameters supplied via
-        ``free_param_init``.  This mirrors Prospector's ``depends_on``
-        mechanism.
-
-        Example — fitting log-ratios of SFR bins instead of raw SFH::
-
-            from ceridwen.model.transforms import logsfr_ratios_to_sfh
-
-            transforms = {
-                "sfh": lambda t: logsfr_ratios_to_sfh(
-                    t["logsfr_ratios"],
-                    sfh_times_yr=csp.sfh_times,
-                )
-            }
-
-    free_param_init : dict[str, Array], optional
-        Initial values for free parameters that *replace* derived ones.
-        Keys in this dict are added to ``param_names`` and ``theta_init``;
-        the corresponding derived params (``transforms`` keys) are removed.
-        Required when ``transforms`` is not empty.
-
-    Attributes
-    ----------
-    theta_init : dict[str, Array]
-        Initial values for the **free** parameters only (derived params
-        are absent; their replacements from ``free_param_init`` are present).
-    param_names : list[str]
-        Ordered list of free-parameter names.
-    transforms : dict[str, callable]
-        Registered transforms (empty dict if none).
-    obs_dict : dict[str, Observation]
-        Observations keyed by ``obs.name``.
-    wave : Array, shape (n_wave,)
-        Model wavelength grid [Å].
+    priors : dict[str, Prior] -- free-parameter name -> prior; absent names get a flat improper prior
+    transforms : dict[str, callable] -- derived CSP parameter name -> ``fn(free_theta)``; derived names leave the free set
+    free_param_init : dict[str, Array] -- initial values of the free parameters replacing derived ones
+    zred : float -- fixed redshift; zred = 0 without ``lumdist_mpc`` applies NO flux factor, so predictions
+        are L_sun/Hz x 10^logmass, not maggies
+    cosmo -- must equal ``csp.cosmo`` if given
+    lumdist_mpc : float, Mpc -- explicit luminosity distance replacing D_L(zred) in the flux factor
+    kinematics : Kinematics -- the galaxy's stellar / gas velocity dispersions [km/s], fixed
+        (float) or sampled (theta key); default ``DEFAULT_KINEMATICS`` = 300 km/s, stars and gas
+    broaden_photometry : bool -- apply the kinematic broadening to the spectrum entering the
+        filters (default True; below 5e-4 mag for broad bands, per cent for a narrow band on a line)
     """
 
     def __init__(
@@ -152,33 +51,51 @@ class SedModel:
         free_param_init: dict[str, Any] | None = None,
         zred: float = 0.0,
         cosmo=None,
+        lumdist_mpc: float | None = None,
+        kinematics: Kinematics | None = None,
+        broaden_photometry: bool = True,
     ):
         self.csp          = csp
         self.observations = list(observations)
         self.priors       = dict(priors) if priors is not None else {}
         self.transforms   = dict(transforms) if transforms is not None else {}
         self.zred         = float(zred)
+        if kinematics is None:
+            kinematics = DEFAULT_KINEMATICS
+        if not isinstance(kinematics, Kinematics):
+            raise TypeError("kinematics must be a ceridwen.broadening.Kinematics "
+                            f"(e.g. Kinematics(sigma_gal=250.0)), got {type(kinematics).__name__}")
+        self.kinematics   = kinematics
+        self.broaden_photometry = bool(broaden_photometry)
 
-        # --- Cosmology ------------------------------------------------
-        # The CSP is the SINGLE owner of the cosmology: it is the object
-        # that evaluates both the flux factor and the age of the universe,
-        # so that is the only place the value is stored.  ``SedModel``
-        # exposes it through a read-only property (below) that forwards to
-        # ``self.csp.cosmo``; there is deliberately no second copy that
-        # could drift out of step with the CSP that actually does the
-        # arithmetic.  Setting it here is therefore refused outright
-        # rather than silently mutating the CSP behind the user's back.
-        if cosmo is not None:
+        if not hasattr(csp, "cosmo"):
             raise TypeError(
-                "SedModel does not take a cosmology: the CSP owns it, so that "
-                "the flux factor and the SFH age grid can never disagree.  Set "
-                "it once at CSP construction instead, e.g.\n"
-                "    csp = CSPBasis(ssp, ..., cosmo=Cosmology(H0=70.0, Om0=0.3))\n"
-                "    model = SedModel(csp, observations, priors)\n"
-                "``model.cosmo`` then reports the CSP's cosmology."
+                f"{type(csp).__name__} carries no .cosmo; build the CSP with "
+                "cosmo=Cosmology.planck18() (or another Cosmology)")
+        if cosmo is not None and cosmo != csp.cosmo:
+            raise ValueError(
+                "SedModel(cosmo=...) differs from the CSP's cosmology, and the "
+                "CSP is what evaluates distances and ages:\n"
+                f"    CSP     : {csp.cosmo.describe()}\n"
+                f"    SedModel: {cosmo.describe()}\n"
+                "Set it once, at CSP construction: CSPBasis(ssp, ..., cosmo=...)"
             )
 
-        # Validate that all observation names are unique
+        self.lumdist_mpc = None
+        if lumdist_mpc is not None:
+            self.lumdist_mpc = float(lumdist_mpc)
+            if not (self.lumdist_mpc > 0.0) or self.lumdist_mpc != self.lumdist_mpc:
+                raise ValueError(f"lumdist_mpc must be a finite positive distance "
+                                 f"in Mpc, got {lumdist_mpc}")
+            if "zred" in self.transforms:
+                raise ValueError("lumdist_mpc cannot be combined with a 'zred' transform")
+            if self.zred > 0.0:
+                warnings.warn(
+                    f"lumdist_mpc = {self.lumdist_mpc:g} Mpc replaces D_L(zred = "
+                    f"{self.zred:g}) = {float(csp.cosmo.luminosity_distance(self.zred)):.1f} "
+                    "Mpc in the flux factor; (1+zred) still comes from zred",
+                    stacklevel=2)
+
         names = [obs.name for obs in self.observations]
         if len(names) != len(set(names)):
             dups = [n for n in names if names.count(n) > 1]
@@ -186,15 +103,10 @@ class SedModel:
                 f"Observation names must be unique.  Duplicates found: {dups}"
             )
 
-        # Start from the CSP's full parameter set
         self.theta_init  = dict(csp.theta_init)
         self.param_names = list(csp.param_names)
         self.wave        = csp.wave
 
-        # Apply transforms bookkeeping:
-        #   1. Remove derived parameters (they are outputs of transforms, not
-        #      free parameters that the sampler proposes).
-        #   2. Add the new free parameters supplied via free_param_init.
         if self.transforms:
             _derived = set(self.transforms.keys())
             for p in _derived:
@@ -203,140 +115,497 @@ class SedModel:
                 if p in self.param_names:
                     self.param_names.remove(p)
 
-            if free_param_init is not None:
-                for p, v in free_param_init.items():
-                    arr = jnp.atleast_1d(jnp.asarray(v, dtype=float))
-                    self.theta_init[p] = arr
-                    if p not in self.param_names:
-                        self.param_names.append(p)
+        if free_param_init is not None:
+            for p, v in free_param_init.items():
+                arr = jnp.atleast_1d(jnp.asarray(v, dtype=float))
+                self.theta_init[p] = arr
+                if p not in self.param_names:
+                    self.param_names.append(p)
 
-        # Tell the CSP unknown-key guard about the model-level free parameters
-        # (e.g. logsfr_ratios consumed by the sfh transform). apply_transforms
-        # forwards the full free-parameter dict to csp.predict, so without this
-        # those keys would be mis-flagged as typos on every fit.
+        self._check_metallicity_setup(free_param_init)
+
+        unknown = sorted(set(self.priors) - set(self.param_names))
+        if unknown:
+            raise ValueError(
+                f"priors given for {unknown}, which are not sampled parameters "
+                f"(a prior on a derived or misspelled name would be silently ignored); "
+                f"the sampled parameters are {self.param_names}")
+        unpriored = [p for p in self.param_names if p not in self.priors]
+        if unpriored:
+            warnings.warn(
+                f"no prior for sampled parameter(s) {unpriored}: NUTS treats them as "
+                "improper flat, nested sampling refuses them", stacklevel=2)
+
+        self.kinematics.validate_theta(set(self.theta_init) | set(self.transforms), self.priors)
+        self._check_instrument_scales()
         if hasattr(self.csp, "register_known_theta_keys"):
             self.csp.register_known_theta_keys(
                 set(self.param_names) | set(self.priors) | set(self.transforms)
+                | set(self.kinematics.free_keys) | set(self._instrument_scale_keys())
             )
 
-        # Precompute static projection matrices for spectral observations.
-        # This must happen once, at Python level, BEFORE any JIT trace of
-        # predict().  Each observation's setup_for_model() stores a constant
-        # JAX array (_H for Spectrum, _W for Lines) that XLA constant-folds
-        # at trace time — meaning the GPU kernel contains no matrix construction,
-        # only a single GEMV.  Photometry.setup_for_model() is a no-op.
-        #
-        # ``zred`` bakes the (1+z) wavelength stretch into the projection
-        # matrices so the GEMV fast path stays the same shape for non-zero
-        # fixed redshift.  The matching cosmological flux factor is applied
-        # inside CSPBasis.predict via the ``zred`` entry that
-        # :meth:`predict` injects into the CSP theta (see below) — both
-        # things are needed for observed-frame calibration.
-        for obs in self.observations:
-            if getattr(obs, "_kind", None) in {"spectrum", "stellar_indices"}:
-                # Thread the SSP library resolution curve (schema 2.0)
-                # into the Spectrum projection so the library width is
-                # subtracted in quadrature from the instrumental
-                # smoothing automatically (inres="auto").
-                extra = {}
-                if obs._kind == "spectrum":
-                    # The hard upper limit of the sigma_smooth prior sets
-                    # the zero pad of the runtime LOSVD FFT.
-                    extra["sigma_smooth_max"] = self._prior_upper_bound(
-                        "sigma_smooth")
-                obs.setup_for_model(
-                    self.wave, zred=self.zred,
-                    lib_resolution=getattr(self.csp, "lib_resolution", None),
-                    **extra)
-            else:
-                obs.setup_for_model(self.wave, zred=self.zred)
-
-        # If the user supplied a non-trivial fixed redshift, store it so
-        # :meth:`predict` can inject it into the CSP theta at trace time.
-        #
-        # A fixed zred must NOT be seeded into ``theta_init``: theta_init
-        # is the sampled free-parameter pytree handed to the sampler
-        # (``run_sampler`` -> ``adapter.run(..., model.theta_init, ...)``),
-        # so a seeded entry silently becomes an UNPRIORED sampled
-        # dimension.  Nothing bounds it; once the sampler drifts it to
-        # z <= 0 the 10 pc fallback inside ``flux_factor_maggies`` erases
-        # the entire (10pc/D_L)^2 dimming — a factor ~2e15 in flux at
-        # z = 0.1 — without raising any error.  Injecting at predict time
-        # instead guarantees EVERY prediction path (mock generation,
-        # loglike_fn, predict_jit, predict_vmap) applies the same
-        # cosmological normalisation, while keeping zred out of the
-        # sampled parameter vector.
-        #
-        # When astropy is installed we prefer its luminosity distance for
-        # this one-off scalar computation (it includes neutrinos +
-        # radiation exactly and matches published tables to <0.1%); the
-        # backend is handed ``self.cosmo``, so a user-supplied cosmology
-        # is honoured here as well as on the native path,
-        # and bake the resulting flux factor into a static JAX scalar.
-        # The sampled path (when zred is free) continues to use the
-        # native differentiable backend, so NUTS gradients still work.
-        #
-        # GOTCHA: only inject when there is no user-supplied ``zred``
-        # transform.  If the user registered transforms={"zred": ...}
-        # they are explicitly injecting zred at predict time from a
-        # fixed external value; adding it here on top would double-route
-        # the parameter.
+        if float(self.zred) < 0.0 and self.lumdist_mpc is None and "zred" not in self.transforms:
+            raise ValueError(
+                f"SedModel(zred={float(self.zred):g}): a negative redshift has no luminosity "
+                "distance (the flux factor would put the source at 10 pc).  For a nearby, "
+                "blueshifted galaxy give its distance, SedModel(zred=..., lumdist_mpc=D), or "
+                "use its cosmological redshift")
         self._zred_fixed = None
-        self.flux_factor_astropy = None
-        if self.zred != 0.0 and "zred" not in self.transforms:
+        self._lumdist_fixed = None
+        if (self.zred != 0.0 or self.lumdist_mpc is not None) and "zred" not in self.transforms:
             self._zred_fixed = jnp.array([self.zred])
-            try:
-                from ..cosmology import (
-                    flux_factor_maggies, have_astropy,
+            if self.lumdist_mpc is not None:
+                self._lumdist_fixed = jnp.array([self.lumdist_mpc])
+
+        self.zred_is_free = ("zred" in self.param_names) or ("zred" in self.transforms)
+        grid_rescaled = (bool(getattr(csp, "track_zred_age", False))
+                         and self._zred_fixed is not None) or ("lookback_time" in self.transforms)
+        if (not self.zred_is_free and not grid_rescaled
+                and hasattr(csp, "sfh_times") and hasattr(csp, "age_at")):
+            oldest = float(csp.sfh_times[-1]) / 1e9
+            age = float(csp.age_at(self.zred))
+            if oldest > age * (1.0 + 5e-3):
+                raise ValueError(
+                    f"the oldest SFH node, {oldest:.3f} Gyr of lookback time, "
+                    f"predates the Universe at zred = {self.zred:g}: age = "
+                    f"{age:.3f} Gyr under {csp.cosmo.describe()}.  Build the "
+                    f"grid from csp.age_at(zred) (or cosmo.age(zred)), e.g. "
+                    f"lookback_time=jnp.linspace(0.0, {age:.3f}, n)"
                 )
-                if have_astropy():
-                    ff = float(flux_factor_maggies(
-                        self.zred, self.cosmo, backend="astropy"))
-                    # Stored for diagnostics; the free-z fit path ignores
-                    # this and recomputes via the native JAX backend.
-                    self.flux_factor_astropy = ff
-            except Exception:
-                # Non-fatal: fall through to the native backend.
-                self.flux_factor_astropy = None
-        # For a fixed redshift the flux factor is a constant, so the
-        # 129-node quadrature inside flux_factor_maggies must not run in
-        # the compiled hot path (~10 kernels per likelihood call).
-        # Compute it once here with the native backend through jit, so the
-        # value matches a compiled per-call evaluation, and inject it into
-        # theta in predict(). The free-z path never sees this constant.
-        self._flux_factor_fixed = None
-        if self._zred_fixed is not None:
-            import jax
 
-            from ..cosmology import flux_factor_maggies
+        if ("zred" in self.param_names and not bool(getattr(csp, "track_zred_age", False))
+                and "lookback_time" not in self.transforms and "zred" in self.priors
+                and hasattr(csp, "sfh_times") and hasattr(csp, "age_at")):
+            from ..csp.csp import prior_support
+            zlo, zhi = prior_support(self.priors["zred"])
+            if np.isfinite(zhi) and zhi > 0:
+                oldest = float(csp.sfh_times[-1]) / 1e9
+                age_hi = float(csp.age_at(float(zhi)))
+                if oldest > age_hi * (1.0 + 5e-3):
+                    age_lo = float(csp.age_at(max(float(zlo), 0.0)))
+                    where = ("at every zred the prior allows" if oldest > age_lo * (1.0 + 5e-3)
+                             else "at the high-zred end of the prior")
+                    warnings.warn(
+                        f"the oldest SFH node, {oldest:.3f} Gyr of lookback time, predates the "
+                        f"Universe {where} (age {age_hi:.3f} Gyr at zred = {zhi:g}); with "
+                        "track_zred_age=False the grid is not rescaled with the sampled "
+                        "redshift.  Use CSPBasis(track_zred_age=True) or a grid within "
+                        "csp.age_at(zred_max)", stacklevel=2)
 
-            ff_native = jax.jit(
-                lambda z: flux_factor_maggies(z, self.cosmo)
-            )(self._zred_fixed[0])
-            self._flux_factor_fixed = jnp.float32(ff_native)
+        self.setup_observations()
 
-    # ------------------------------------------------------------------
-    # Cosmology (read-only view onto the CSP)
-    # ------------------------------------------------------------------
+        if (self.zred == 0.0 and self.lumdist_mpc is None and not self.zred_is_free
+                and "zred" not in self.transforms and self.observations):
+            warnings.warn(
+                "SedModel(zred=0) applies NO flux factor: predictions are in "
+                "L_sun/Hz x 10^logmass, not maggies.  Give zred= (Hubble flow) or "
+                "lumdist_mpc= (nearby object) for physical units, or ignore this if "
+                "the data are in the same unitless convention",
+                stacklevel=2)
+
+
+    def _check_metallicity_setup(self, free_param_init):
+        """Refuse the removed absolute-metallicity keys, and check every metallicity prior /
+        fixed value against the grid (and the nebular axis when the gas is tied)."""
+        from ..csp.csp import (LOGZSOL_KEYS, REMOVED_METALLICITY_KEYS, prior_support,
+                               removed_metallicity_key_error, ABSOLUTE_LOOKING_LOGZSOL)
+        csp = self.csp
+        l0 = getattr(csp, "log10_zsun", None)
+        if l0 is None:
+            return
+        for where, d in (("priors", self.priors), ("transforms", self.transforms),
+                         ("free_param_init", free_param_init or {}),
+                         ("theta_init", self.theta_init)):
+            for old in REMOVED_METALLICITY_KEYS:
+                if old in d:
+                    v = d[old] if where in ("free_param_init", "theta_init") else None
+                    raise removed_metallicity_key_error(old, v, l0,
+                                                        getattr(csp, "axis_meaning", None),
+                                                        where=where)
+        if getattr(csp, "gas_tied", False):
+            for where, d in (("priors", self.priors), ("transforms", self.transforms),
+                             ("free_param_init", free_param_init or {})):
+                if "gas_logz" in d:
+                    raise ValueError(
+                        f"the CSP was built with gas_tied=True (gas_logz := logzsol), so "
+                        f"'gas_logz' cannot also appear in {where}; drop it, or rebuild the "
+                        "CSP with gas_tied=False to sample the gas metallicity separately.")
+        zlo, zhi = float(np.min(csp.zmet)), float(np.max(csp.zmet))
+        for name in LOGZSOL_KEYS:
+            prior = self.priors.get(name)
+            if prior is None:
+                fixed = self._transform_value(name)
+                if fixed is None:
+                    continue
+                lo = float(np.min(fixed)); hi = float(np.max(fixed))
+                if lo < zlo - 1e-12 or hi > zhi + 1e-12:
+                    raise ValueError(
+                        f"the transform for {name!r} gives {np.array2string(fixed, precision=3)}, "
+                        f"outside this grid's logzsol range [{zlo:+.3f}, {zhi:+.3f}] (Z_sun = "
+                        f"{getattr(csp, 'zsun_nominal', float('nan')):.6g}); the metallicity "
+                        "interpolation would clamp there.")
+                if hi < ABSOLUTE_LOOKING_LOGZSOL:
+                    warnings.warn(
+                        f"the transform for {name!r} gives {np.array2string(fixed, precision=3)}, "
+                        f"below logzsol = {ABSOLUTE_LOOKING_LOGZSOL} everywhere: is it an OLD "
+                        f"absolute log10 Z?  It would be logzsol = "
+                        f"{np.array2string(fixed - l0, precision=3)}.", stacklevel=3)
+                continue
+            lo, hi = prior_support(prior)
+            if np.isfinite(lo) and np.isfinite(hi) and (lo < zlo - 1e-12 or hi > zhi + 1e-12):
+                raise ValueError(
+                    f"the prior on {name!r} covers [{lo:+.3f}, {hi:+.3f}], outside this grid's "
+                    f"logzsol range [{zlo:+.3f}, {zhi:+.3f}] (Z_sun = "
+                    f"{getattr(csp, 'zsun_nominal', float('nan')):.6g}); the metallicity "
+                    "interpolation clamps there, which makes a degenerate posterior tail that "
+                    "looks like a constraint.  Narrow the prior to the grid, e.g. "
+                    f"Uniform(low={zlo:+.3f}, high={zhi:+.3f}).")
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                warnings.warn(
+                    f"the prior on {name!r} is unbounded; logzsol is clamped to the grid "
+                    f"[{zlo:+.3f}, {zhi:+.3f}] outside it.  Prefer a bounded prior "
+                    "(Uniform / TopHat / ClippedNormal).", stacklevel=3)
+            elif hi < ABSOLUTE_LOOKING_LOGZSOL:
+                warnings.warn(
+                    f"the prior on {name!r} lies entirely below logzsol = "
+                    f"{ABSOLUTE_LOOKING_LOGZSOL} ([{lo:+.3f}, {hi:+.3f}]): is it an OLD "
+                    f"absolute-log10-Z prior?  logzsol = log10(Z/Z_sun) is 0 at solar; the "
+                    f"absolute bounds [{lo:+.3f}, {hi:+.3f}] convert to "
+                    f"[{lo - l0:+.3f}, {hi - l0:+.3f}].", stacklevel=3)
+        self._check_tied_gas_range()
+        self._check_gas_range()
+        self._check_afe_range()
+        self._check_refused_alpha_cell()
+
+    def _check_tied_gas_range(self):
+        """gas_tied=True (B1-019): the gas metallicity is the stellar logzsol, and a logzsol
+        prior / fixed value reaching outside the CLOUDY gas axis freezes the lines there (the
+        stellar part is still valid, so this warns)."""
+        from ..csp.csp import LOGZSOL_KEYS, prior_support
+        neb = getattr(self.csp, "neb", None)
+        if not getattr(self.csp, "gas_tied", False) or neb is None \
+                or getattr(neb, "nebem_logz", None) is None:
+            return
+        g = np.asarray(neb.nebem_logz, dtype=float)
+        glo, ghi = float(g.min()), float(g.max())
+        for name in LOGZSOL_KEYS:
+            prior = self.priors.get(name)
+            if prior is not None:
+                lo, hi = prior_support(prior)
+            else:
+                fixed = self._transform_value(name)
+                if fixed is None:
+                    continue
+                lo, hi = float(np.min(fixed)), float(np.max(fixed))
+            if lo < glo - 1e-12 or hi > ghi + 1e-12:
+                warnings.warn(
+                    f"gas_tied=True: the gas metallicity is {name!r}, whose range "
+                    f"[{lo:+.3f}, {hi:+.3f}] leaves the CLOUDY gas axis [{glo:+.3f}, {ghi:+.3f}]; "
+                    "outside it the emission lines are frozen at the edge value (the stellar "
+                    "continuum still follows logzsol)", stacklevel=4)
+
+    def _check_gas_range(self):
+        """The logzsol rule for the nebular parameters (T2-002, T4-002): a bounded prior on
+        ``gas_logz`` / ``gas_logu`` whose support leaves the CLOUDY axis of the grid in use, or a
+        fixed value outside it, raises (the interpolation clamps there: frozen lines, a flat
+        likelihood tail that looks like a constraint); an unbounded prior warns."""
+        from ..csp.csp import prior_support
+        neb = getattr(self.csp, "neb", None)
+        if neb is None:
+            return
+        grid = getattr(neb, "line_file", None)
+        grid = "" if grid is None else f" ({getattr(grid, 'stem', grid)})"
+        for name, attrs in (("gas_logz", ("nebem_cont_logz", "nebem_line_logz")),
+                            ("gas_logu", ("nebem_cont_logu", "nebem_line_logu"))):
+            if name == "gas_logz" and getattr(self.csp, "gas_tied", False):
+                continue                     # follows logzsol (_check_tied_gas_range)
+            axes = [np.asarray(getattr(neb, a), dtype=float) for a in attrs
+                    if getattr(neb, a, None) is not None]
+            if not axes:
+                continue
+            glo = max(float(a.min()) for a in axes)
+            ghi = min(float(a.max()) for a in axes)
+            prior = self.priors.get(name)
+            if prior is not None:
+                lo, hi = prior_support(prior)
+                if not (np.isfinite(lo) and np.isfinite(hi)):
+                    warnings.warn(
+                        f"the prior on {name!r} is unbounded; the nebular emission is clamped "
+                        f"to the CLOUDY axis [{glo:+.3f}, {ghi:+.3f}]{grid} outside it.  Prefer "
+                        "a bounded prior (Uniform / TopHat / ClippedNormal).", stacklevel=4)
+                    continue
+                if lo < glo - 1e-9 or hi > ghi + 1e-9:
+                    raise ValueError(
+                        f"the prior on {name!r} covers [{lo:+.3f}, {hi:+.3f}], outside the "
+                        f"nebular grid's {name} axis [{glo:+.3f}, {ghi:+.3f}]{grid}; the CLOUDY "
+                        "interpolation clamps there, so the lines freeze at the edge and the "
+                        "posterior piles up in a flat tail that looks like a constraint.  "
+                        f"Narrow the prior to the grid, e.g. Uniform(low={glo:+.3f}, "
+                        f"high={ghi:+.3f}).")
+                continue
+            fixed = self._transform_value(name)          # a fixed value is a constant transform
+            if fixed is None:
+                continue
+            if float(np.min(fixed)) < glo - 1e-9 or float(np.max(fixed)) > ghi + 1e-9:
+                raise ValueError(
+                    f"the transform for {name!r} gives {np.array2string(fixed, precision=3)}, outside the "
+                    f"nebular grid's {name} axis [{glo:+.3f}, {ghi:+.3f}]{grid}; the CLOUDY "
+                    "interpolation would clamp to the edge.  Give a value inside the axis.")
+
+    def _check_afe_range(self):
+        """The logzsol rule for [alpha/Fe] on an alpha grid (B1-011): a bounded prior or a
+        constant transform outside the afe axis raises (the interpolation clamps there, a flat
+        likelihood tail); an unbounded prior warns."""
+        from ..csp.csp import prior_support
+        grid = getattr(self.csp, "afe_grid", None)
+        if grid is None:
+            return
+        alo, ahi = float(np.min(grid)), float(np.max(grid))
+        prior = self.priors.get("afe")
+        if prior is None:
+            fixed = self._transform_value("afe")
+            if fixed is not None and (float(np.min(fixed)) < alo - 1e-12
+                                      or float(np.max(fixed)) > ahi + 1e-12):
+                raise ValueError(
+                    f"the transform for 'afe' gives {np.array2string(fixed, precision=3)}, "
+                    f"outside this grid's [alpha/Fe] range [{alo:+.3f}, {ahi:+.3f}]; the "
+                    "interpolation would clamp there.")
+            return
+        lo, hi = prior_support(prior)
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            warnings.warn(
+                f"the prior on 'afe' is unbounded; [alpha/Fe] is clamped to the grid "
+                f"[{alo:+.3f}, {ahi:+.3f}] outside it.  Prefer a bounded prior.", stacklevel=4)
+        elif lo < alo - 1e-12 or hi > ahi + 1e-12:
+            raise ValueError(
+                f"the prior on 'afe' covers [{lo:+.3f}, {hi:+.3f}], outside this grid's "
+                f"[alpha/Fe] range [{alo:+.3f}, {ahi:+.3f}]; the interpolation clamps there, "
+                "which makes a flat posterior tail that looks like a constraint.  Narrow the "
+                f"prior to the grid, e.g. Uniform(low={alo:+.3f}, high={ahi:+.3f}).")
+
+    def _transform_value(self, name):
+        """The value a CONSTANT transform gives for ``name`` (None when there is no transform
+        for it, or when it depends on sampled parameters and cannot be evaluated here)."""
+        fn = self.transforms.get(name)
+        if fn is None:
+            return None
+        try:
+            v = np.atleast_1d(np.asarray(fn(dict(self.theta_init)), dtype=float))
+        except Exception:
+            return None
+        return v if v.size and np.all(np.isfinite(v)) else None
+
+    def _check_refused_alpha_cell(self):
+        """Raise when the logzsol and afe priors both reach into a refused interpolation cell."""
+        from ..csp.csp import prior_support
+        csp = self.csp
+        cells = getattr(csp, "refused_cells_logzsol", None)
+        if cells is None:
+            return
+        cells = cells()
+        if not cells:
+            return
+        zname = "logzsol" if getattr(csp, "zh_const", True) else "logzsol_hist"
+        def _hi(name):
+            if name in self.priors:
+                return prior_support(self.priors[name])[1]
+            fixed = self._transform_value(name)          # a transform-derived value counts too
+            if fixed is not None:
+                return float(np.max(fixed))
+            v = self.theta_init.get(name)
+            return float(np.max(np.asarray(v))) if v is not None else None
+        z_hi, a_hi = _hi(zname), _hi("afe")
+        if zname in self.transforms and self._transform_value(zname) is None:
+            warnings.warn(
+                f"the transform for {zname!r} depends on sampled parameters, so the refused "
+                "[Fe/H] x [alpha/Fe] cell cannot be checked at construction; check it yourself "
+                "with csp.refused_cells_logzsol().", stacklevel=3)
+        if "afe" in self.transforms and self._transform_value("afe") is None:
+            warnings.warn(
+                "the transform for 'afe' depends on sampled parameters, so the refused "
+                "[Fe/H] x [alpha/Fe] cell cannot be checked at construction; check it yourself "
+                "with csp.refused_cells_logzsol().", stacklevel=3)
+        if z_hi is None or a_hi is None:
+            return
+        for z_lo, z_up, a_lo, a_up, reason in cells:
+            if z_hi > z_lo and a_hi > a_lo:
+                raise ValueError(
+                    f"the {zname} and afe ranges (up to {z_hi:+.3f} and {a_hi:+.2f}) both reach "
+                    f"into the refused interpolation cell logzsol in ({z_lo:+.3f}, {z_up:+.3f}] "
+                    f"x afe in ({a_lo:+.2f}, {a_up:+.2f}]: {reason}.  Cap one of them "
+                    f"(logzsol <= {z_lo!r} or afe <= {a_lo!r}).")
 
     @property
     def cosmo(self):
-        """The cosmology used by the forward model.
+        """The CSP's cosmology (read-only)."""
+        return self.csp.cosmo
 
-        Read-only, and forwarded to ``self.csp.cosmo`` on every access:
-        the CSP is the single source of truth, so this can never report a
-        cosmology different from the one actually applied to the flux
-        factor and the SFH age grid.  To change it, construct the CSP with
-        ``cosmo=`` (or assign ``model.csp.cosmo`` before the first
-        ``predict``).  Falls back to the package default if the wrapped
-        object predates the ``cosmo`` attribute.
-        """
-        from ..cosmology import resolve_cosmology
-        return resolve_cosmology(getattr(self.csp, "cosmo", None))
+    def _check_calibration_names(self):
+        """spectrum_scaling / spectrum_calib: the plain name only with a single
+        Spectrum, ``<name>_<obs.name>`` for each of several; ambiguous, doubled or unmatched
+        names raise (they would be applied to every spectrum, or sampled and never used)."""
+        from .obs_params import CALIB_FAMILIES, check_names
+        given = set(self.param_names) | set(self.transforms)
+        if any(f.claims(n) for f in CALIB_FAMILIES for n in given):
+            check_names(self.observations, CALIB_FAMILIES, given,
+                        what=" (spectrum calibration)")
+        # keys the CSP configuration makes inert (B1-021): sampled, they would do nothing
+        csp = self.csp
+        if "igm_factor" in self.param_names and hasattr(csp, "igm") and csp.igm is None:
+            raise ValueError(
+                "'igm_factor' is sampled but the CSP has no IGM model (add_igm=False), so it "
+                "would be sampled without being used.  Drop it, or build the CSP with add_igm=True")
+        if ("frac_obrun" in self.param_names and getattr(csp, "neb", None) is None
+                and hasattr(csp, "flux") and not hasattr(csp, "attenuate_dust")):
+            raise ValueError(
+                "'frac_obrun' is sampled but the CSP has neither a nebular model nor dust "
+                "attenuation, so it would be sampled without being used.  Drop it, or build the "
+                "CSP with add_neb=True or dust")
+        # eline_scaling multiplies only the Lines prediction (csp.py predict_line_fluxes); with
+        # observations but none of them Lines it would be sampled and never used (B1-014)
+        if ("eline_scaling" in self.param_names and self.observations
+                and not any(getattr(o, "kind", None) == "lines" for o in self.observations)):
+            raise ValueError(
+                "'eline_scaling' is sampled but no observation is a Lines: it scales only the "
+                "Lines prediction (not a Spectrum or Photometry), so it would be sampled "
+                "without being used.  Drop it, or use spectrum_scaling for a spectrum's level")
 
-    # ------------------------------------------------------------------
-    # Transforms
-    # ------------------------------------------------------------------
+    def setup_observations(self):
+        """Build every observation's projection for this model's grid, redshift and
+        kinematics (called by ``__init__`` and by ``fitSED`` when it replaces the
+        observations); drops the cached jitted predictors."""
+        names = [o.name for o in self.observations]
+        if len(set(names)) != len(names):
+            raise ValueError(f"observation names must be unique, got {names}")
+        self._check_calibration_names()
+        neb = getattr(self.csp, "neb", None)
+        lib = getattr(self.csp, "lib_resolution", None)
+        for obs in self.observations:
+            kind = getattr(obs, "_kind", None)
+            if kind == "spectrum":
+                zr = self._spectrum_zred_range(obs) if self.zred_is_free else None
+                lines_rest = None if neb is None else neb.nebem_line_pos
+                if neb is None and getattr(obs, "marginalize_elines", False):
+                    # no nebular grid: the marginalised lines come from FSPS's line list
+                    from ..likelihood.eline_marginal import line_table_for, refuse_without_grid
+                    refuse_without_grid(self.csp, obs, self.observations)
+                    lines_rest = line_table_for(self.csp)["wave"]
+                kw = {}
+                if self._prior_scale_range(obs) is not None:
+                    kw["inst_scale_range"] = self._prior_scale_range(obs)
+                obs.setup_for_model(
+                    self.wave, zred=(self._spectrum_zred_ref(zr) if zr else self.zred),
+                    kinematics=self.kinematics, lib_resolution=lib,
+                    line_wave_rest=lines_rest,
+                    zred_range=zr, **kw)
+            elif kind == "photometry":
+                obs.setup_for_model(self.wave, zred=self.zred)
+                obs.free_z = bool(self.zred_is_free)
+                obs.setup_broadening(
+                    self.wave, self.zred,
+                    self.kinematics if self.broaden_photometry else None,
+                    free_z=bool(getattr(obs, "free_z", False)), neb=neb)
+            else:
+                obs.setup_for_model(self.wave, zred=self.zred)
+        for cached in ("_predict_jit_fn", "_predict_vmap_fn"):
+            self.__dict__.pop(cached, None)
+        from ..likelihood.eline_marginal import build_eline_system
+        self._eline_system = build_eline_system(self)
+
+
+    def _instrument_scale_keys(self) -> tuple:
+        """Theta keys of the sampled LSF scales of this model's Spectrum instruments."""
+        keys = []
+        for o in self.observations:
+            ins = getattr(o, "instrument", None)
+            if getattr(o, "_kind", None) == "spectrum" and ins is not None:
+                keys += list(getattr(ins, "free_keys", ()))
+        return tuple(dict.fromkeys(keys))
+
+    def _prior_scale_range(self, obs):
+        """(lo, hi) finite bounds of the prior on a Spectrum instrument's sampled scale key,
+        or None (fixed scale, no prior, or an unbounded one)."""
+        ins = getattr(obs, "instrument", None)
+        if ins is None or not isinstance(getattr(ins, "scale", 1.0), str):
+            return None
+        pr = self.priors.get(ins.scale)
+        b = getattr(pr, "bounds", None)
+        b = b() if callable(b) else b
+        if b is None:
+            return None
+        lo = float(np.min(np.asarray(b[0], dtype=float)))
+        hi = float(np.max(np.asarray(b[1], dtype=float)))
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return None
+        return (lo, hi)
+
+    def _check_instrument_scales(self):
+        """A sampled Instrument scale (``Instrument(..., scale="<key>")``) is in theta, and the
+        range its compiled kernel must support is known and positive: the finite bounds of its
+        prior, inside the Instrument's own ``scale_range`` when it has one."""
+        from ..broadening import check_scale_range
+        known = set(self.theta_init) | set(self.transforms)
+        for o in self.observations:
+            ins = getattr(o, "instrument", None)
+            if getattr(o, "_kind", None) != "spectrum" or ins is None:
+                continue
+            k = getattr(ins, "scale", 1.0)
+            if not isinstance(k, str):
+                continue
+            if k not in known:
+                raise KeyError(
+                    f"Spectrum {o.name!r}: its Instrument samples the LSF scale as theta['{k}'], "
+                    f"which is not a parameter; add it (free_param_init={{'{k}': 1.0}} and a "
+                    "bounded prior) or give a float to fix it")
+            rng = self._prior_scale_range(o)
+            if rng is not None:
+                rng = check_scale_range(rng, f"prior on '{k}'")
+                own = ins.scale_range
+                if own is not None and (rng[0] < own[0] or rng[1] > own[1]):
+                    raise ValueError(
+                        f"prior on '{k}' spans [{rng[0]:g}, {rng[1]:g}], beyond the Instrument's "
+                        f"scale_range [{own[0]:g}, {own[1]:g}] that the kernel is built for; "
+                        "widen scale_range or narrow the prior")
+            elif ins.scale_range is None:
+                why = ("its prior is unbounded" if k in self.priors
+                       else "it is derived by a transform" if k in self.transforms
+                       else "it has no prior")
+                raise ValueError(
+                    f"Spectrum {o.name!r}: the LSF scale theta['{k}'] needs a finite range for "
+                    f"the compiled kernel, but {why}; give it a bounded prior (Uniform / "
+                    "ClippedNormal, lower bound > 0) or pass Instrument(..., "
+                    "scale_range=(lo, hi))")
+
+    def _spectrum_zred_range(self, obs) -> tuple:
+        """(z_min, z_max) a Spectrum's projector must cover when zred is sampled: the
+        observation's ``zred_range``, else the finite bounds of the zred prior."""
+        zr = getattr(obs, "zred_range", None)
+        if zr is None and "zred" in self.priors:
+            b = getattr(self.priors["zred"], "bounds", None)
+            b = b() if callable(b) else b
+            if b is not None:
+                lo, hi = float(np.asarray(b[0]).ravel()[0]), float(np.asarray(b[1]).ravel()[0])
+                if np.isfinite(lo) and np.isfinite(hi):
+                    zr = (lo, hi)
+        if zr is None:
+            raise ValueError(
+                f"Spectrum {obs.name!r} with a sampled zred needs the redshift interval its "
+                "projector must cover: give priors['zred'] a bounded prior (Uniform / "
+                "ClippedNormal) or pass Spectrum(zred_range=(z_min, z_max))")
+        lo, hi = float(zr[0]), float(zr[1])
+        if not (-1.0 < lo < hi):
+            raise ValueError(f"zred_range must satisfy -1 < z_min < z_max, got {zr}")
+        return (lo, hi)
+
+    def _spectrum_zred_ref(self, zr) -> float:
+        """Reference redshift of a free-z projector: the zred start value when it lies
+        inside the range, else the midpoint in ln(1 + z)."""
+        z0 = self.theta_init.get("zred")
+        if z0 is not None:
+            z0 = float(np.ravel(np.asarray(z0))[0])
+            if zr[0] <= z0 <= zr[1]:
+                return z0
+        return float(np.exp(0.5 * (np.log1p(zr[0]) + np.log1p(zr[1]))) - 1.0)
 
     def _prior_upper_bound(self, name):
         """Finite hard upper limit of the prior on a sampled parameter, else None."""
@@ -349,29 +618,7 @@ class SedModel:
         return high if high < float("inf") else None
 
     def apply_transforms(self, free_theta: dict[str, Array]) -> dict[str, Array]:
-        """
-        Apply all registered transforms to produce a CSP-compatible model_theta.
-
-        Starts from a shallow copy of ``free_theta`` and computes each
-        derived parameter by calling the corresponding transform callable::
-
-            model_theta[derived] = transform_fn(free_theta)
-
-        The free-parameter keys (e.g. ``"logsfr_ratios"``) are kept in
-        ``model_theta`` alongside the derived ones; the CSP simply ignores
-        any keys it does not recognise.
-
-        Parameters
-        ----------
-        free_theta : dict[str, Array]
-            Free-parameter dict as used by the sampler.
-
-        Returns
-        -------
-        model_theta : dict[str, Array]
-            Extended dict suitable for ``csp.predict``.  Contains all
-            entries of ``free_theta`` plus the derived parameter values.
-        """
+        """Return ``free_theta`` plus every derived parameter ``fn(free_theta)``."""
         if not self.transforms:
             return free_theta
         model_theta = dict(free_theta)
@@ -379,90 +626,45 @@ class SedModel:
             model_theta[derived_param] = fn(free_theta)
         return model_theta
 
-    # ------------------------------------------------------------------
-    # Prediction
-    # ------------------------------------------------------------------
 
     def predict(self, theta: dict[str, Array]) -> dict[str, Array]:
-        """
-        Project the CSP model spectrum onto all observations.
-
-        If transforms are registered, ``theta`` is treated as the
-        *free*-parameter dict; ``apply_transforms`` is called first to
-        obtain the CSP-compatible model_theta before forwarding to
-        ``csp.predict``.
-
-        Internally calls ``csp.predict(model_theta, observations)`` which
-        computes the spectrum once and projects it onto each observation:
-
-        - ``Photometry`` → synthetic AB maggies via filter convolution
-        - ``Spectrum``   → model F_ν interpolated onto observed wavelength grid
-        - ``Lines``      → integrated nebular line fluxes
-        - ``StellarIndices`` → integrated stellar absorption indices
-
-        **Mass scaling** — if ``"logmass"`` is present in ``theta``, the
-        spectrum is multiplied by ``10 ** logmass`` inside ``csp.predict()``
-        *before* projection.  The ``logsfr_ratios_to_sfh`` transform
-        normalises the SFH so that the trapezoidal integral of SFR over
-        the lookback grid equals 1 M⊙ (Prospector / FSPS convention), so
-        this factor sets the physical amplitude for a galaxy with stellar
-        mass ``M = 10^logmass`` M⊙.  Scaling once before projection is
-        more efficient than scaling each observation separately.
-
-        Parameters
-        ----------
-        theta : dict[str, Array]
-            Free-parameter dict (before any transforms).  May optionally
-            include ``"logmass"`` (shape ``(1,)``).
-
-        Returns
-        -------
-        dict[str, Array]
-            Keyed by ``obs.name`` for each observation in ``self.observations``.
-        """
+        """Predictions keyed by observation name from the free-parameter dict.
+        A fixed zred/lumdist_mpc is injected into the CSP theta here; without a
+        'zred' the CSP applies no flux factor and the outputs are not maggies."""
         model_theta = self.apply_transforms(theta)
-        # Fixed-redshift injection: guarantee the cosmological flux factor
-        # (1+z) * (10pc/D_L)^2 is applied inside csp.predict for EVERY
-        # caller (mock generation, loglike_fn, predict_jit, predict_vmap).
-        # Without this, a theta lacking "zred" silently skips the entire
-        # distance normalisation and the returned "maggies" are the raw
-        # 10 pc-frame numbers (~6e21 too bright at z = 0.1).  The dict-key
-        # check is Python-static, and ``self._zred_fixed`` is a concrete
-        # closure constant, so this folds out at JIT trace time — zero
-        # cost in the compiled hot path.  A caller-supplied (e.g. sampled)
-        # ``zred`` always wins over the fixed value.
         if self._zred_fixed is not None and "zred" not in model_theta:
-            if model_theta is theta:          # apply_transforms may not copy
+            if model_theta is theta:
                 model_theta = dict(model_theta)
             model_theta["zred"] = self._zred_fixed
-            if self._flux_factor_fixed is not None:
-                # Constant flux factor for the fixed redshift; the CSP
-                # skips the per-call quadrature when this key is present.
-                model_theta["flux_factor"] = self._flux_factor_fixed
-        # Mass scaling is handled inside csp.predict() — the spectrum is
-        # scaled once before projection, rather than per-observation.
-        return self.csp.predict(model_theta, self.observations)
+        if self._lumdist_fixed is not None and "lumdist_mpc" not in model_theta:
+            if model_theta is theta:
+                model_theta = dict(model_theta)
+            model_theta["lumdist_mpc"] = self._lumdist_fixed
+        return self.csp.predict(model_theta, self.observations,
+                                kinematics=self.kinematics,
+                                broaden_photometry=self.broaden_photometry)
 
-    # ------------------------------------------------------------------
-    # JIT-compiled prediction (for interactive / PPC use)
-    # ------------------------------------------------------------------
+    def predict_with_elines(self, theta: dict[str, Array]):
+        """``(predictions, aux)`` for the emission-line marginalisation: the predictions with
+        the fitted lines removed, and ``aux = {"prior_mean", "cols"}`` (their CLOUDY fluxes and
+        the per-observation design columns).  Needs a Spectrum with marginalize_elines=True."""
+        if getattr(self, "_eline_system", None) is None:
+            raise ValueError("no Spectrum of this model has marginalize_elines=True")
+        model_theta = self.apply_transforms(theta)
+        if self._zred_fixed is not None and "zred" not in model_theta:
+            model_theta = dict(model_theta)
+            model_theta["zred"] = self._zred_fixed
+        if self._lumdist_fixed is not None and "lumdist_mpc" not in model_theta:
+            model_theta = dict(model_theta)
+            model_theta["lumdist_mpc"] = self._lumdist_fixed
+        return self.csp.predict(model_theta, self.observations,
+                                kinematics=self.kinematics,
+                                broaden_photometry=self.broaden_photometry,
+                                eline_system=self._eline_system)
+
 
     def predict_jit(self, theta: dict[str, Array]) -> dict[str, Array]:
-        """
-        JIT-compiled version of :meth:`predict`.
-
-        Identical semantics, but the first call triggers XLA compilation
-        and subsequent calls with the same dict structure hit the compiled
-        cache.  Use this for interactive evaluation (sanity checks,
-        posterior predictive checks) outside the sampler hot path, where
-        ``run_sampler`` already wraps the full log-posterior in ``@jax.jit``.
-
-        For vectorised evaluation over many parameter draws, prefer
-        :meth:`predict_vmap`.
-        """
-        # Built once on first access via cached_property (avoids tracing at
-        # __init__ time, before observations are set up) and cached on the
-        # instance thereafter.
+        """JIT-compiled :meth:`predict` (compiled on first call)."""
         return self._predict_jit_fn(theta)
 
     @cached_property
@@ -473,48 +675,16 @@ class SedModel:
         self,
         theta_batch: dict[str, Array],
     ) -> dict[str, Array]:
-        """
-        Vectorised prediction over a batch of parameter dicts.
-
-        Parameters
-        ----------
-        theta_batch : dict[str, Array]
-            Each value has a leading batch dimension, e.g.
-            ``{"logsfr_ratios": (N, 4), "Z": (N, 1), "logmass": (N, 1)}``.
-
-        Returns
-        -------
-        dict[str, Array]
-            Each value has a leading batch dimension, e.g.
-            ``{"optical_spec": (N, n_pix)}``.
-        """
+        """Vectorised :meth:`predict` over a leading batch axis of every theta entry."""
         return self._predict_vmap_fn(theta_batch)
 
     @cached_property
     def _predict_vmap_fn(self) -> Callable[[dict[str, Array]], dict[str, Array]]:
         return jax.jit(jax.vmap(self.predict))
 
-    # ------------------------------------------------------------------
-    # Prior
-    # ------------------------------------------------------------------
 
     def ln_prior(self, theta: dict[str, Array]) -> Array:
-        """
-        Evaluate the log-prior for all registered free parameters.
-
-        For each parameter ``p`` in ``self.priors``, computes
-        ``sum(prior.logpdf(theta[p]))`` (the ``sum`` handles vector-valued
-        parameters such as a non-parametric SFH) and accumulates the total.
-        Parameters absent from ``self.priors`` contribute 0 (flat prior).
-
-        Parameters
-        ----------
-        theta : dict[str, Array]
-
-        Returns
-        -------
-        lnp : Array, scalar
-        """
+        """Scalar sum of ``prior.logpdf(theta[p])`` over registered priors."""
         lnp = jnp.zeros(())
         for param_name, prior in self.priors.items():
             if param_name in theta:
@@ -522,37 +692,13 @@ class SedModel:
         return lnp
 
     def log_prob(self, theta: dict[str, Array]) -> Array:
-        """
-        Alias for ``ln_prior``.
-
-        Required by ``DiagonalGaussianLikelihood.make_lnprobfn`` and
-        ``MultiObservationLikelihood.make_lnprobfn``, which call
-        ``prior.log_prob(theta)``.
-
-        Parameters
-        ----------
-        theta : dict[str, Array]
-
-        Returns
-        -------
-        Array, scalar
-        """
+        """Alias for ``ln_prior``."""
         return self.ln_prior(theta)
 
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
 
     @property
     def obs_dict(self) -> dict[str, Observation]:
-        """
-        Observations as a dict keyed by ``obs.name``.
-
-        Pass this to ``MultiObservationLikelihood.make_lnprobfn`` as the
-        ``observations`` argument::
-
-            lnprobfn = multi_lhood.make_lnprobfn(model.obs_dict, model, model)
-        """
+        """Observations keyed by ``obs.name``."""
         return {obs.name: obs for obs in self.observations}
 
     @property
@@ -561,19 +707,16 @@ class SedModel:
         return len(self.observations)
 
     def summary(self) -> str:
-        """
-        Return a multi-line human-readable summary of the model configuration.
-
-        Covers: registered free parameters (with shapes and prior types),
-        active transforms (free → derived param mappings), all observation
-        objects, and the CSP physics switch configuration.
-        """
+        """Multi-line summary of parameters, transforms, observations and CSP setup."""
         lines = [
             "SedModel",
             "=" * 50,
             f"CSP spectrum model : {self.csp.get_spectrum.__name__}",
             f"Wavelength range   : {float(self.wave.min()):.0f} – "
                                    f"{float(self.wave.max()):.0f} Å",
+            f"Cosmology          : {self.cosmo.describe()}",
+            f"Redshift           : {self._redshift_line()}",
+            f"Kinematics         : {self._kinematics_line()}",
             "",
             "Free Parameters",
             "-" * 40,
@@ -598,21 +741,51 @@ class SedModel:
                 "-" * 40,
                 "  logmass ∈ free params → predicted flux × 10^logmass",
                 "  (SFH transform `logsfr_ratios_to_sfh` enforces "
-                "∫SFR dt = 1 M⊙;",
-                "   logmass therefore equals log10 of the total formed "
-                "stellar mass.)",
-                "  Convention matches Prospector / FSPS.",
+                "∫SFR dt = 1 M⊙ on the construction grid;",
+                "   the CSP keeps that mass on a track_zred_age grid, so logmass",
+                "   equals log10 of the total formed stellar mass at any redshift.)",
             ]
 
         lines += ["", "Observations", "-" * 40]
         for obs in self.observations:
             lines.append(f"  {obs!r}")
+        es = getattr(self, "_eline_system", None)
+        if es is not None:
+            lines += ["", "Emission lines", "-" * 40, f"  {es.describe()}"]
 
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Graphical model visualisation
-    # ------------------------------------------------------------------
+    def _kinematics_line(self) -> str:
+        """One line for summary() and the fit log: the galaxy widths in force."""
+        k = self.kinematics
+        def _w(v):
+            return f"theta[{v!r}]" if isinstance(v, str) else f"{float(v):g} km/s"
+        gas = "= sigma_gal" if k.sigma_gas is TIED else _w(k.sigma_gas)
+        return (f"sigma_gal {_w(k.sigma_gal)}, sigma_gas {gas}, sigma_max {k.sigma_max:g} km/s; "
+                f"photometry {'broadened' if self.broaden_photometry else 'not broadened'}")
+
+    def _redshift_line(self) -> str:
+        """One line for summary() and the fit log: how the distance is set."""
+        if self.zred_is_free:
+            projs = [o._proj for o in self.observations
+                     if getattr(o, "_kind", None) == "spectrum" and getattr(o, "_proj", None) is not None]
+            rng = (", ".join(f"spectrum projector for z in [{p.zred_range[0]:g}, {p.zred_range[1]:g}] "
+                             f"(reference {p.opz_ref - 1:g})" for p in projs)
+                   if projs else "photometry projected per sample")
+            return (f"zred sampled (flux factor and, with track_zred_age, the SFH grid "
+                    f"follow it; {rng})"
+                    + (f"; luminosity distance fixed at {self.lumdist_mpc:g} Mpc"
+                       if self.lumdist_mpc is not None else ""))
+        if self.lumdist_mpc is not None:
+            return (f"zred = {self.zred:g} fixed, luminosity distance = "
+                    f"{self.lumdist_mpc:g} Mpc (explicit)")
+        if self.zred == 0.0:
+            return ("zred = 0: no flux factor, predictions in L_sun/Hz x 10^logmass "
+                    "(give lumdist_mpc= for a nearby object in physical units)")
+        return (f"zred = {self.zred:g} fixed, D_L = "
+                f"{float(self.cosmo.luminosity_distance(self.zred)):.1f} Mpc, "
+                f"age = {float(self.cosmo.age(self.zred)):.3f} Gyr")
+
 
     def display(
         self,
@@ -620,60 +793,19 @@ class SedModel:
         figsize: tuple[float, float] | None = None,
         return_fig: bool = False,
     ):
-        """
-        Draw a publication-quality probabilistic graphical model (PGM) diagram.
-
-        The diagram follows standard PGM conventions:
-
-        - Open circles       — stochastic latent variables (free parameters θᵢ)
-        - Stacked circles    — vector-valued parameters (e.g. SFH weight vector)
-        - Double-bordered rectangle — deterministic SED computation f_ν(λ)
-        - Coloured rectangles — observation projection operators
-        - Filled circles     — observed data (shaded = conditioned upon)
-        - Dashed arrows      — prior ↦ parameter dependency (ε ≡ stochastic edge)
-        - Solid arrows       — deterministic dependency (θ → f_SED → ŷ → y)
-
-        The figure adapts dynamically to however many parameters and
-        observations are registered, making it immediately suitable for
-        inclusion in a paper.
-
-        Parameters
-        ----------
-        ax : matplotlib.axes.Axes, optional
-            Axes to draw into.  If *None* a new figure is created.
-        figsize : (float, float), optional
-            Figure size in inches ``(width, height)``.  Defaults scale
-            automatically with the number of free parameters.
-        return_fig : bool, optional
-            If *True* return ``(fig, ax)``; otherwise call ``plt.show()``
-            and return *None*.
-
-        Returns
-        -------
-        (fig, ax) or None
-            Only returned when ``return_fig=True``.
-
-        Examples
-        --------
-        >>> model.display(return_fig=True)[0].savefig("pgm.pdf", dpi=300)
-        """
+        """Draw the model as a PGM diagram; returns ``(fig, ax)`` when ``return_fig``."""
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
         from matplotlib.patches import FancyBboxPatch
-        import numpy as np
 
-        # ── colour palette ─────────────────────────────────────────────────
         C = dict(
             bg        = "#FFFFFF",
-            # parameter nodes
             param_fc  = "#FFFFFF",
             param_ec  = "#222222",
             vec_fc    = "#EEF3FF",
             vec_ec    = "#556BBB",
-            # SED deterministic node
             sed_fc    = "#E6F2FB",
             sed_ec    = "#1A6098",
-            # observation type nodes
             phot_fc   = "#FFF4E6",  phot_ec = "#C95800",
             spec_fc   = "#EDFAED",  spec_ec = "#276929",
             line_fc   = "#F5EEFF",  line_ec = "#6A22A8",
@@ -682,14 +814,12 @@ class SedModel:
             data_fc   = "#37474F",
             data_ec   = "#1A252B",
             data_tc   = "#FFFFFF",
-            # arrows
             arr_prior = "#BBBBBB",
             arr_fwd   = "#555555",
             arr_obs   = "#777777",
         )
 
         def _obs_colors(obs):
-            # Prefer isinstance (handles subclasses); fall back to class name.
             try:
                 if isinstance(obs, Photometry):
                     return (C["phot_fc"], C["phot_ec"])
@@ -708,18 +838,18 @@ class SedModel:
                 "StellarIndices": (C["index_fc"], C["index_ec"]),
             }.get(type(obs).__name__, (C["param_fc"], C["param_ec"]))
 
-        # ── label helpers ──────────────────────────────────────────────────
         _LATEX = {
             "sfh":         r"$\mathbf{w}_\mathrm{SFH}$",
-            "logzsol":     r"$\log Z_\star/Z_\odot$",
-            "Z":           r"$Z$",
+            "logzsol":     r"$\log(Z_\star/Z_\odot)$",
+            "logzsol_hist": r"$\log(Z_\star/Z_\odot)(t)$",
+            "logzsol_total": r"$[Z/\mathrm{H}]$",
             "zred":        r"$z$",
             "tau_dust":    r"$\hat{\tau}$",
             "tau_1":       r"$\hat{\tau}_1$",
             "tau_2":       r"$\hat{\tau}_2$",
             "dust_index":  r"$\delta_\mathrm{dust}$",
             "dust_ratio":  r"$f_\mathrm{dust}$",
-            "gas_logz":    r"$\log Z_\mathrm{neb}$",
+            "gas_logz":    r"$\log(Z_\mathrm{gas}/Z_\odot)$",
             "gas_logu":    r"$\log U$",
             "sigma_v":     r"$\sigma_v$",
             "f_agn":       r"$f_\mathrm{AGN}$",
@@ -760,6 +890,9 @@ class SedModel:
                     return rf"$\mathcal{{N}}_c({mu:.3g},\,{sg:.3g})$"
                 if cls == "LogNormal":
                     return r"$\mathrm{LogNorm}$"
+                if cls == "LogUniform":
+                    lo = float(p["mini"]);  hi = float(p["maxi"])
+                    return rf"$\log\mathcal{{U}}({lo:.3g},\,{hi:.3g})$"
                 if cls == "StudentT":
                     return r"$\mathrm{Student}\text{-}t$"
                 if "Multivariate" in cls:
@@ -811,17 +944,14 @@ class SedModel:
                 pass
             return r"$\hat{y}$"
 
-        # ── transform colour ───────────────────────────────────────────────
-        C["tr_fc"] = "#FFF8E1"   # warm amber fill
-        C["tr_ec"] = "#E65100"   # deep orange border
-        C["arr_tr"] = "#E65100"  # transform arrows
+        C["tr_fc"] = "#FFF8E1"
+        C["tr_ec"] = "#E65100"
+        C["arr_tr"] = "#E65100"
 
-        # ── figure geometry ────────────────────────────────────────────────
         n_p = len(self.param_names)
         n_o = len(self.observations)
         has_transforms = bool(self.transforms)
 
-        # 1 data-unit ≡ 1 inch when aspect='equal'
         fw = max(9.0, n_p * 1.10 + 2.0)
         fh = 8.2 if has_transforms else 7.4
         if figsize is not None:
@@ -841,25 +971,22 @@ class SedModel:
         ax.set_aspect("equal", adjustable="box")
         ax.axis("off")
 
-        # y levels — shift everything up by 0.8 when transforms are present
         _tr_shift = 0.8 if has_transforms else 0.0
         y_prior = fh - 0.80
         y_param = fh - 2.05
-        y_trans = y_param - 1.15   # transform node row (only used when transforms exist)
+        y_trans = y_param - 1.15
         y_sed   = fh / 2.0 + 0.10 + (_tr_shift / 2)
         y_obs   = 1.90
         y_data  = 0.62
 
-        r_p  = 0.34   # scalar-param radius
-        r_v  = 0.36   # vector-param radius
-        r_d  = 0.30   # data-node radius
+        r_p  = 0.34
+        r_v  = 0.36
+        r_d  = 0.30
 
-        # x positions of parameters (spread across 85% of figure width)
         x0, x1 = fw * 0.07, fw * 0.93
         x_p = ([fw / 2] if n_p == 1
                 else list(np.linspace(x0, x1, n_p)))
 
-        # x positions of observation nodes
         ox0, ox1 = fw * 0.15, fw * 0.85
         x_o = ([fw / 2]           if n_o == 1
                else [fw*0.33, fw*0.67] if n_o == 2
@@ -867,7 +994,6 @@ class SedModel:
 
         x_sed = fw / 2.0
 
-        # ── drawing primitives ─────────────────────────────────────────────
         def circle(x, y, r, fc, ec, lw=1.3, zorder=3, ls="-", alpha=1.0):
             ax.add_patch(mpatches.Circle(
                 (x, y), r, facecolor=fc, edgecolor=ec,
@@ -901,32 +1027,27 @@ class SedModel:
                     fontweight=weight, fontstyle=style,
                     zorder=zorder, **kw)
 
-        # ── 1 ·  prior labels ──────────────────────────────────────────────
         for i, pname in enumerate(self.param_names):
             xp    = x_p[i]
             prior = self.priors.get(pname)
             plbl  = _prior_label(prior)
             txt(xp, y_prior, plbl, fs=7.5, color="#444444",
                 style="italic" if prior is None else "normal")
-            # dashed stochastic edge: prior distribution → parameter
             arrow(xp, y_prior - 0.16,
                   xp, y_param + (r_v if _is_vector(pname) else r_p) + 0.05,
                   C["arr_prior"], lw=0.75, ls="dashed")
 
-        # ── 2 ·  parameter nodes ───────────────────────────────────────────
         for i, pname in enumerate(self.param_names):
             xp  = x_p[i]
             vec = _is_vector(pname)
 
             if vec:
-                # stacked-card visual: two offset circles
                 circle(xp + 0.06, y_param - 0.06, r_v,
                        fc=C["vec_fc"], ec=C["vec_ec"],
                        lw=0.7, zorder=3, alpha=0.7)
                 circle(xp, y_param, r_v,
                        fc=C["vec_fc"], ec=C["vec_ec"],
                        lw=1.3, zorder=4)
-                # dimension annotation
                 ds = _shape_str(pname)
                 if ds:
                     txt(xp + r_v + 0.07, y_param + r_v - 0.08,
@@ -936,12 +1057,10 @@ class SedModel:
                 circle(xp, y_param, r_p,
                        fc=C["param_fc"], ec=C["param_ec"], lw=1.3)
 
-            # parameter symbol inside circle
             lbl = _param_label(pname)
             txt(xp, y_param, lbl, fs=8.5 if not vec else 8.0,
                 weight="bold", color="#111111")
 
-        # ── 2b ·  transform nodes (deterministic diamonds) ────────────────
         if has_transforms:
             n_tr    = len(self.transforms)
             tr_x0   = fw * 0.15
@@ -954,7 +1073,6 @@ class SedModel:
                 xt  = x_tr[j]
                 fn_name = getattr(fn, "__name__", "fn")
 
-                # Diamond shape approximated via rotated rectangle (FancyBboxPatch)
                 ax.add_patch(FancyBboxPatch(
                     (xt - tr_w / 2, y_trans - tr_h / 2), tr_w, tr_h,
                     boxstyle="round,pad=0,rounding_size=0.08",
@@ -968,8 +1086,6 @@ class SedModel:
                     rf"$\rightarrow$ {derived_name}",
                     fs=6.5, color="#555555", style="italic")
 
-                # Arrows: all free params that feed into this transform → transform node
-                # (draw from all free params since we don't know which ones each fn uses)
                 for i, pname in enumerate(self.param_names):
                     xp  = x_p[i]
                     vec = _is_vector(pname)
@@ -978,19 +1094,15 @@ class SedModel:
                           xt,  y_trans + tr_h / 2 + 0.05,
                           C["arr_tr"], lw=0.7, ls="dashed")
 
-                # Arrow: transform node → SED node
                 arrow(xt, y_trans - tr_h / 2 - 0.04,
                       x_sed, y_sed + (max(3.8, min(fw * 0.42, n_p * 0.88))) / 2 * 0.0 + 0.42,
                       C["tr_ec"], lw=1.0)
 
-        # ── 3 ·  SED computation node ──────────────────────────────────────
         sed_w = max(3.8, min(fw * 0.42, n_p * 0.88))
         sed_h = 0.84
 
-        # outer box
         rect(x_sed, y_sed, sed_w, sed_h,
              C["sed_fc"], C["sed_ec"], lw=2.2)
-        # inner double-border (convention for deterministic node)
         rect(x_sed, y_sed, sed_w - 0.13, sed_h - 0.13,
              "none", C["sed_ec"], lw=0.6, zorder=4)
 
@@ -1017,30 +1129,22 @@ class SedModel:
             rf"  ·  {variant_disp}",
             fs=7.2, color="#2B5F8A", style="italic")
 
-        # ── 4 ·  arrows: parameters → SED ─────────────────────────────────
-        # When transforms are present, free-param arrows go to transform
-        # nodes (drawn in section 2b).  Non-transformed params still connect
-        # directly to the SED node.
         for i, pname in enumerate(self.param_names):
             if has_transforms:
-                # Skip — arrows already drawn in section 2b
                 continue
             xp   = x_p[i]
             vec  = _is_vector(pname)
             r    = r_v if vec else r_p
-            # fan tip into box proportionally
             xt   = x_sed + (xp - x_sed) * 0.30
             arrow(xp, y_param - r - 0.03,
                   xt,  y_sed + sed_h / 2 + 0.04,
                   C["arr_fwd"], lw=0.85)
 
-        # ── 5 ·  observation nodes + data nodes ───────────────────────────
         for j, obs in enumerate(self.observations):
             xo       = x_o[j]
             fc, ec  = _obs_colors(obs)
             ow, oh  = 1.60, 0.64
 
-            # canonical type name and projection symbol
             if isinstance(obs, Photometry):
                 obs_type_lbl = "Photometry"
                 proj_lbl     = r"$\mathbf{T}_\mathrm{filt}\!\cdot\!f_\nu$"
@@ -1060,13 +1164,11 @@ class SedModel:
             txt(xo, y_obs + oh / 2 + 0.26, proj_lbl,
                 fs=7.5, color=ec, style="italic")
 
-            # SED → observation arrow
             xt = x_sed + (xo - x_sed) * 0.22
             arrow(xt, y_sed - sed_h / 2 - 0.04,
                   xo, y_obs + oh / 2 + 0.05,
                   ec, lw=1.1)
 
-            # observation box
             rect(xo, y_obs, ow, oh, fc, ec, lw=1.7)
             txt(xo, y_obs + 0.13, obs_type_lbl,
                 fs=8.5, weight="bold", color=ec)
@@ -1074,12 +1176,10 @@ class SedModel:
                 fs=7.0, color="#555555",
                 family="monospace")
 
-            # observation → data arrow (with noise annotation)
             arrow(xo, y_obs - oh / 2 - 0.04,
                   xo, y_data + r_d + 0.04,
                   ec, lw=1.1)
 
-            # noise annotation feeding into data node
             noise_x = xo + r_d + 0.44
             noise_y = y_data + 0.20
             txt(noise_x, noise_y, r"$\sigma_k$",
@@ -1088,18 +1188,15 @@ class SedModel:
                   xo + r_d + 0.04, y_data + 0.05,
                   "#BBBBBB", lw=0.75)
 
-            # data node (filled = observed / conditioned upon)
             circle(xo, y_data, r_d,
                    fc=C["data_fc"], ec=C["data_ec"], lw=1.5)
             txt(xo, y_data, _obs_dim(obs),
                 fs=7.2, color=C["data_tc"], weight="bold")
 
-            # label below data node
             txt(xo, y_data - r_d - 0.26,
                 rf"$\mathbf{{y}}_\mathrm{{{obs.name}}}$",
                 fs=8, color="#333333", style="italic")
 
-        # ── 6 ·  legend ───────────────────────────────────────────────────
         lg_y  = 0.28
         lg_r  = 0.13
         items = [
@@ -1116,7 +1213,6 @@ class SedModel:
             circle(lx, lg_y, lg_r, fc=lfc, ec=lec, lw=1.0, zorder=5)
             txt(lx + 0.22, lg_y, llbl,
                 fs=7.5, ha="left", color="#444444")
-        # dashed-arrow legend entry
         ax.annotate(
             "", xy=(fw * 0.82, lg_y), xytext=(fw * 0.80, lg_y),
             arrowprops=dict(
@@ -1128,7 +1224,6 @@ class SedModel:
         txt(fw * 0.83, lg_y, r"stochastic edge",
             fs=7.5, ha="left", color="#444444")
 
-        # ── 7 ·  title ────────────────────────────────────────────────────
         n_tr   = len(self.transforms)
         tr_str = (rf"  ·  ${n_tr}$ transform{'s' if n_tr != 1 else ''}"
                   if has_transforms else "")
@@ -1138,7 +1233,6 @@ class SedModel:
             fontsize=9.5, color="#333333", pad=3,
         )
 
-        # no tight_layout — axes already fill the figure via add_axes
 
         if return_fig:
             return fig, ax

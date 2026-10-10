@@ -34,10 +34,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ceridwen import SSPData, CSPBasis, SedModel, fitSED
+from ceridwen import SSPData, CSPBasis, SedModel, fitSED, PostProcess
 from ceridwen.observation import Photometry, Lines
 from ceridwen.model import logsfr_ratios_to_sfh
 from ceridwen.priors import Uniform, ClippedNormal, StudentT
+from ceridwen.cosmology import Cosmology
 
 HERE = pathlib.Path(__file__).resolve().parent
 SSP_FILE = HERE / "ssp_data.h5"
@@ -50,15 +51,15 @@ FILTERS = ["galex_FUV", "galex_NUV",
            "sdss_u0", "sdss_g0", "sdss_r0", "sdss_i0", "sdss_z0",
            "twomass_J", "twomass_H", "twomass_Ks"]
 
-# Line identities: 1-based indices into $SPS_HOME/data/emlines_info.dat.
+# Line identities: 0-based row indices into $SPS_HOME/data/emlines_info.dat.
 # The names are labels for you; the physics is keyed on line_ind.
-LINE_IND   = [59, 62, 63, 71, 72]
+LINE_IND   = [59, 61, 62, 74, 75]
 LINE_NAMES = ["Hbeta", "[OIII]4959", "[OIII]5007", "Halpha", "[NII]6583"]
-LINE_WAVE  = [4861.3, 4958.9, 5006.8, 6562.8, 6583.4]   # vacuum rest [A]
+LINE_WAVE  = [4862.76, 4960.37, 5008.31, 6564.72, 6585.37]   # vacuum rest [A]
 
 TRUTH = {
     "logsfr_ratios":      jnp.array([+0.3, +0.2, -0.1, -0.4, -0.6]),
-    "Z":                  jnp.array([-2.0]),
+    "logzsol":            jnp.array([-0.2]),
     "logmass":            jnp.array([10.5]),
     "diffuse_tau_kc":     jnp.array([0.5]),
     "diffuse_dust_index": jnp.array([-0.7]),
@@ -91,6 +92,7 @@ def main() -> None:
         zh_const=True, sfh_interp="step",
         add_dust=False, add_diffuse_dust=True, add_neb=True,
         verbose=False,
+        cosmo=Cosmology.planck18(),
     )
     sfh_times_yr = np.array(csp.sfh_times)
 
@@ -98,14 +100,14 @@ def main() -> None:
         return SedModel(
             csp, observations=observations,
             priors={
-                "Z": Uniform(low=-3.9, high=-1.45),
+                "logzsol": Uniform(low=-2.0, high=0.2),
                 "logmass": Uniform(low=9.0, high=12.0),
                 "diffuse_tau_kc": ClippedNormal(mean=0.3, sigma=1.0,
                                                 low=0.0, high=4.0),
                 "diffuse_dust_index": Uniform(low=-1.0, high=0.4),
                 "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=1.0),
                 # gas + slit-loss: the line-fitting-specific parameters
-                "gas_logz":       Uniform(low=-2.0, high=0.5),
+                "gas_logz":       Uniform(low=-1.3, high=0.2),   # inside the CLOUDY axis
                 "gas_logu":       Uniform(low=-4.0, high=-1.0),
                 "eline_scaling":  Uniform(low=0.1, high=2.0),
             },
@@ -113,7 +115,8 @@ def main() -> None:
                         logsfr_ratios_to_sfh(th["logsfr_ratios"],
                                              sfh_times_yr=_t)},
             free_param_init={"logsfr_ratios": jnp.zeros(N_TIME - 1),
-                             "logmass": jnp.array([10.0])},
+                             "logmass": jnp.array([10.0]),
+                             "eline_scaling": jnp.array([1.0])},
             zred=ZRED,
         )
 
@@ -152,14 +155,18 @@ def main() -> None:
         output_dir="./demo_2_output",
     )
 
-    # ── Recovered vs true ─────────────────────────────────────────────────
-    lw = np.asarray(result.log_weights)
-    w = np.exp(lw - lw.max()); w /= w.sum()
-    idx = rng.choice(w.size, size=2000, p=w)
-    for p in ("logmass", "Z", "gas_logz", "gas_logu", "eline_scaling"):
-        s = np.asarray(result.samples[p])[idx].ravel()
-        print(f"{p:>15}: true {float(TRUTH[p][0]):+7.3f}   "
+    # ── Post-process ──────────────────────────────────────────────────────
+    params = ("logmass", "logzsol", "gas_logz", "gas_logu", "eline_scaling")
+    truths = {p: float(TRUTH[p][0]) for p in params}
+    pp = PostProcess(model, result, n_samples=2000)
+    out = pp.run()
+    pp.figures("./demo_2_output/figures", title="demo 2: photometry + lines", truths=truths)
+    for p in params:
+        s = out["theta"][p]
+        print(f"{p:>15}: true {truths[p]:+7.3f}   "
               f"fit {np.median(s):+7.3f} +/- {np.std(s):.3f}")
+    print(f"log xi_ion = {np.median(np.log10(out['extras']['ionizing']['xion'])):.2f} Hz/erg; "
+          f"figures in demo_2_output/figures/")
     # Expect: gas_logz / gas_logu pinned by the [OIII]/Hbeta and [NII]/Halpha
     # ratios; eline_scaling recovered because the photometry anchors the
     # ABSOLUTE line luminosity while the Lines observation sees only 80%.

@@ -1,54 +1,38 @@
 """
-ceridwen/observation/photometry.py
-==================================
-Broadband photometric observation container.
+Broadband photometric observation container (AB maggies).
 """
 
-import json
 import jax.numpy as jnp
 import numpy as np
-from scipy import sparse
-from sedpy_jax.observate import FilterSet
-from sedpy_jax.smoothing import (
-    make_vel_smoother,
-    make_wave_smoother,
-    make_lsf_smoother,
-)
+from ceridwen.observation.filters import FilterSet
 from .base import Observation
 
-# One FilterSet per filter-name tuple per process; see set_filters.
-_FILTERSET_CACHE: dict = {}
+_FILTERSET_CACHE = {}
+
+
+def _filterset(filternames):
+    """One ``FilterSet`` per distinct filter-name tuple, shared by every Photometry that uses it."""
+    key = tuple(filternames)
+    fs = _FILTERSET_CACHE.get(key)
+    if fs is None:
+        fs = FilterSet(list(key))
+        _FILTERSET_CACHE[key] = fs
+    return fs
 
 
 class Photometry(Observation):
-    """
-    Broadband photometric observation in AB maggies.
-
-    Flux and uncertainty are stored in *maggies* (linear AB flux units;
-    1 maggie = 3631 Jy).  Filter information is held in a
-    ``sedpy_jax.observate.FilterSet``.
+    """Broadband photometric observation; flux and uncertainty in AB maggies (1 maggie = 3631 Jy).
 
     Parameters
     ----------
-    filters : list of str or list of Filter objects
-        Filters to include.  Strings are resolved to ``.par`` files in the
-        sedpy_jax filter library.
-    flux : array-like, shape (n_filters,), optional
-        Observed maggies.
-    uncertainty : array-like, shape (n_filters,), optional
-        1-sigma uncertainties in maggies.
-    mask : array-like of bool, shape (n_filters,), optional
-        True for filters that should be included in the fit.
+    filters : list of str or Filter -- names are resolved in the filter library
+    upper_limit : bool array (n_filters,) -- True = one-sided (model > data only) chi-squared penalty
 
-    Examples
-    --------
-    >>> phot = Photometry(
-    ...     filters=["sdss_u0", "sdss_g0", "sdss_r0", "sdss_i0", "sdss_z0"],
-    ...     flux=obs_maggies,
-    ...     uncertainty=obs_maggies_unc,
-    ... )
-    >>> model_maggies = phot.get_maggies(model_wave, model_fnu)
-    >>> chi2 = phot.chi_sq(model_maggies)
+    Attributes
+    ----------
+    flux : array (n_filters,), maggies (keyword argument)
+    uncertainty : array (n_filters,), maggies -- 1-sigma (keyword argument)
+    mask : bool array (n_filters,) -- True = used in the fit (keyword argument)
     """
 
     _kind = "photometry"
@@ -61,26 +45,6 @@ class Photometry(Observation):
     _meta = ("kind", "name", "filternames")
 
     def __init__(self, filters=[], name=None, upper_limit=None, **kwargs):
-        """
-        Parameters
-        ----------
-        upper_limit : array-like of bool, shape (n_filters,), optional
-            Per-band non-detection flags.  If True for band ``i`` the
-            photometric likelihood treats that band as an upper limit:
-            a chi-squared penalty is applied *only* when the model flux
-            exceeds the observed value, i.e.
-
-            .. math::
-
-                \\chi^2_{\\rm UL}
-                    = \\left[\\max(m - d, 0) \\,/\\, \\sigma\\right]^2.
-
-            This mirrors the convention already used in
-            :class:`ceridwen.observation.Lines` and matches Prospector's
-            recommended treatment of non-detections (the simple flux=0,
-            sigma=1-sigma-limit approximation).  ``None`` (default) treats
-            every band as a positive detection.
-        """
         self.set_filters(filters)
         self.upper_limit = (
             None if upper_limit is None
@@ -88,12 +52,8 @@ class Photometry(Observation):
         )
         super().__init__(name=name, **kwargs)
 
-    # ------------------------------------------------------------------
     def set_filters(self, filters):
-        """
-        Set the filter list.  ``filters`` may be a list of filter-name
-        strings or of sedpy_jax ``Filter`` objects.
-        """
+        """Set the filter list from filter-name strings or ``Filter`` objects."""
         if not filters:
             self.filters     = []
             self.filternames = []
@@ -105,275 +65,117 @@ class Photometry(Observation):
         except (AttributeError, TypeError):
             self.filternames = list(filters)
 
-        # Loading one filter costs about a second of small JIT compiles in
-        # sedpy, and a joint fit builds two Photometry objects with the same
-        # filter list (aperture transfer + fit). Filters are immutable after
-        # construction, so share one FilterSet per name tuple per process.
-        key = tuple(self.filternames)
-        cached = _FILTERSET_CACHE.get(key)
-        if cached is None:
-            cached = FilterSet(self.filternames)
-            _FILTERSET_CACHE[key] = cached
-        self.filterset = cached
+        self.filterset = _filterset(self.filternames)
         self.filters   = list(self.filterset.filters)
         self.wave_eff = [f.wave_effective for f in self.filters]
+        self._wavelength = jnp.asarray([f.wave_effective for f in self.filters])
 
-    # ------------------------------------------------------------------
     @property
     def wavelength(self):
         """Effective wavelengths of the filters [Å], shape (n_filters,)."""
         if not self.filters:
             return jnp.array([], dtype=float)
-        return jnp.asarray([f.wave_effective for f in self.filters])
+        return self._wavelength
 
-    # ------------------------------------------------------------------
     def get_maggies(self, model_wave, model_fnu):
-        """
-        Project a model spectrum onto the filters and return synthetic maggies.
-
-        The model spectrum is expected in **F_nu units** (e.g. L_sun Hz^{-1}
-        M_sun^{-1} as returned by ``CSPBasis.get_spectrum``).  Internally the
-        spectrum is converted to F_lambda before being projected through the
-        AB-normalised FilterSet transmission matrix, so the output has the
-        same relative normalisation as a standard AB photometric integral.
-
-        Parameters
-        ----------
-        model_wave : array-like, shape (n_wave,)
-            Wavelength grid [Å].
-        model_fnu : array-like, shape (n_wave,)
-            Model spectrum in F_nu units (L_sun/Hz/M_sun or erg/s/Hz/cm^2).
-
-        Returns
-        -------
-        maggies : jnp.ndarray, shape (n_filters,)
-            Synthetic photometry with the same relative normalisation as the
-            input flux.
-
-        Notes
-        -----
-        The AB normalisation constant in sedpy_jax cancels dimensionally when
-        both the Ceridwen and FSPS spectra are expressed in the same units,
-        making model/data comparisons unit-independent.
-        """
+        """Synthetic maggies, shape (n_filters,), of an F_nu spectrum on ``model_wave`` [Å]
+        (reference path; normalisation follows the input flux units)."""
         if self.filterset is None:
             raise ValueError("No FilterSet configured; call set_filters() first.")
-        _c         = jnp.array(2.998e18)        # Å/s
+        _c         = jnp.array(2.998e18)
         wave       = jnp.asarray(model_wave,  dtype=float)
         flux_flam  = jnp.asarray(model_fnu,   dtype=float) * _c / wave**2
         return self.filterset.get_sed_maggies(flux_flam, sourcewave=wave)
 
-    # ------------------------------------------------------------------
-    # GPU / JIT projection interface
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
     def setup_for_model(self, wave_model, zred: float = 0.0):
-        """
-        Precompute a (n_filters, n_wave) projection matrix ``_T`` so that
-        ``predict`` reduces to a single GEMV: ``maggies = _T @ F_nu``.
-
-        The matrix folds together three operations that
-        ``FilterSet.get_sed_maggies`` does per call:
-
-        1. F_nu -> F_lambda conversion: ``F_lam = F_nu * c / lam^2``
-        2. Interpolation from the model wavelength grid onto the
-           FilterSet's internal grid (``interp_source``)
-        3. Dot product with the precomputed ``FilterSet.trans`` matrix
-
-        By composing these into a single static matrix ``_T`` of shape
-        ``(n_filters, n_wave_model)``, all three steps collapse into one
-        GEMV at predict time.
-
-        Must be called once before ``predict`` (and before JIT compilation).
-        ``SedModel.__init__`` calls this automatically.
-
-        Parameters
-        ----------
-        wave_model : array-like
-            Rest-frame wavelength grid of the model spectrum [Å].
-        zred : float, optional
-            Fixed redshift at which to precompute the filter projection.
-            Defaults to 0 (rest-frame).  For a non-zero ``zred``, the grid
-            is effectively taken in the observed frame
-            (``wave_effective = (1 + zred) * wave_model``) before filter
-            integration — this keeps the predict-time GEMV path unchanged
-            and preserves sampling-hot-path speed.  Combine with
-            :func:`ceridwen.cosmology.flux_factor_maggies` (applied inside
-            ``CSPBasis.predict`` when ``theta['zred']`` is present) to get
-            correctly calibrated observed-frame maggies.
-        """
-        wm_rest = np.asarray(wave_model, dtype=np.float64)   # (n_wave,)
-        # Effective ("observed-frame") grid used for the maggies integral.
-        # At zred = 0 this equals wm_rest.
+        """Precompute the ``(n_filters, n_wave)`` float32 projection matrix ``_T`` (F_nu -> maggies)
+        for the rest-frame grid ``wave_model`` [Å] observed at fixed ``zred``; required before ``predict``."""
+        wm_rest = np.asarray(wave_model, dtype=np.float64)
         opz = 1.0 + float(zred)
         wm = opz * wm_rest
         n_wave = len(wm)
-        _c = 2.998e18  # speed of light [A/s]
+        _c = 2.998e18
 
-        # F_nu -> F_lambda factor per model wavelength bin
-        fnu_to_flam = _c / wm**2                         # (n_wave,)
+        fnu_to_flam = _c / wm**2
 
-        # Build interpolation matrix H: (n_lam_filter, n_wave_model)
-        # such that  F_lam_filtergrid = H @ F_lam_modelgrid
-        # This is the linear interpolation that interp_source does per call.
-        lam_filt = np.asarray(self.filterset.lam, dtype=np.float64)  # (n_lam,)
+        lam_filt = np.asarray(self.filterset.lam, dtype=np.float64)
         n_lam = len(lam_filt)
 
-        # Construct sparse interpolation weights
-        # For each point in lam_filt, find the bracketing indices in wm
-        # and the interpolation fraction.
         idx = np.searchsorted(wm, lam_filt, side="right") - 1
         idx = np.clip(idx, 0, n_wave - 2)
         frac = (lam_filt - wm[idx]) / (wm[idx + 1] - wm[idx])
         frac = np.clip(frac, 0.0, 1.0)
 
-        # Zero out entries outside the model wavelength range
         outside = (lam_filt < wm[0]) | (lam_filt > wm[-1])
         frac[outside] = 0.0
 
-        # H (n_lam, n_wave) has two entries per filter-grid row; sparse, so
-        # no dense (n_lam, n_wave) matrix (4.9 GB for 28 bands) is built.
-        rows = np.flatnonzero(~outside)
-        H = sparse.csr_matrix(
-            (np.column_stack([1.0 - frac[rows], frac[rows]]).ravel(),
-             np.column_stack([idx[rows], idx[rows] + 1]).ravel(),
-             np.searchsorted(rows, np.arange(n_lam + 1)) * 2),
-            shape=(n_lam, n_wave))
-
-        # FilterSet.trans is (n_filters, n_lam): already includes
-        # R * lam * dlam / ab_zero_counts normalisation.
         trans = np.asarray(self.filterset.trans, dtype=np.float64)  # (n_filt, n_lam)
-
-        # Compose: _T = trans @ H @ diag(fnu_to_flam)
-        #   maggies = trans @ (H @ (F_nu * fnu_to_flam))
-        #           = (trans @ H @ diag(fnu_to_flam)) @ F_nu
-        #           = _T @ F_nu
-        # Each column of trans @ H sums its nonzero terms in filter-grid order.
-        TH = (H.T @ trans.T).T                           # (n_filt, n_wave)
-        T  = TH * fnu_to_flam[None, :]                   # (n_filt, n_wave)
+        inside = ~outside
+        TH = np.zeros((trans.shape[0], n_wave), dtype=np.float64)
+        np.add.at(TH.T, idx[inside],     (trans[:, inside] * (1.0 - frac[inside])).T)
+        np.add.at(TH.T, idx[inside] + 1, (trans[:, inside] * frac[inside]).T)
+        T  = TH * fnu_to_flam[None, :]
 
         self._T = jnp.array(T.astype(np.float32))
         self._has_precomputed_T = True
         columns = np.flatnonzero(np.any(np.asarray(self._T) != 0, axis=0))
         self.model_support = (int(columns[0]), int(columns[-1]) + 1)
+        self._broadener = None
+        self._line_basis = None
 
-    # ------------------------------------------------------------------
+    def setup_broadening(self, wave_model, zred, kinematics, *, free_z=False, neb=None):
+        """Build the sigma_gal broadener over the rest range the filters cover (the
+        whole 912-25000 A window when ``free_z``) and, when ``neb`` is given and
+        sigma_gas is fixed, the static line basis at that width.  Both are None
+        for ``Kinematics.none()``; call after ``setup_for_model``."""
+        from ..broadening import PhotometricBroadener
+        self._broadener = None
+        self._line_basis = None
+        if kinematics is None:
+            return
+        wm = np.asarray(wave_model, dtype=np.float64)
+        static_zero = (kinematics.is_static
+                       and float(kinematics.sigma_gal) == 0.0
+                       and float(kinematics.effective_sigma_gas) == 0.0)
+        if not static_zero:
+            if free_z or self.filterset is None:
+                wmin, wmax = max(912.0, wm[0]), min(25000.0, wm[-1])
+            else:
+                opz = 1.0 + float(zred)
+                lam = np.asarray(self.filterset.lam, dtype=np.float64)
+                wmin = max(lam.min() / opz, wm[0])
+                wmax = min(lam.max() / opz, wm[-1])
+            if wmin < wmax:
+                self._broadener = PhotometricBroadener.build(kinematics, wm, wmin, wmax)
+        gas = kinematics.effective_sigma_gas
+        if neb is not None and not isinstance(gas, str) and float(gas) > 0.0:
+            self._line_basis = np.asarray(neb.line_profiles(float(gas)), dtype=np.float32)
+
     def predict(self, spectrum, wave_model):
-        """
-        Project a model F_nu spectrum onto the filters.
+        """Synthetic AB maggies, shape (n_filters,), as ``_T @ spectrum`` (F_nu on ``wave_model``)."""
+        if not getattr(self, "_has_precomputed_T", False):
+            raise RuntimeError(
+                "Photometry.predict() called before setup_for_model(): call "
+                "phot.setup_for_model(wave_model, zred=...) once before the first "
+                "predict / JIT trace (get_maggies(wave, spectrum) is the "
+                "rest-frame reference path).")
+        return self._T @ spectrum
 
-        If ``setup_for_model`` has been called, this is a single GEMV
-        (``_T @ spectrum``).  Otherwise falls back to ``get_maggies``.
-
-        Parameters
-        ----------
-        spectrum : jax.Array, shape (n_wave,)
-            Model spectrum in F_nu units.
-        wave_model : jax.Array, shape (n_wave,)
-            Model wavelength grid [Å].
-
-        Returns
-        -------
-        jax.Array, shape (n_filters,)
-            Synthetic AB maggies.
-        """
-        if getattr(self, "_has_precomputed_T", False):
-            return self._T @ spectrum
-        return self.get_maggies(wave_model, spectrum)
-
-    # ------------------------------------------------------------------
     def predict_at_redshift(self, spectrum_fnu_observed, wave_rest, zred):
-        """
-        Project an observer-frame F_nu spectrum through the filters when
-        the redshift is a *traced* (sampled) JAX scalar.
-
-        This is the free-redshift counterpart of :meth:`predict`.  The
-        GEMV fast path baked by :meth:`setup_for_model` assumes a single
-        Python-scalar ``zred`` was known at trace time and bakes the
-        observed-frame wavelength grid into the projection matrix
-        ``_T``; that path cannot be used for sampling.  Here the
-        observed-frame wavelength grid is reconstructed per-sample as
-        ``wave_obs = (1 + zred) * wave_rest`` and the spectrum is
-        projected via :meth:`FilterSet.get_sed_maggies` with the
-        traced ``sourcewave``.
-
-        Pre-condition: ``spectrum_fnu_observed`` is the observer-frame
-        F_nu, i.e. ``CSPBasis.predict`` has already multiplied by
-        ``flux_factor_maggies(zred)`` and (optionally) by the IGM
-        transmission.  This method only handles the wavelength-grid
-        bookkeeping and the filter integral.
-
-        Parameters
-        ----------
-        spectrum_fnu_observed : jax.Array, shape (n_wave,)
-            Observer-frame F_nu on the rest-frame model wavelength grid
-            (the standard ceridwen output of get_spectrum + mass +
-            flux-factor + IGM).
-        wave_rest : jax.Array, shape (n_wave,)
-            Rest-frame model wavelength grid [Å] (typically ``csp.wave``).
-        zred : jax.Array, scalar
-            Sampled redshift.  May be a traced array; the entire path
-            below is JIT-compatible and differentiable in ``zred``
-            (sedpy_jax's ``interp_source`` uses ``jnp.interp`` which
-            has a defined gradient w.r.t. its xp argument).
-
-        Returns
-        -------
-        jax.Array, shape (n_filters,)
-            Synthetic AB maggies in observer frame.
-
-        Notes
-        -----
-        - Cost is one filter interpolation + one trans-matrix dot per
-          sample, vs the single GEMV of the fixed-z path.  For a 14-d
-          NUTS / 4000-particle NS / 20 000-step SVI run on a 40 GB A100
-          this is ~10-20x slower than the GEMV but still saturates
-          the GPU.
-        - Numerically equivalent to ``setup_for_model(wave_rest, zred=z)
-          + predict(spectrum, wave_rest)`` evaluated at the same z, to
-          float32 precision.
-        - Works regardless of whether ``setup_for_model`` has been
-          called.  When both paths are wired (e.g. for compare-mode
-          plots), prefer the GEMV path for any fixed-z observation
-          and this method for any free-z observation.
-        """
+        """Observer-frame AB maggies, shape (n_filters,), for a traced ``zred``: ``spectrum_fnu_observed``
+        must already be observer-frame F_nu (flux factor and IGM applied) on the rest-frame grid ``wave_rest`` [Å]."""
         if self.filterset is None:
             raise ValueError("No FilterSet configured; call set_filters() first.")
-        _c = jnp.array(2.998e18, dtype=spectrum_fnu_observed.dtype)
-        wave_obs = (jnp.float32(1.0) + zred.astype(spectrum_fnu_observed.dtype)) \
-            * jnp.asarray(wave_rest, dtype=spectrum_fnu_observed.dtype)
-        flux_flam = jnp.asarray(spectrum_fnu_observed,
-                                 dtype=spectrum_fnu_observed.dtype) \
-            * _c / (wave_obs * wave_obs)
+        wave_obs = (1.0 + jnp.asarray(zred)) * jnp.asarray(wave_rest)
+        flux_flam = spectrum_fnu_observed * (2.998e18 / (wave_obs * wave_obs))
         return self.filterset.get_sed_maggies(flux_flam, sourcewave=wave_obs)
 
-    # ------------------------------------------------------------------
     def chi_sq(self, model_maggies):
-        """
-        Chi-squared contribution from this photometric observation.
-
-        For bands flagged as upper limits (``self.upper_limit[i] = True``),
-        the contribution is one-sided: a penalty is applied only when the
-        model flux exceeds the observed upper-limit value.  Matches the
-        convention used in :class:`Lines` and Prospector's recommended
-        treatment of non-detections.
-
-        Parameters
-        ----------
-        model_maggies : array-like, shape (n_filters,)
-            Synthetic photometry on the same filter set.
-
-        Returns
-        -------
-        chi2 : float
-        """
+        """Chi-squared (float) over unmasked bands; upper-limit bands are penalised only when model > data."""
         mf    = jnp.asarray(model_maggies, dtype=float)
-        resid = (self.flux - mf) / self.uncertainty       # (data - model) / sigma
+        resid = (self.flux - mf) / self.uncertainty
 
         if self.upper_limit is not None:
-            # For upper-limit bands: only penalise when model > data,
-            # i.e. when resid < 0.  Identical to the Lines convention.
             resid_sq = jnp.where(
                 self.upper_limit,
                 jnp.where(resid < 0.0, resid ** 2, 0.0),
@@ -385,17 +187,7 @@ class Photometry(Observation):
         return float(jnp.sum(jnp.where(self.mask, resid_sq, 0.0)))
 
     def residuals(self, model_maggies):
-        """
-        Per-filter (data − model) / sigma.  Masked filters are set to NaN.
-
-        For bands flagged as upper limits, residuals are clipped to 0 when
-        the model is safely below the limit (positive residual), so the
-        returned vector matches what enters ``chi_sq`` band-by-band.
-
-        Returns
-        -------
-        res : jnp.ndarray, shape (n_filters,)
-        """
+        """Per-filter (data - model) / sigma, shape (n_filters,); masked bands NaN, upper-limit bands 0 when model < data."""
         res = (self.flux - jnp.asarray(model_maggies, dtype=float)) / self.uncertainty
 
         if self.upper_limit is not None:
@@ -406,7 +198,6 @@ class Photometry(Observation):
             )
         return jnp.where(self.mask, res, jnp.nan)
 
-    # ------------------------------------------------------------------
     def __str__(self):
         weff = [float(f.wave_effective) for f in self.filters] if self.filters else []
         w_range = (
@@ -429,12 +220,8 @@ class Photometry(Observation):
         ]
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
     def _display_str(self, max_rows: int = 80) -> str:
-        """Per-filter table: filter name, λ_eff, flux, σ, S/N, mask.
-
-        Filter units follow the ``Photometry`` contract (maggies);
-        ``wave_effective`` is pulled from each sedpy_jax ``Filter``."""
+        """Per-filter table of name, λ_eff, flux, σ, S/N, used (the mask: True = fitted), UL."""
         header = str(self)
         flux = np.asarray(self.flux) if self.flux is not None else None
         unc  = np.asarray(self.uncertainty) if self.uncertainty is not None else None
@@ -448,7 +235,7 @@ class Photometry(Observation):
               else np.zeros(n, dtype=bool))
 
         col = f"  {'#':<3}  {'filter':<28}  {'λ_eff [Å]':>12}  " \
-              f"{'flux [mag]':>14}  {'σ':>12}  {'S/N':>7}  {'mask':>5}  {'UL':>3}"
+              f"{'flux [maggies]':>14}  {'σ':>12}  {'S/N':>7}  {'used':>5}  {'UL':>3}"
         sep = "  " + "-" * (len(col) - 2)
         out = [header, "", col, sep]
 
@@ -470,9 +257,3 @@ class Photometry(Observation):
                 f"{f:>14.4e}  {u:>12.4e}  {snr:>7.2f}  {str(m):>5}  {ul_str:>3}"
             )
         return "\n".join(out)
-
-
-# =====================================================================
-# Spectrum
-# =====================================================================
-

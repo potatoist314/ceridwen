@@ -1,61 +1,6 @@
-r"""
-ceridwen/igm.py
-===============
-Intergalactic-medium (IGM) absorption models for redshift-aware SED
-fitting.  Applied as a wavelength-dependent transmission curve to the
-rest-frame source spectrum as a function of the source redshift; the
-returned factor can simply be multiplied into the spectrum before the
-observation projection.
-
-Interface
----------
-:class:`IGMModel` is the abstract base.  Each concrete subclass
-implements ``tau(lam_rest, zred)`` returning the optical depth on the
-rest-frame wavelength grid at the given source redshift.  The public
-:meth:`IGMModel.attenuation` method returns ``exp(-tau * factor)`` —
-the transmission curve — with an optional scalar ``factor`` matching
-FSPS's ``igm_factor`` fudge (so the IGM strength can be fit).
-
-Models
-------
-:class:`Madau1995`
-    Line-by-line port of FSPS's ``igm_absorb.f90``: 17 Lyman-series
-    transitions (Ly-α through Ly-17) with blanketing index 3.46,
-    metal blanketing on Ly-α, and the analytic Lyman-continuum
-    approximation (Eq. 16 of Madau 1995).  τ is capped at its peak
-    short-wavelength value so the fitting-function breakdown below
-    ~100 Å does not produce a non-monotonic curve.
-
-:class:`NoIGM`
-    Identity (``τ ≡ 0``).  Useful as a null model so the forward
-    pass does not need a Python-level branch on ``self.igm_model is
-    None``.
-
-Extensibility
--------------
-Adding e.g. Inoue et al. (2014) is a matter of subclassing
-:class:`IGMModel`, implementing ``tau``, and registering in
-:data:`_MODEL_REGISTRY`.  The public constructor
-:func:`make_igm_model` accepts either a string name or a pre-built
-instance:
-
->>> from ceridwen.igm import make_igm_model, Madau1995
->>> igm = make_igm_model("madau1995")
->>> igm = make_igm_model(Madau1995())
->>> igm = make_igm_model(None)              # NoIGM
-
-Tied to CSPBasis
-----------------
-``CSPBasis`` accepts ``add_igm`` and ``igm_model`` kwargs.  When
-``add_igm=True``, ``CSPBasis.predict`` multiplies the post-mass-
-post-flux-factor spectrum by the transmission curve at
-``theta["zred"]`` (and, optionally, ``theta["igm_factor"]``) — so IGM
-strength can be fit.
-
-References
-----------
-Madau, P. (1995), ApJ, 441, 18.  "Radiative Transfer in a Clumpy
-Universe: The Colors of High-Redshift Galaxies".
+"""
+Intergalactic-medium absorption models: transmission curves ``exp(-tau * factor)``
+on the rest-frame wavelength grid at a given source redshift.
 """
 from __future__ import annotations
 
@@ -64,40 +9,30 @@ from typing import Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 Array = jax.Array
 
 
-# ======================================================================
-# Abstract base
-# ======================================================================
-
 class IGMModel(abc.ABC):
-    """Abstract IGM attenuation model.
+    """Abstract IGM attenuation model; subclasses implement ``tau(lam_rest, zred)``.
 
-    Concrete subclasses implement ``tau(lam_rest, zred)``.  The
-    :meth:`attenuation` method returns ``exp(-tau * factor)`` and is
-    what callers (e.g. ``CSPBasis.predict``) multiply into the
-    spectrum.
-    """
+    A model that reads theta keys of its own lists them in ``param_names``; the CSP then passes
+    ``attenuation(..., params={key: scalar})`` with those of the keys present in theta (and only
+    then, so a subclass with the three-argument ``attenuation`` keeps working)."""
 
     name: str = "igm"
+    param_names: tuple = ()
 
     @abc.abstractmethod
     def tau(self, lam_rest: Array, zred: Array) -> Array:
-        """Optical depth on the rest-frame wavelength grid at source
-        redshift ``zred``.  Must be broadcastable to ``lam_rest``'s
-        shape."""
+        """Optical depth on the rest-frame wavelength grid [Å] at source redshift ``zred``."""
 
     def attenuation(self, lam_rest: Array, zred: Array,
                     factor: Union[Array, float] = 1.0) -> Array:
         """Transmission curve ``exp(-tau * factor)``."""
         return jnp.exp(-self.tau(lam_rest, zred) * factor)
 
-
-# ======================================================================
-# Null model — zero optical depth everywhere
-# ======================================================================
 
 class NoIGM(IGMModel):
     """Identity IGM: zero optical depth at every wavelength."""
@@ -108,53 +43,13 @@ class NoIGM(IGMModel):
         return jnp.zeros_like(lam_rest)
 
 
-# ======================================================================
-# Madau (1995) — line-by-line port of FSPS's igm_absorb.f90
-# ======================================================================
-
 class Madau1995(IGMModel):
-    r"""Madau (1995) IGM attenuation.
-
-    Direct port of FSPS's ``igm_absorb.f90``.  Three components:
-
-    1. **Lyman-series line blanketing** (17 transitions from Ly-α
-       down to Ly-17):
-
-       .. math::
-           \tau_\mathrm{Ly\,series}(\lambda_\mathrm{rest}) =
-           \sum_{i=1}^{17} A_i
-           \left(\frac{\lambda_\mathrm{rest}(1+z)}{\lambda_i}\right)^{3.46},
-
-       applied only where :math:`\lambda_\mathrm{rest} < \lambda_i`.
-
-    2. **Metal blanketing on Ly-α** with a softer index 1.68:
-
-       .. math::
-           \tau_\mathrm{metal} = 0.0017
-           \bigl(\lambda_\mathrm{obs}/1215.67\bigr)^{1.68}.
-
-    3. **Lyman-continuum photoelectric absorption** (Madau 1995 Eq. 16
-       analytic approximation) for :math:`\lambda_\mathrm{rest} < 911.75\,\text{Å}`.
-
-    A small post-processing step caps τ at its peak short-wavelength
-    value, suppressing the fitting-function breakdown at ~100 Å.
-
-    At ``zred = 0`` τ is forced to zero — the Madau 1995 approximation
-    is not physically valid for a line-of-sight of zero length and
-    would otherwise give spurious residual attenuation to local-
-    universe sources.  This matches FSPS's own usage, which only
-    invokes ``IGM_ABSORB`` when ``zred > 0``.
-    """
+    """Madau (1995) IGM attenuation: 17 Lyman-series lines, Ly-α metal blanketing and
+    Lyman-continuum absorption; tau is capped at its short-wavelength peak and is zero at zred = 0."""
 
     name = "madau1995"
 
-    # Source of the tabulation below: Madau (1995), ApJ 441, 18 (eqs. 12-16),
-    # as transcribed in FSPS's ``src/igm_absorb.f90`` (arrays ``lyw`` /
-    # ``lycoeff`` and the Lyman limit ``lylim``).  Reproduced verbatim so
-    # ceridwen's IGM attenuation matches FSPS's Madau mode bit-for-bit.  (The
-    # more modern Inoue+ 2014 prescription is a different model, not used here.)
-    #
-    # Lyman-series rest wavelengths [Å] — 17 transitions, Ly-α first.
+    # Lyman-series rest wavelengths [Å], Ly-α first
     _LYW = jnp.asarray([
         1215.67, 1025.72,  972.537, 949.743, 937.803,
          930.748, 926.226, 923.150, 920.963, 919.352,
@@ -162,7 +57,6 @@ class Madau1995(IGMModel):
          914.919, 914.576,
     ])
 
-    # Blanketing coefficients (identical to FSPS).
     _LYCOEFF = jnp.asarray([
         0.0036,    0.0017,    0.0011846, 0.0009410, 0.0007960,
         0.0006967, 0.0006236, 0.0005665, 0.0005200, 0.0004817,
@@ -171,45 +65,21 @@ class Madau1995(IGMModel):
     ])
 
     _LYLIM   = 911.75    # Lyman limit [Å]
-    _A_METAL = 0.0017    # metal blanketing coefficient for Ly-α
+    _A_METAL = 0.0017
 
     def tau(self, lam_rest, zred):
-        # Clamp z >= 0: the Madau 1995 fitting formulae are undefined
-        # for negative redshifts, and both VI ELBO training and NUTS
-        # leapfrog steps can transiently explore ``z < 0``.  Without
-        # this guard ``(1+z)^0.46`` at ``z < -1`` raises a power of a
-        # negative base, producing NaN that then poisons the entire VI
-        # gradient — causing 100 % divergences in the downstream NUTS
-        # sampling.  Clamping at 0 keeps the trace finite; any proposal
-        # with ``z < 0`` is still rejected by whichever prior / Jacobian
-        # is in play.
         zred = jnp.maximum(zred, 0.0)
         lam  = lam_rest
         z1   = 1.0 + zred
-        lobs = lam * z1
-        xc   = lobs / self._LYLIM
+        ratio = lam[None, :] / self._LYW[:, None]
+        series = jnp.sum(jnp.where(lam[None, :] < self._LYW[:, None],
+                                   self._LYCOEFF[:, None] * ratio ** 3.46, 0.0), axis=0)
+        metal = self._A_METAL * (lam / self._LYW[0]) ** 1.68 * (lam < self._LYW[0])
+        tau_series = series * z1 ** 3.46
+        tau_metal  = metal * z1 ** 1.68
 
-        # ─── Lyman-series line blanketing (vectorised) ──────────────
-        # FSPS loops over the 17 Ly lines and sets
-        #   tau(lam <  lyw_i) += A_i * (lobs/lyw_i)^3.46
-        # which is equivalent to masking + broadcasting sum.
-        masks = lam[None, :] < self._LYW[:, None]               # (17, n_wave)
-        contrib = (self._LYCOEFF[:, None]
-                   * (lobs[None, :] / self._LYW[:, None]) ** 3.46)
-        tau_series = jnp.sum(jnp.where(masks, contrib, 0.0), axis=0)
-
-        # Metal blanketing on Ly-α only.
-        mask_lya = lam < self._LYW[0]
-        tau_metal = (
-            self._A_METAL * (lobs / self._LYW[0]) ** 1.68
-        ) * mask_lya
-
-        # ─── Lyman-continuum photoelectric absorption (Madau Eq. 16) ─
         mask_lyc = lam < self._LYLIM
-        # Compute over the full grid with a safe xc (≥ 1 outside the
-        # mask) so no NaN/Inf leaks through the reverse-mode tape; then
-        # mask to zero outside the valid region.
-        xc_safe = jnp.where(mask_lyc, xc, 1.0)
+        xc_safe = jnp.where(mask_lyc, lam / self._LYLIM * z1, 1.0)
         tau_lyc = (
              0.25  * xc_safe**3.0  * (z1**0.46 - xc_safe**0.46)
             + 9.4  * xc_safe**1.5  * (z1**0.18 - xc_safe**0.18)
@@ -217,53 +87,207 @@ class Madau1995(IGMModel):
             - 0.023 * (z1**1.68 - xc_safe**1.68)
         )
         tau_lyc = jnp.where(mask_lyc, tau_lyc, 0.0)
-
         tau = tau_series + tau_metal + tau_lyc
 
-        # ─── Cap τ at its short-wavelength maximum ──────────────────
-        # The LyC fit fails below ~100 Å and can produce a spuriously
-        # decreasing τ.  FSPS freezes τ at the peak for all shorter
-        # wavelengths; we do the same.  Assumes ``lam_rest`` is sorted
-        # ascending (the FSPS / ceridwen convention).
         idx_peak = jnp.argmax(tau)
-        tau_peak = tau[idx_peak]
-        idxs = jnp.arange(tau.shape[0])
-        tau = jnp.where(idxs <= idx_peak, tau_peak, tau)
-
-        # Gate at zred = 0: the approximation is not valid for a zero-
-        # length line of sight.  ``jnp.where`` on a scalar predicate
-        # constant-folds when ``zred`` is a literal 0, so this does
-        # not cost anything in the typical fixed-z case.
+        tau = jnp.where(jnp.arange(tau.shape[0]) <= idx_peak, tau[idx_peak], tau)
         return jnp.where(zred > 0.0, tau, jnp.zeros_like(tau))
 
 
-# ======================================================================
-# Factory
-# ======================================================================
+# ---- IGM damping wing and damped Ly-alpha absorber ------------------------------------------
+# Ported from Prospector (prospect/models/sedmodel.py @ a78d153): DLA ``add_dla`` :808-819,
+# ``voigt_profile`` :1201-1245, ``H`` :1192-1198; damping wing ``add_damping_wing`` :821-827,
+# ``tau_damping`` :1261-1309, ``tau_gp`` :1312-1327, ``Ix`` :1330-1333.  Constants as there.
+_C_CMS = 2.99792e10            # :1233
+_VOIGT_CONST = 0.0149736082    # :1234, sqrt(pi) e^2 / (m_e c) [cgs]
+_LYA = 1215.6696               # :1201, :1261
+_F_LYA = 4.16e-1               # :1201
+_GAMMA_LYA = 6.265e8           # :1201
+_R_ALPHA = 2.02e-8             # :1297
+_X_SAFE = 1e-3
+
+
+def _voigt_H(a, x):
+    """Tepper-Garcia (2006) Voigt-Hjerting approximation, with the ``x -> 0`` singularity moved to
+    ``|x| = 1e-3`` (|lambda - l0| < 1.6e-4 A; tau > 3e6 there for any DLA column), so the value
+    and the gradient are finite where Prospector returns NaN."""
+    small = jnp.abs(x) < _X_SAFE
+    x = jnp.where(small, jnp.where(x < 0, -_X_SAFE, _X_SAFE), x)
+    P = x ** 2
+    H0 = jnp.exp(-x ** 2)
+    Q = 1.5 / x ** 2
+    return H0 - a / jnp.sqrt(jnp.pi) / P * (H0 * H0 * (4. * P * P + 7. * P + 4. + Q) - Q - 1)
+
+
+def voigt_tau(wave_abs, N, bkms=40.0, l0=_LYA, f=_F_LYA, gamma=_GAMMA_LYA):
+    """Optical depth of a Voigt line (Krogager 2018 normalisation) on ``wave_abs`` [A, absorber
+    rest frame] for a column density ``N`` [cm^-2]; Ly-alpha by default."""
+    l0_cm = l0 * 1.e-8
+    b = bkms * 1e5
+    C_a = _VOIGT_CONST * f * l0_cm / b
+    a = l0_cm * gamma / (4. * jnp.pi * b)
+    x = (_C_CMS / b) * (1. - l0 / wave_abs)
+    return C_a * N * _voigt_H(a, x)
+
+
+def _Ix(x):
+    v = x ** (9 / 2) / (1 - x) + 9 / 7 * x ** 3.5 + 9 / 5 * x ** 2.5 + 3 * x ** 1.5 + 9 * x ** 0.5
+    return v - 9 / 2 * jnp.log((1 + x ** 0.5) / (1 - x ** 0.5))
+
+
+def tau_gp(zred, h, Om0, Ob0, Y=0.25):
+    """Gunn-Peterson optical depth, Miralda-Escude (1998) normalisation."""
+    scale = (1 - Y) * h * Om0 ** (-0.5) * (Ob0 / 0.03)
+    return 2.6e5 * scale * ((1 + zred) / 7) ** (3 / 2)
+
+
+def tau_damping(wave_rest, zred, x_HI, h, Om0, Ob0, zmin=5.0, Y=0.25, l0=_LYA):
+    """Damping-wing optical depth of a uniformly neutral IGM (neutral fraction ``x_HI``) between
+    ``zmin`` and ``zred`` (Miralda-Escude 1998; Totani et al. 2006), on the rest-frame grid.
+    Zero blueward of Ly-alpha and for ``zred <= zmin``; masked with safe arguments so ``jit``
+    and gradients stay finite."""
+    wave_obs = wave_rest * (1 + zred)
+    zobs = wave_obs / l0 - 1
+    red = ((zobs - zred) / (1 + zobs) > (100 * _R_ALPHA)) & (zred > zmin)
+    x1 = jnp.where(red, (1 + zred) / (1 + zobs), 0.5)
+    x2 = jnp.where(red, (1 + zmin) / (1 + zobs), 0.25)
+    xx = _Ix(x1) - _Ix(x2)
+    zobs_s = jnp.where(red, zobs, zred)
+    tau = _R_ALPHA / jnp.pi * x_HI * tau_gp(zred, h, Om0, Ob0, Y=Y)
+    tau = tau * ((1 + zobs_s) / (1 + zred)) ** (3 / 2) * xx
+    return jnp.where(red, tau, 0.0)
+
+
+class MadauDampingDLA(Madau1995):
+    """Madau (1995) x IGM damping wing x damped Ly-alpha absorber (DLA).
+
+        attenuation = exp(-(igm_factor * tau_Madau + tau_damp(x_HI) + tau_DLA(logN_HI, z_dla)))
+
+    ``igm_factor`` scales the Madau forest only; the neutral fraction is its own parameter
+    (Prospector instead reads ``x_HI`` from ``igm_factor``, ``sedmodel.py:824``).
+
+    ``x_HI``, ``logN_HI`` and ``z_dla`` are theta keys like ``igm_factor``: the constructor
+    values are the defaults, and a theta entry (fixed or sampled) overrides them.  A component
+    is evaluated when its constructor value switches it on or its key is in theta; otherwise it
+    is skipped, so ``MadauDampingDLA()`` is ``Madau1995`` bit for bit, and so are ``x_HI = 0``
+    and ``logN_HI = -inf``.
+
+    Parameters
+    ----------
+    Ob0 : float -- baryon density today; required for the damping wing (CERIDWEN's Cosmology
+        carries no Ob0, so it is not guessed).  Planck18: 0.04897; WMAP9: 0.04628.
+    cosmo : Cosmology or None -- supplies ``h`` and ``Om0``; ``None`` = the CSP's cosmology,
+        bound at ``CSPBasis`` construction (a different one given here raises there).
+    x_HI : float -- IGM neutral fraction (> 1 mimics a local overdensity); 0 = no damping wing.
+    zmin : float -- lower redshift of the neutral IGM; no wing for ``zred <= zmin``.
+    Y : float -- helium mass fraction.
+    logN_HI : float or None -- DLA column [log10 cm^-2]; ``None`` = no DLA.
+    z_dla : float or None -- absorber redshift; ``None`` = the source redshift.  No DLA for
+        ``z_dla > zred``.  A foreground absorber is placed at rest wavelength
+        ``1215.67 (1 + z_dla) / (1 + zred)`` (Prospector's ``add_dla``, ``sedmodel.py:816``,
+        divides the other way and puts it redward of Ly-alpha; they agree at ``z_dla = zred``).
+    b_kms : float -- Doppler parameter of the DLA [km/s].
+    """
+
+    name = "madau1995_damping_dla"
+    param_names = ("x_HI", "logN_HI", "z_dla")
+
+    def __init__(self, Ob0=None, cosmo=None, x_HI=0.0, zmin=5.0, Y=0.25,
+                 logN_HI=None, z_dla=None, b_kms=40.0):
+        x_HI = float(x_HI)
+        if not x_HI >= 0.0:
+            raise ValueError(f"x_HI must be >= 0, got {x_HI}")
+        if Ob0 is not None and not float(Ob0) > 0.0:
+            raise ValueError(f"Ob0 must be > 0, got {Ob0}")
+        if logN_HI is not None and np.isnan(float(logN_HI)):
+            raise ValueError("logN_HI is NaN; pass None for no DLA")
+        self.x_HI = x_HI
+        self.zmin = float(zmin)
+        self.Y = float(Y)
+        self.Ob0 = None if Ob0 is None else float(Ob0)
+        self.cosmo = None
+        self.h = self.Om0 = None
+        if cosmo is not None:
+            self.bind_cosmology(cosmo)
+        self.logN_HI = None if logN_HI is None else float(logN_HI)
+        self.z_dla = None if z_dla is None else float(z_dla)
+        self.b_kms = float(b_kms)
+        if self.x_HI > 0.0 and self.Ob0 is None:
+            raise ValueError(
+                f"x_HI = {self.x_HI} > 0 switches on the damping wing, which needs Ob0= "
+                "(baryon density; Planck18 0.04897, WMAP9 0.04628): CERIDWEN's Cosmology "
+                "has no Ob0, so it is not guessed")
+
+    def bind_cosmology(self, cosmo):
+        """Take ``h`` and ``Om0`` from ``cosmo``; a model already bound to a different
+        cosmology raises (the damping wing and the flux factor would disagree)."""
+        h, Om0 = float(cosmo.h), float(cosmo.Om0)
+        if self.cosmo is not None and (h, Om0) != (self.h, self.Om0):
+            raise ValueError(
+                f"{type(self).__name__} was built with cosmology h={self.h}, Om0={self.Om0} "
+                f"but the CSP uses h={h}, Om0={Om0}; pass the same Cosmology, or cosmo=None "
+                "to take the CSP's")
+        self.cosmo, self.h, self.Om0 = cosmo, h, Om0
+
+    @staticmethod
+    def _get(params, key, default):
+        if params is not None and key in params:
+            return jnp.ravel(jnp.asarray(params[key]))[0]
+        return default
+
+    # --- components -----------------------------------------------------------------------
+    def tau_madau(self, lam_rest, zred):
+        return super().tau(lam_rest, zred)
+
+    def tau_damp(self, lam_rest, zred, params=None):
+        """Damping-wing optical depth; ``params['x_HI']`` overrides the constructor value."""
+        sampled = params is not None and "x_HI" in params
+        if not sampled and self.x_HI == 0.0:
+            return jnp.zeros_like(lam_rest)
+        if self.Ob0 is None:
+            raise ValueError(
+                "theta['x_HI'] switches on the damping wing, which needs the baryon density: "
+                "build the model as MadauDampingDLA(Ob0=...) and pass it as CSPBasis(igm_model=...)")
+        if self.h is None:
+            raise ValueError(
+                "MadauDampingDLA has no cosmology: pass cosmo= or use it through "
+                "CSPBasis(igm_model=...), which binds the CSP's")
+        x_HI = self._get(params, "x_HI", self.x_HI)
+        return tau_damping(lam_rest, zred, x_HI, self.h, self.Om0, self.Ob0,
+                           zmin=self.zmin, Y=self.Y)
+
+    def tau_dla(self, lam_rest, zred, params=None):
+        """DLA Voigt optical depth; ``params['logN_HI']`` / ``params['z_dla']`` override."""
+        sampled = params is not None and "logN_HI" in params
+        if not sampled and self.logN_HI is None:
+            return jnp.zeros_like(lam_rest)
+        N = 10.0 ** self._get(params, "logN_HI", self.logN_HI)
+        z_abs = self._get(params, "z_dla", zred if self.z_dla is None else self.z_dla)
+        wave_abs = lam_rest * (1 + zred) / (1 + z_abs)
+        tau = voigt_tau(wave_abs, N, bkms=self.b_kms)
+        return jnp.where(z_abs > zred, 0.0, tau)
+
+    # --- IGMModel interface ----------------------------------------------------------------
+    def tau(self, lam_rest, zred, params=None):
+        return (self.tau_madau(lam_rest, zred) + self.tau_damp(lam_rest, zred, params)
+                + self.tau_dla(lam_rest, zred, params))
+
+    def attenuation(self, lam_rest, zred, factor=1.0, params=None):
+        """``exp(-(factor * tau_Madau + tau_damp + tau_DLA))``: ``igm_factor`` scales the forest only."""
+        return jnp.exp(-(self.tau_madau(lam_rest, zred) * factor
+                         + self.tau_damp(lam_rest, zred, params)
+                         + self.tau_dla(lam_rest, zred, params)))
+
 
 _MODEL_REGISTRY = {
     "madau1995": Madau1995,
+    "madau1995_damping_dla": MadauDampingDLA,
     "none":      NoIGM,
 }
 
 
 def make_igm_model(name_or_model):
-    """Build an :class:`IGMModel` from a string name, an instance, or
-    ``None``.
-
-    Parameters
-    ----------
-    name_or_model : str, IGMModel, or None
-        String name (key of :data:`_MODEL_REGISTRY`), an already-built
-        :class:`IGMModel` instance (returned as-is), or ``None``
-        (returns :class:`NoIGM`).
-
-    Examples
-    --------
-    >>> make_igm_model("madau1995")      # -> Madau1995()
-    >>> make_igm_model(None)             # -> NoIGM()
-    >>> make_igm_model(Madau1995())      # -> same instance
-    """
+    """Return an :class:`IGMModel` from a registry name, an instance (as-is), or ``None`` (NoIGM)."""
     if name_or_model is None:
         return NoIGM()
     if isinstance(name_or_model, IGMModel):
@@ -277,4 +301,5 @@ def make_igm_model(name_or_model):
     return _MODEL_REGISTRY[name]()
 
 
-__all__ = ["IGMModel", "NoIGM", "Madau1995", "make_igm_model"]
+__all__ = ["IGMModel", "NoIGM", "Madau1995", "MadauDampingDLA", "make_igm_model",
+           "tau_damping", "tau_gp", "voigt_tau"]

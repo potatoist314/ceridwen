@@ -1,158 +1,165 @@
-"""Free-redshift path for ``Spectrum``.
-
-A ``Spectrum`` bakes its redshift into the projection at
-``setup_for_model``.  With ``free_z=True`` the prediction can be re-evaluated
-at a runtime ``zred`` by stretching the observed grid: the model at redshift
-``z`` seen at observed pixel ``wo`` is the model at the setup redshift ``z0``
-seen at ``wo * (1 + z0) / (1 + z)``.  Every smoothing kernel here is
-velocity-shift-invariant, so the stretch commutes with the smoothing and the
-only error is the linear interpolation between observed pixels.
-
-The first tests need no SSP grid; the last one runs the CSP dispatch on the
-alpha-enhanced schema-2.1 grid and skips when it is absent.
-"""
+"""A sampled redshift with a Spectrum observation: SedModel builds the spectral
+projector for the zred prior range, predict() re-projects at theta['zred'], and
+the result equals a model built at that fixed redshift."""
 from __future__ import annotations
 
 import os
+import pathlib
+import sys
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
-import jax
-import jax.numpy as jnp
 import numpy as np
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
 import pytest
 
-jax.config.update("jax_enable_x64", True)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _gridfixture import find_test_grid                                   # noqa: E402
 
-from ceridwen.observation.spectrum import Spectrum
-from ceridwen.observation.base import _CKMS
+from ceridwen import SSPData, CSPBasis, SedModel, Cosmology                # noqa: E402
+from ceridwen.broadening import Kinematics, Instrument                     # noqa: E402
+from ceridwen.observation import Photometry, Spectrum                      # noqa: E402
+from ceridwen.model.transforms import logsfr_ratios_to_sfh                # noqa: E402
+from ceridwen.sampler.priors import Uniform, Normal                        # noqa: E402
 
-Z0 = 0.70
-DV_KMS = 60.0                         # a plausible catalogue-redshift error
-DZ = DV_KMS / _CKMS * (1.0 + Z0)
-SIGMA_LOSVD = 200.0
-INSTR_R = 2600.0
-
-
-def _model_grid(lo=2500.0, hi=6000.0, resolving_power=6000.0):
-    n = int(np.log(hi / lo) * resolving_power) + 1
-    return lo * np.exp(np.arange(n) / resolving_power)
+Z_LO, Z_HI, Z_INIT = 0.7, 0.9, 0.8
+N_TIME = 5
+FILTERS = ["sdss_g0", "sdss_r0", "sdss_i0", "sdss_z0"]
+SPEC_WAVE = np.linspace(7000.0, 12000.0, 800)      # observed frame, A
 
 
-def _model_spectrum(wm):
-    """Continuum with a handful of absorption lines (rest frame)."""
-    flux = 1.0 + 0.2 * (wm - wm[0]) / (wm[-1] - wm[0])
-    for centre, depth in ((3934.0, 0.5), (3969.0, 0.4), (4102.0, 0.3),
-                          (4341.0, 0.3), (4861.0, 0.35), (5175.0, 0.25)):
-        flux = flux * (1.0 - depth * np.exp(-0.5 * ((wm - centre) / 1.5) ** 2))
-    return jnp.asarray(flux)
+def _csp(add_neb):
+    path = find_test_grid()
+    if path is None:
+        pytest.skip("no test grid")
+    if add_neb and not os.environ.get("SPS_HOME"):
+        pytest.skip("SPS_HOME not set (CLOUDY grids)")
+    ssp = SSPData.load(str(path))
+    cosmo = Cosmology.planck18()
+    # grid valid at every z in the range: oldest node = age(Z_HI)
+    kw = dict(lookback_time=jnp.linspace(0.0, float(cosmo.age(Z_HI)), N_TIME),
+              zh_const=True, sfh_interp="step", add_dust=False, add_diffuse_dust=True,
+              add_neb=add_neb, add_igm=False, verbose=False, cosmo=cosmo)
+    if add_neb:
+        kw["sps_home"] = os.environ["SPS_HOME"]
+    return CSPBasis(ssp, **kw)
 
 
-def _observed_grid(lo=6300.0, hi=8800.0, step=0.6):
-    return np.arange(lo, hi, step)
+def _obs():
+    n = SPEC_WAVE.size
+    spec = Spectrum(wavelength=SPEC_WAVE, flux=np.full(n, 1e-18), uncertainty=np.full(n, 1e-19),
+                    instrument=Instrument.R_fwhm(1000.0), name="spec")
+    phot = Photometry(filters=FILTERS, flux=np.full(4, 1e-9), uncertainty=np.full(4, 1e-10),
+                      name="phot")
+    return spec, phot
 
 
-def _build(zred, free_z, fit_sigma_smooth=False):
-    wo = _observed_grid()
-    spec = Spectrum(
-        wavelength=wo, flux=np.ones_like(wo), uncertainty=np.ones_like(wo),
-        smoothtype="R", resolution=INSTR_R, res_convention="fwhm", inres=0.0,
-        sigma_losvd=SIGMA_LOSVD, fit_sigma_smooth=fit_sigma_smooth,
-        free_z=free_z, name="spec",
-    )
-    spec.setup_for_model(_model_grid(), zred=zred)
-    return spec
+def _model(csp, obs, *, zred_prior=None, zred_fixed=None, extra_priors=None):
+    t = np.array(csp.sfh_times)
+
+    def _sfh(th, _t=t):
+        return logsfr_ratios_to_sfh(th["logsfr_ratios"], sfh_times_yr=_t)
+    init = {"logsfr_ratios": jnp.zeros(N_TIME - 1), "logmass": jnp.array([10.0])}
+    priors = dict(extra_priors or {})
+    kw = {}
+    if zred_fixed is not None:
+        kw["zred"] = zred_fixed
+    else:
+        init["zred"] = jnp.array([Z_INIT])
+        if zred_prior is not None:
+            priors["zred"] = zred_prior
+    return SedModel(csp, obs, priors=priors, transforms={"sfh": _sfh},
+                    free_param_init=init, kinematics=Kinematics(sigma_gal=200.0, sigma_gas=80.0),
+                    **kw)
 
 
-def _interior(wo, z_hi):
-    """Pixels whose stretched position stays inside the observed grid."""
-    lo, hi = wo[0] * (1.0 + z_hi) / (1.0 + Z0), wo[-1] * (1.0 + Z0) / (1.0 + z_hi)
-    return (wo > lo + 5.0) & (wo < hi - 5.0)
+def _theta(model, z=None):
+    th = {k: jnp.asarray(v) for k, v in model.theta_init.items()}
+    if "logzsol" in th:
+        th["logzsol"] = jnp.array([-0.3])
+    if z is not None:
+        th["zred"] = jnp.array([z])
+    return th
 
 
-def test_predict_at_setup_redshift_matches_baked_prediction():
-    wm = _model_grid()
-    flux = _model_spectrum(wm)
-    spec = _build(Z0, free_z=True)
-    baked = np.asarray(spec.predict(flux, wm))
-    moved = np.asarray(spec.predict(flux, wm, zred=Z0))
-    np.testing.assert_allclose(moved, baked, rtol=1e-10, atol=0.0)
+@pytest.fixture(scope="module")
+def csp():
+    return _csp(False)
 
 
-@pytest.mark.parametrize("fit_sigma_smooth", [False, True])
-def test_predict_at_shifted_redshift_matches_fresh_setup(fit_sigma_smooth):
-    wm = _model_grid()
-    flux = _model_spectrum(wm)
-    z1 = Z0 + DZ
-    free = _build(Z0, free_z=True, fit_sigma_smooth=fit_sigma_smooth)
-    fresh = _build(z1, free_z=False, fit_sigma_smooth=fit_sigma_smooth)
-    kw = dict(sigma_smooth=SIGMA_LOSVD) if fit_sigma_smooth else {}
-    moved = np.asarray(free.predict(flux, wm, zred=z1, **kw))
-    target = np.asarray(fresh.predict(flux, wm, **kw))
-    wo = np.asarray(free.wavelength)
-    inside = _interior(wo, z1)
-    # The shift moves the lines by ~1.4 A on a 0.6 A grid, so the baked
-    # prediction itself must be far from the target before the stretch.
-    baked = np.asarray(free.predict(flux, wm, **kw))
-    assert np.max(np.abs(baked - target)[inside]) > 1e-2
-    # Residual floor: linear interpolation between 0.6 A pixels of a line
-    # smoothed to ~5 A, h^2 f''/8 ~ 5e-4 of the continuum at the line
-    # cores.  LEGA-C pixel noise is ~5e-2, so this is 100x below it.
-    np.testing.assert_allclose(moved[inside], target[inside],
-                               rtol=0.0, atol=1e-3)
+@pytest.fixture(scope="module")
+def csp_neb():
+    return _csp(True)
 
 
-def test_free_z_off_ignores_zred_kwarg_gracefully():
-    """Without ``free_z`` the Spectrum has no stretch to apply and must say so."""
-    wm = _model_grid()
-    flux = _model_spectrum(wm)
-    spec = _build(Z0, free_z=False)
-    with pytest.raises(TypeError):
-        spec.predict(flux, wm, zred=Z0 + DZ)
+def test_free_z_spectrum_model_builds_and_matches_fixed_z(csp):
+    spec, phot = _obs()
+    with pytest.warns(UserWarning):          # unpriored sampled parameters (logsfr_ratios, ...)
+        free = _model(csp, [spec, phot], zred_prior=Uniform(low=Z_LO, high=Z_HI))
+    assert free.zred_is_free
+    assert spec._proj.free_z and spec._proj.zred_range == (Z_LO, Z_HI)
+    assert spec._proj.opz_ref == 1.0 + Z_INIT
+    assert phot.free_z
+    for z in (Z_INIT, 0.74, 0.88):
+        spec_f, phot_f = _obs()
+        with pytest.warns(UserWarning):
+            fixed = _model(csp, [spec_f, phot_f], zred_fixed=z)
+        a = free.predict(_theta(free, z))
+        b = fixed.predict(_theta(fixed))
+        # at the reference redshift the free-z projector shares its log-grid nodes with the
+        # fixed-z one (exact); elsewhere the two grids differ in node phase and the linear
+        # interpolation of the model onto them differs at the per-mille level
+        for k in ("spec", "phot"):
+            tol = 1e-9 if (z == Z_INIT and k == "spec") else 1e-2
+            ra = np.asarray(a[k]); rb = np.asarray(b[k])
+            assert np.all(np.isfinite(ra))
+            assert np.max(np.abs(ra - rb)) < tol * np.max(np.abs(rb)), (k, z)
 
 
-def test_csp_dispatch_threads_sampled_zred_into_spectrum():
-    from _gridfixture import find_test_grid
-    grid = find_test_grid("amist_c3k_hr_krou_afe.h5")
-    if grid is None:
-        pytest.skip("alpha-enhanced schema-2.1 grid not found")
-    from ceridwen.csp import CSPBasis_afe
-    from ceridwen.ssps import SSPDataAfe
+def test_free_z_spectrum_with_lines(csp_neb):
+    spec, phot = _obs()
+    with pytest.warns(UserWarning):
+        free = _model(csp_neb, [spec, phot], zred_prior=Uniform(low=Z_LO, high=Z_HI))
+    assert spec._proj.line_idx.size > 0
+    for z in (Z_INIT, 0.86):
+        spec_f, phot_f = _obs()
+        with pytest.warns(UserWarning):
+            fixed = _model(csp_neb, [spec_f, phot_f], zred_fixed=z)
+        ra = np.asarray(free.predict(_theta(free, z))["spec"])
+        rb = np.asarray(fixed.predict(_theta(fixed))["spec"])
+        tol = 1e-9 if z == Z_INIT else 1e-2
+        assert np.max(np.abs(ra - rb)) < tol * np.max(np.abs(rb)), z
 
-    ssp = SSPDataAfe.load(str(grid))
-    csp = CSPBasis_afe(
-        ssp, lookback_time=jnp.linspace(0.0, 6.0, 5),
-        zh_const=True, sfh_interp="step",
-        add_dust=False, add_diffuse_dust=True,
-        sigma_losvd_kms=0.0, verbose=False,
-    )
-    wo = _observed_grid()
-    spec = Spectrum(
-        wavelength=wo, flux=np.ones_like(wo), uncertainty=np.ones_like(wo),
-        smoothtype="R", resolution=INSTR_R, res_convention="fwhm",
-        sigma_losvd=SIGMA_LOSVD, fit_sigma_smooth=True, free_z=True,
-        name="spec",
-    )
-    spec.setup_for_model(csp.wave, zred=Z0,
-                         lib_resolution=getattr(csp, "lib_resolution", None))
 
-    theta = dict(csp.all_params)
-    theta["logmass"] = jnp.array([10.5])
-    theta["afe"] = jnp.array([0.2])
-    theta["sigma_smooth"] = jnp.array([SIGMA_LOSVD])
-    theta["zred"] = jnp.array([Z0])
-    at_z0 = np.asarray(csp.predict(theta, [spec])["spec"])
-    theta["zred"] = jnp.array([Z0 + DZ])
-    at_z1 = np.asarray(csp.predict(theta, [spec])["spec"])
+def test_free_z_spectrum_needs_a_range(csp):
+    spec, phot = _obs()
+    with pytest.raises(ValueError, match="zred_range"):
+        with pytest.warns(UserWarning):
+            _model(csp, [spec, phot], zred_prior=Normal(mean=Z_INIT, sigma=0.02))
+    spec2 = Spectrum(wavelength=SPEC_WAVE, flux=np.full(SPEC_WAVE.size, 1e-18),
+                     uncertainty=np.full(SPEC_WAVE.size, 1e-19),
+                     instrument=Instrument.R_fwhm(1000.0), name="spec",
+                     zred_range=(Z_LO, Z_HI))
+    with pytest.warns(UserWarning):
+        m = _model(csp, [spec2, phot], zred_prior=Normal(mean=Z_INIT, sigma=0.02))
+    assert spec2._proj.free_z and spec2._proj.zred_range == (Z_LO, Z_HI)
+    assert np.all(np.isfinite(np.asarray(m.predict(_theta(m, 0.81))["spec"])))
 
-    inside = _interior(wo, Z0 + DZ)
-    # The flux factor alone changes the level by ~1e-3; moved lines
-    # change the cores by ~1e-2.
-    assert np.max(np.abs(at_z1 - at_z0)[inside] / at_z0[inside]) > 5e-3
-    # The dispatch must do exactly what a direct predict(..., zred=) does.
-    phot_spec, slit_spec, line_slit = csp._assemble_observer_spectra(theta)
-    _, slit_spec, _ = csp._apply_mass_redshift_igm(phot_spec, slit_spec,
-                                                   line_slit, theta)
-    direct = np.asarray(spec.predict(slit_spec, csp.wave,
-                                     sigma_smooth=SIGMA_LOSVD, zred=Z0 + DZ))
-    np.testing.assert_allclose(at_z1, direct, rtol=1e-8)
+
+def test_free_z_spectrum_jit_and_grad(csp):
+    spec, phot = _obs()
+    with pytest.warns(UserWarning):
+        free = _model(csp, [spec, phot], zred_prior=Uniform(low=Z_LO, high=Z_HI))
+    th = _theta(free, Z_INIT)
+    pred = free.predict_jit(th)
+    assert np.all(np.isfinite(np.asarray(pred["spec"])))
+
+    def loss(z):
+        t = dict(th, zred=z)
+        return jnp.sum((free.predict(t)["spec"] / 1e-18) ** 2)
+
+    z0 = jnp.array([0.81])
+    g = float(jax.grad(loss)(z0)[0])
+    eps = 1e-5
+    fd = float((loss(z0 + eps) - loss(z0 - eps)) / (2 * eps))
+    assert np.isfinite(g) and np.isclose(g, fd, rtol=1e-3)

@@ -28,6 +28,7 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from ceridwen.ssps.ssp_data import SSPData
+from ceridwen.cosmology import Cosmology
 from ceridwen.csp.csp     import CSPBasis
 from ceridwen.observation.observation import Photometry
 
@@ -50,6 +51,13 @@ LB_OLD  = jnp.linspace(0.0, T_UNIV - 1e-2, N_TIME)  # NEW convention, ascending
 PSI_OLD = jnp.exp(-LB_OLD / 1.0)   # SFR at each lookback node
 
 
+# The goldens were captured at the native axis value log10 Z = -2.0 on the BPASS grid
+# (Z = 0.01), which is grid node 7.  In the logzsol convention (v1.0.5) that is
+# -2.0 - log10 Z_sun = -2.0 - (-1.6989700043360187), i.e. the same physical metallicity and
+# the same exact node, so the stored arrays are unchanged (tested in _assert_baseline_node).
+LOGZSOL_BASELINE = -0.30102999566398125
+
+
 def _build_theta(zh_const: bool, per_bin: bool):
     sfh = PSI_OLD
     if per_bin:
@@ -59,9 +67,9 @@ def _build_theta(zh_const: bool, per_bin: bool):
         "sfh":           sfh,
     }
     if zh_const:
-        theta["Z"]  = jnp.asarray([-2.0])
+        theta["logzsol"] = jnp.asarray([LOGZSOL_BASELINE])
     else:
-        theta["zh"] = jnp.asarray(np.full(N_TIME, -2.0))
+        theta["logzsol_hist"] = jnp.asarray(np.full(N_TIME, LOGZSOL_BASELINE))
     return theta
 
 
@@ -69,12 +77,13 @@ def _build_csp(ssp, theta, *, sfh_interp, zh_const):
     return CSPBasis(
         ssp,
         theta             = theta,
-        tuniv             = T_UNIV,
+        cosmo=Cosmology.planck18(),
         zh_const          = zh_const,
         add_dust          = False,
         add_diffuse_dust  = False,
         add_dust_emission = False,
         add_neb           = True,
+        init_neb_params   = {"cloudy_dust": True},   # the grid the goldens were captured with
         nebemlineinspec   = True,
         verbose           = False,
         sfh_interp        = sfh_interp,

@@ -12,7 +12,10 @@ convention -- i.e. with both ``lookback_time`` AND ``sfh`` (and
 
 If any assertion fails by more than float64 rounding the kernel has
 an indexing bug, not a numerical artefact -- do not loosen the
-tolerance.
+tolerance.  The W baselines are the invariant; the spec / lines / maggies
+baselines depend on the broadening as well and are re-captured with
+``tests/baselines/_recapture_spectra.py`` when that changes (last:
+2026-09-10, one kinematic kernel).
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ jax.config.update("jax_enable_x64", True)
 
 from ceridwen.ssps.ssp_data import SSPData
 from ceridwen.csp.csp     import CSPBasis
+from ceridwen.cosmology   import Cosmology
 from ceridwen.observation.observation import Photometry
 
 
@@ -56,6 +60,22 @@ def ssp():
     return SSPData.load(SSP_FILE)
 
 
+def test_baseline_logzsol_matches_the_capture_value(ssp):
+    """LOGZSOL_BASELINE must be the capture-time metallicity, native log10 Z = -2.0, in the
+    v1.0.5 convention: logzsol + log10 Z_sun == -2.0 exactly, so the goldens still apply.
+    (-2.0 is one ulp above grid node 7, -1.9999999999999998, where the weight clips to 1.)"""
+    assert LOGZSOL_BASELINE + float(ssp.log10_zsun) == -2.0
+    assert abs(LOGZSOL_BASELINE - (float(np.asarray(ssp.ssp_lgmet)[7]) -
+                                   float(ssp.log10_zsun))) < 1e-15
+
+
+# The goldens were captured at the native axis value log10 Z = -2.0 on the BPASS grid
+# (Z = 0.01), which is grid node 7.  In the logzsol convention (v1.0.5) that is
+# -2.0 - log10 Z_sun = -2.0 - (-1.6989700043360187), i.e. the same physical metallicity and
+# the same exact node, so the stored arrays are unchanged (tested in _assert_baseline_node).
+LOGZSOL_BASELINE = -0.30102999566398125
+
+
 def _build_theta_new(zh_const: bool, per_bin: bool):
     """Rebuild the same physical SFH used at baseline-capture time.
     After the 2026-06-03 lookback flip the manifest stores NEW-convention
@@ -73,9 +93,10 @@ def _build_theta_new(zh_const: bool, per_bin: bool):
         "sfh":           sfh,
     }
     if zh_const:
-        theta["Z"] = jnp.asarray([-2.0])
+        theta["logzsol"] = jnp.asarray([LOGZSOL_BASELINE])
     else:
-        theta["zh"] = jnp.asarray(np.full(N_TIME, -2.0))   # constant Z history
+        theta["logzsol_hist"] = jnp.asarray(       # constant metallicity history
+            np.full(N_TIME, LOGZSOL_BASELINE))
     return theta
 
 
@@ -83,12 +104,13 @@ def _build_csp(ssp, theta, *, sfh_interp, zh_const):
     return CSPBasis(
         ssp,
         theta             = theta,
-        tuniv             = T_UNIV,
+        cosmo             = Cosmology.planck18(),   # the pre-2026-09-03 default
         zh_const          = zh_const,
         add_dust          = False,
         add_diffuse_dust  = False,
         add_dust_emission = False,
         add_neb           = True,
+        init_neb_params   = {"cloudy_dust": True},   # the grid the goldens were captured with
         nebemlineinspec   = True,
         verbose           = False,
         sfh_interp        = sfh_interp,
@@ -124,7 +146,8 @@ def test_lookback_flip_invariant(ssp, sfh_interp, zh_const, per_bin, tag):
     W_new       = np.asarray(csp.calculate_ssp_weights(theta_full))
     spec_new    = np.asarray(csp.get_spectrum(theta_full))
     lines_new   = np.asarray(csp.get_line_spec(theta_full))
-    maggies_new = np.asarray(csp.predict(theta_full, [phot])[phot.name])
+    spec_phot = csp._apply_mass_redshift_igm(*csp._assemble_observer_spectra(theta_full), theta_full)[0]
+    maggies_new = np.asarray(phot.get_maggies(csp.wave, spec_phot))
 
     W_ref       = np.load(BASELINES / f"W_{tag}.npy")
     spec_ref    = np.load(BASELINES / f"spec_{tag}.npy")
@@ -143,7 +166,8 @@ def test_lookback_flip_invariant(ssp, sfh_interp, zh_const, per_bin, tag):
 
     # Spectra and maggies flow through float32 einsums, so float32 rtol.
     np.testing.assert_allclose(spec_new,    spec_ref,    rtol=1e-6, atol=0)
-    np.testing.assert_allclose(lines_new,   lines_ref,   rtol=1e-6, atol=0)
+    np.testing.assert_allclose(lines_new,   lines_ref,   rtol=1e-6,
+                               atol=1e-6 * float(np.max(np.abs(lines_ref))))
     np.testing.assert_allclose(maggies_new, maggies_ref, rtol=1e-6, atol=0)
 
 

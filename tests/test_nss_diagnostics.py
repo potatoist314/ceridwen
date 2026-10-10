@@ -49,9 +49,11 @@ def test_likelihood_count_semantics_survive_hdf5_and_legacy_loading(tmp_path):
     from ceridwen.fit import write_result_h5, load_result_h5
     from ceridwen.sampler.runner import SamplingResult
 
+    from ceridwen.cosmology import Cosmology
+
     model = SimpleNamespace(observations=[], csp=SimpleNamespace(wave=jnp.arange(2.)),
                             theta_init={'x': jnp.zeros(1)}, priors={}, transforms={},
-                            param_names=['x'], zred=0.)
+                            param_names=['x'], zred=0., cosmo=Cosmology.planck18())
     result = SamplingResult(samples={'x': jnp.zeros(2)}, log_evidence=0.,
         log_evidence_err=.1, log_weights=jnp.zeros(2), log_likelihoods=jnp.zeros(2),
         param_names=['x'], n_likelihood_calls=13, wall_time_s=1., sampler_name='blackjax.nss',

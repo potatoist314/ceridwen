@@ -1,5 +1,3 @@
-# ceridwen/likelihood/__init__.py
-
 from .noise_model import (
     NoiseModelOutput,
     NoiseModelBase,
@@ -13,35 +11,45 @@ from .likelihood import (
     LikelihoodBase,
     lnlike_diag_gaussian,
     lnlike_diag_gaussian_with_upper_limits,
+    lnlike_diag_outlier,
+    lnlike_diag_outlier_with_upper_limits,
+    outlier_probability,
     DiagonalGaussianLikelihood,
     DiagonalGaussianLikelihoodWithUpperLimits,
     MultiObservationLikelihood,
     make_lnprobfn,
 )
 
-from .theta import (
-    ThetaVector,
-    make_theta_vector_from_csp,
+from .gp_likelihood import (
+    GP_JITTER,
+    gp_sqdist,
+    lnlike_gp_gaussian,
+    gp_conditional_mean,
+    GPGaussianLikelihood,
 )
+from .poly_marginal import PolyMarginalGaussianLikelihood
 
 __all__ = [
-    # noise model
     "NoiseModelOutput",
     "NoiseModelBase",
     "DiagonalNoiseModel",
-    # calibration
     "PolynomialCalibration",
     "EmissionLineColumns",
-    # likelihood
     "LikelihoodOutput",
     "LikelihoodBase",
     "lnlike_diag_gaussian",
     "lnlike_diag_gaussian_with_upper_limits",
+    "lnlike_diag_outlier",
+    "lnlike_diag_outlier_with_upper_limits",
+    "outlier_probability",
     "DiagonalGaussianLikelihood",
     "DiagonalGaussianLikelihoodWithUpperLimits",
     "MultiObservationLikelihood",
     "make_lnprobfn",
-    # theta adapter
-    "ThetaVector",
-    "make_theta_vector_from_csp",
+    "GP_JITTER",
+    "gp_sqdist",
+    "lnlike_gp_gaussian",
+    "gp_conditional_mean",
+    "GPGaussianLikelihood",
+    "PolyMarginalGaussianLikelihood",
 ]

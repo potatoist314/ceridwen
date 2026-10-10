@@ -1,75 +1,5 @@
-"""
-ceridwen/sampler/nested.py
-==========================
-BlackJAX adaptive nested sampler (``blackjax.nss``) adapter for Ceridwen.
-
-Algorithm background
---------------------
-Nested sampling (Skilling 2006) integrates the Bayesian evidence by
-compressing the prior volume along iso-likelihood contours.  At each
-step the least-likely live point is replaced by a new point drawn from
-the prior inside the current likelihood contour.
-
-BlackJAX's ``nss`` (nested slice sampler) uses an adaptive slice-sampling
-inner kernel.  The key parameters are:
-
-``num_live``
-    Resolution parameter.  Evidence uncertainty scales as
-    :math:`1/\\sqrt{N_\\mathrm{live}}`.  Typical: 200 (fast) – 2000
-    (publication quality).
-
-``num_inner_steps``
-    Reliability of the inner MCMC chain.  Best practice: ``n_dims * 5``.
-    Check stability by halving/doubling.
-
-``num_delete``
-    Parallelisation: points removed per iteration.
-    Default: ``max(1, num_live // 5)``, adopted from the 2026-08 JADES
-    campaign tuning (64 at ``num_live = 300``).  Larger batches gain
-    little extra throughput once evaluation is vectorised, while the
-    naive single-deletion volume rule used by fallback evidence
-    estimators (not the anesthetic path) biases :math:`\\ln Z` high by
-    several nats at ``num_delete = num_live // 2``.  Must stay
-    strictly below ``num_live`` (a BlackJAX NSS constraint).
-
-``logZ_tol``
-    Convergence threshold :math:`\\ln(Z_\\mathrm{live}/Z)`.
-    Iteration stops when the live contribution drops below this.
-    Default ``-5``.  The fraction of the total evidence still in the
-    live set at termination is :math:`f = e^{tol}/(1 + e^{tol})`:
-    ``-5`` leaves 0.67 per cent (marginally stricter than nautilus's
-    ``f_live = 0.01``, which corresponds to ``-4.595``); ``-3`` leaves
-    4.7 per cent; a value as loose as ``-1`` leaves 27 per cent of the
-    evidence unaccounted for.
-
-Installation
-------------
-::
-
-    # Nested sampling (blackjax.nss) is merged into the official blackjax;
-    # until it lands in a PyPI release, install the pinned commit:
-    pip install "git+https://github.com/blackjax-devs/blackjax@f73e12956"
-    pip install anesthetic   # optional (posteriors/plots; now on PyPI)
-
-Usage
------
-::
-
-    from ceridwen.sampler        import run_sampler
-    from ceridwen.sampler.nested import BlackJAXNestedSamplerAdapter
-
-    adapter = BlackJAXNestedSamplerAdapter(
-        priors          = model.priors,
-        num_live        = 500,
-        num_inner_steps = len(model.param_names) * 5,
-    )
-    result = run_sampler(model, multi_likelihood, adapter,
-                         jax.random.PRNGKey(42))
-
-    print(result.summary())
-    ns = result.to_anesthetic(labels={...})
-    ns.plot_2d([...])
-"""
+"""Nested sampling adapter: live-point initialisation from priors, the NS
+loop with periodic checkpoints (resumable), and evidence/weight extraction."""
 
 from __future__ import annotations
 
@@ -84,6 +14,7 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from .runner import SamplerAdapter, SamplingResult
+from .priors import sample_for_parameter
 
 Array = jax.Array
 
@@ -424,24 +355,12 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
     return update_function
 
 
+# relative tolerance of the resume check on the saved live points' ln L (see _load_resume)
+RESUME_LOGL_RTOL = 1e-6
+
+
 class BlackJAXNestedSamplerAdapter(SamplerAdapter):
-    """
-    Adapter wrapping ``blackjax.nss`` for use with any Ceridwen ``SedModel``.
-
-    Handles three concerns that are specific to nested sampling in Ceridwen:
-
-    1. **Live-point initialisation** — samples each free parameter
-       independently from its registered prior using the ``Prior.sample``
-       method from ``ceridwen.sampler.priors``.
-
-    2. **Shape reconciliation** — the BlackJAX NSS live-point dict has
-       shape ``{name: (num_live, *param_shape)}``.  The step function
-       vmaps over axis 0, delivering single-particle slices of shape
-       ``(*param_shape,)`` to ``loglike_fn`` / ``logprior_fn``.  This
-       matches the Ceridwen dict-theta convention exactly.
-
-    3. **Evidence extraction** — optionally uses ``anesthetic`` for a
-       more accurate :math:`\\ln Z` estimate with uncertainty.
+    """Nested-sampling adapter driving the NSS kernel with a Ceridwen ``SedModel``.
 
     Parameters
     ----------
@@ -506,7 +425,17 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         ``elapsed_s``).  Written whether or not ``verbose`` is set, appended
         and flushed per line so a killed run keeps its history.  Default None
         writes nothing.
+    resume_from : str, optional
+        A periodic checkpoint (``ns_checkpoint_<pid>.pkl``) to continue from
+        instead of starting afresh.  The run continues with the saved live
+        points, dead points and rng key, so it reproduces the uninterrupted
+        run at the same key.  The checkpoint must come from the same model:
+        the settings, the parameter shapes and the log-likelihood of the
+        saved live points are checked before sampling resumes.
     """
+
+    #: format of the ``resume`` block written into periodic checkpoints
+    RESUME_VERSION = 1
 
     def __init__(
         self,
@@ -525,11 +454,12 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         iteration_callback: Optional[Callable] = None,
         progress_path: Optional[str] = None,
         slice_kernel: str = "lanes",
+        resume_from           : Optional[str] = None,
     ):
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
-        self._num_inner_steps = num_inner_steps   # None → auto
-        self._num_delete      = num_delete         # None → max(1, num_live // 5)
+        self._num_inner_steps = num_inner_steps
+        self._num_delete      = num_delete
         self.logZ_tol        = float(logZ_tol)
         self.verbose         = bool(verbose)
         self.iteration_callback = iteration_callback
@@ -554,6 +484,9 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self.checkpoint_frame_draws = int(checkpoint_frame_draws)
         self.checkpoint_frame_limit = int(checkpoint_frame_limit)
         self.checkpoint_frame_max_bytes = int(checkpoint_frame_max_bytes)
+        self.resume_from           = None if resume_from is None else str(resume_from)
+        if self.resume_from is not None and not os.path.isfile(self.resume_from):
+            raise FileNotFoundError(f"resume_from={self.resume_from!r}: no such checkpoint")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -568,17 +501,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         theta_init : dict[str, Array],
         rng_key    : Array,
     ) -> dict[str, Array]:
-        """
-        Draw ``num_live`` initial live points from the registered priors.
-
-        Each parameter is sampled independently.  The returned dict has
-        shape ``{name: (num_live, *param_shape)}``.
-
-        Raises
-        ------
-        ValueError
-            If any free parameter has no registered prior.
-        """
+        """Draw ``num_live`` live points from the priors; returns {name: (num_live, *param_shape)}."""
         particles = {}
         for name, init_val in theta_init.items():
             if name not in self.priors:
@@ -590,39 +513,19 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 )
             prior          = self.priors[name]
             rng_key, sub   = jax.random.split(rng_key)
-            expected_shape = init_val.shape           # e.g. (1,) or (k,)
+            expected_shape = init_val.shape
 
-            # Pass the full target shape (num_live, *expected_shape) to
-            # prior.sample so TFP broadcasts a scalar distribution over
-            # all required dimensions in a single call.
-            #
-            # Examples:
-            #   Normal(0, 1), expected_shape=(4,)
-            #     → sample((500, 4)) → (500, 4)  ✓  iid per element
-            #   Uniform(-2.5, 0.2), expected_shape=(1,)
-            #     → sample((500, 1)) → (500, 1)  ✓
-            #
-            # This avoids the shape mismatch that arises when sampling
-            # (num_live,) and then trying to reshape to (num_live, k).
-            particles[name] = prior.sample(sub, shape=(self.num_live, *expected_shape))
+            try:
+                particles[name] = sample_for_parameter(prior, sub, self.num_live,
+                                                       expected_shape)
+            except ValueError as exc:
+                raise ValueError(f"prior of {name!r}: {exc}") from None
 
         return particles
 
-    # ------------------------------------------------------------------
-    # Checkpoint / rescue helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _finalise_dead(live, dead_list, ns_utils):
-        """Merge the live ensemble into the accumulated dead points and return
-        ``(positions_dict, loglikelihood, loglikelihood_birth)``.
-
-        Version-aware over BlackJAX ``finalise`` (0.1.0b0 has no
-        ``update_info`` kwarg) and over the dead-point layout (older dict
-        ``particles`` vs v3 ``StateWithLogLikelihood``).  Shared by the
-        end-of-run path and the periodic checkpoints so the finalise logic
-        lives in ONE place.
-        """
+        """Merge live into dead points; returns (positions_dict, loglikelihood, loglikelihood_birth)."""
         import inspect as _inspect
         if "update_info" in _inspect.signature(ns_utils.finalise).parameters:
             dead = ns_utils.finalise(live, dead_list, update_info=False)
@@ -637,8 +540,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         return positions, dead.loglikelihood, dead.loglikelihood_birth
 
     def _resolve_ckpt_dir(self):
-        """Checkpoint destination: explicit arg -> $CERIDWEN_CHECKPOINT_DIR ->
-        $CERIDWEN_RESCUE_DIR -> None (disabled)."""
+        """Checkpoint dir: explicit arg -> $CERIDWEN_CHECKPOINT_DIR -> $CERIDWEN_RESCUE_DIR -> None."""
         return (self._checkpoint_dir
                 or os.environ.get("CERIDWEN_CHECKPOINT_DIR")
                 or os.environ.get("CERIDWEN_RESCUE_DIR"))
@@ -720,20 +622,21 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         return path
 
     def _dump_snapshot(self, ckpt_dir, live, dead_list, ns_utils, logZ,
-                       *, tag, partial, progress):
+                       *, tag, partial, progress, finalised=None, resume=None):
         """Atomically pickle a finalised snapshot of the run so far.
 
         Schema 2 adds progress metadata to the legacy recovery keys.  A
         ``partial=True`` snapshot marks a run that had not converged.
-        Best-effort: never let a checkpoint break the run.  Atomic via
-        write-to-temp + os.replace so a kill mid-write cannot corrupt an
-        existing checkpoint.
+        ``resume`` (periodic checkpoints) adds the raw sampler state needed
+        by ``resume_from``.  Best-effort: never let a checkpoint break the
+        run.  Atomic via write-to-temp + os.replace so a kill mid-write
+        cannot corrupt an existing checkpoint.
         """
         try:
             import pickle as _pickle
             import numpy as _np
-            pos, logl, logl_birth = self._finalise_dead(live, dead_list,
-                                                        ns_utils)
+            pos, logl, logl_birth = (finalised if finalised is not None
+                                     else self._finalise_dead(live, dead_list, ns_utils))
             os.makedirs(ckpt_dir, exist_ok=True)
             fname = (f"ns_raw_dead_{os.getpid()}.pkl" if tag == "rescue"
                      else f"ns_checkpoint_{os.getpid()}.pkl")
@@ -749,6 +652,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                     "n_dead": int(_np.asarray(logl).shape[0]),
                     "partial": bool(partial),
                     "progress": dict(progress),
+                    **({"resume": resume} if resume is not None else {}),
                 }
                 _pickle.dump(snapshot, fh)
             os.replace(tmp, path)
@@ -763,16 +667,62 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             print(f"  [{tag}] WARNING: snapshot failed: {exc}")
             return None
 
+    def _run_config(self, theta_init, num_inner_steps, num_delete):
+        """What must match between a checkpoint and the run that resumes it."""
+        return {"num_live": self.num_live, "num_delete": int(num_delete),
+                "num_inner_steps": int(num_inner_steps),
+                "params": [(k, tuple(int(d) for d in jnp.shape(v)))
+                           for k, v in theta_init.items()]}
+
+    def _resume_block(self, live, dead_list, rng_key, n_iter, n_like_calls, elapsed, config):
+        import numpy as _np
+        return {"version": self.RESUME_VERSION,
+                "live": jax.device_get(live),
+                "dead": jax.device_get(list(dead_list)),
+                "rng_key": _np.asarray(rng_key),
+                "n_iter": int(n_iter),
+                "n_like_calls": int(n_like_calls),
+                "elapsed_s": float(elapsed),
+                "config": config}
+
+    def _load_resume(self, config, loglike_fn):
+        """Read ``self.resume_from`` and check it belongs to this run; returns the resume block."""
+        import numpy as _np
+        ck = self.load_checkpoint(self.resume_from)
+        res = ck.get("resume") if isinstance(ck, dict) else None
+        if res is None:
+            raise ValueError(
+                f"{self.resume_from} holds no sampler state (a rescue pickle, or a checkpoint "
+                "written before resuming was supported): it can be read with "
+                "load_checkpoint() for its dead points, but a run cannot continue from it")
+        if res.get("version") != self.RESUME_VERSION:
+            raise ValueError(f"{self.resume_from}: resume format {res.get('version')!r}, "
+                             f"this version reads {self.RESUME_VERSION}")
+        diff = {k: (res["config"].get(k), v) for k, v in config.items()
+                if res["config"].get(k) != v}
+        if diff:
+            raise ValueError(
+                f"{self.resume_from} was written by a different run; differing settings "
+                + ", ".join(f"{k}: checkpoint {a!r} vs now {b!r}" for k, (a, b) in diff.items()))
+        # the same data and forward model: the saved live points must have the same ln L now,
+        # to the forward model's float32-contraction precision (re-evaluated at another batch
+        # width, ln L moves ~1e-8 relative; the T3 spectra tolerance is 1e-6)
+        pts = res["live"].particles
+        logl_saved = _np.asarray(pts.loglikelihood)
+        logl_now = _np.asarray(jax.jit(jax.vmap(loglike_fn))(pts.position))
+        bad = ~_np.isclose(logl_now, logl_saved, rtol=RESUME_LOGL_RTOL, atol=1e-6)
+        if bad.any():
+            i = int(_np.argmax(_np.abs(logl_now - logl_saved)))
+            raise ValueError(
+                f"{self.resume_from}: the log-likelihood of the saved live points differs "
+                f"from this model's for {int(bad.sum())}/{bad.size} points (worst: "
+                f"{logl_saved[i]!r} saved vs {logl_now[i]!r} now); the checkpoint belongs to "
+                "another model or data set")
+        return res
+
     @staticmethod
     def load_checkpoint(path):
-        """Load a checkpoint / rescue pickle written by this adapter.
-
-        Returns the dict ``{positions, loglikelihood, loglikelihood_birth,
-        logZ, n_dead, partial}``.  A ``partial=True`` snapshot is a usable
-        (under-converged) posterior from a run killed before convergence ---
-        feed ``positions`` + ``loglikelihood`` + ``loglikelihood_birth`` to
-        ``anesthetic.NestedSamples`` exactly as the end-of-run path does.
-        """
+        """Load a checkpoint/rescue pickle: {positions, loglikelihood, loglikelihood_birth, logZ, n_dead, partial}."""
         import pickle as _pickle
         with open(path, "rb") as fh:
             return _pickle.load(fh)
@@ -844,30 +794,14 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         theta_init  : dict[str, Array],
         rng_key     : Array,
     ) -> SamplingResult:
-        """
-        Run BlackJAX NSS and return a ``SamplingResult``.
-
-        Parameters
-        ----------
-        loglike_fn : callable
-            JIT-compiled log-likelihood (no prior).
-        logprior_fn : callable
-            JIT-compiled log-prior (must be proper).
-        theta_init : dict[str, Array]
-            Reference parameter dict (shapes / dtypes).
-        rng_key : Array
-
-        Returns
-        -------
-        SamplingResult
-        """
+        """Run nested sampling and return a ``SamplingResult``; ``logprior_fn`` must be proper."""
         try:
             import blackjax
             import blackjax.ns.utils as ns_utils
         except ImportError as exc:
             raise ImportError(
                 "BlackJAX with nested sampling (blackjax.ns) is required.\n"
-                "Install: pip install 'git+https://github.com/blackjax-devs/blackjax@f73e12956'"
+                "Install: pip install -U 'blackjax>=1.6'"
             ) from exc
 
         import tqdm
@@ -888,9 +822,12 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 f"num_delete={num_delete}"
             )
 
-        # ── Initialise live points ────────────────────────────────────────
-        rng_key, prior_key = jax.random.split(rng_key)
-        particles = self._sample_prior(theta_init, prior_key)
+        _config = self._run_config(theta_init, num_inner_steps, num_delete)
+        _resume = (self._load_resume(_config, loglike_fn)
+                   if self.resume_from is not None else None)
+        if _resume is None:
+            rng_key, prior_key = jax.random.split(rng_key)
+            particles = self._sample_prior(theta_init, prior_key)
 
         # ── Build NSS kernel ──────────────────────────────────────────────
         # loglike_fn / logprior_fn operate on a SINGLE particle (un-batched).
@@ -906,67 +843,65 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                   flush=True)
             _t0 = time.perf_counter()
 
-        # Compile the step kernel in a thread while init compiles and runs;
-        # the first step_fn call then takes the executable from JAX's cache.
-        live_shape = jax.eval_shape(init_fn, particles)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            step_compiled = pool.submit(
-                lambda: step_fn.lower(rng_key, live_shape).compile())
-            live = init_fn(particles)
-            step_compiled.result()
+        if _resume is None:
+            # Compile the step kernel in a thread while init compiles and runs;
+            # the first step_fn call then takes the executable from JAX's cache.
+            live_shape = jax.eval_shape(init_fn, particles)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                step_compiled = pool.submit(
+                    lambda: step_fn.lower(rng_key, live_shape).compile())
+                live = init_fn(particles)
+                step_compiled.result()
+        else:
+            # the saved state replaces the prior draw, init and the first iterations
+            live = jax.tree_util.tree_map(jnp.asarray, _resume["live"])
+            rng_key = jnp.asarray(_resume["rng_key"])
 
-        # ── BlackJAX version compatibility ───────────────────────────────
-        # Three known layouts for logZ / logZ_live:
-        #   v1  NSState (direct):           state.logZ, state.logZ_live
-        #   v2  AdaptiveNSState (wrapper):  state.sampler_state.logZ, ...
-        #   v3  AdaptiveNSState (integrator): state.integrator.logZ, ...
-        def _build_logZ_accessors(state):
-            """Return (get_logZ, get_logZ_live) callables for *state*."""
-            # v1 – direct NSState
+        def _logz_fields(state):
             if hasattr(state, "logZ") and hasattr(state, "logZ_live"):
-                return (lambda s: float(s.logZ),
-                        lambda s: float(s.logZ_live))
-            # v3 – newest: integrator sub-object
-            if hasattr(state, "integrator"):
-                ig = state.integrator
-                if hasattr(ig, "logZ") and hasattr(ig, "logZ_live"):
-                    return (lambda s: float(s.integrator.logZ),
-                            lambda s: float(s.integrator.logZ_live))
-            # v2 – older wrapper: sampler_state sub-object
-            if hasattr(state, "sampler_state"):
-                inner = state.sampler_state
-                if hasattr(inner, "logZ") and hasattr(inner, "logZ_live"):
-                    return (lambda s: float(s.sampler_state.logZ),
-                            lambda s: float(s.sampler_state.logZ_live))
-            # Unknown layout – raise with diagnostics
-            _fields = [f for f in dir(state) if not f.startswith("_")]
+                return state.logZ, state.logZ_live
+            ig = getattr(state, "integrator", None)
+            if ig is not None and hasattr(ig, "logZ") and hasattr(ig, "logZ_live"):
+                return ig.logZ, ig.logZ_live
+            inner = getattr(state, "sampler_state", None)
+            if inner is not None and hasattr(inner, "logZ") and hasattr(inner, "logZ_live"):
+                return inner.logZ, inner.logZ_live
             raise AttributeError(
-                f"Cannot locate logZ/logZ_live on {type(state).__name__}.\n"
-                f"  Top-level fields : {_fields}\n"
-                + "Please check your BlackJAX version."
-            )
+                f"Cannot locate logZ/logZ_live on {type(state).__name__} "
+                f"(fields {[f for f in dir(state) if not f.startswith('_')]}); "
+                "check your BlackJAX version.")
 
-        _get_logZ, _get_logZ_live = _build_logZ_accessors(live)
+        def _logz(state):
+            a, b = jax.device_get(_logz_fields(state))
+            return float(a), float(b)
+
+        _get_logZ = lambda s: _logz(s)[0]
 
         if self.verbose:
             _t1 = time.perf_counter()
+            lz, lzl = _logz(live)
             print(f"  [timing] init_fn and step compile done    ({_t1 - _t0:.1f} s)  "
-                  f"logZ={_get_logZ(live):.4f}  "
-                  f"logZ_live={_get_logZ_live(live):.4f}", flush=True)
+                  f"logZ={lz:.4f}  logZ_live={lzl:.4f}", flush=True)
             print(f"  (state type: {type(live).__name__})")
 
         # ── NS run loop ───────────────────────────────────────────────────
-        dead_list    = []
-        n_like_calls = self.num_live
+        dead_list    = [] if _resume is None else list(_resume["dead"])
+        n_like_calls = self.num_live if _resume is None else _resume["n_like_calls"]
+        _elapsed0    = 0.0 if _resume is None else _resume["elapsed_s"]
         t_start      = time.perf_counter()
+        if _resume is not None and self.verbose:
+            print(f"  [resume] {self.resume_from}: iteration {_resume['n_iter']}, "
+                  f"{len(dead_list) * num_delete} dead points", flush=True)
 
-        # Periodic-checkpoint bookkeeping (see __init__).
         _ckpt_dir   = self._resolve_ckpt_dir()
         _ckpt_on    = bool(_ckpt_dir) and self.checkpoint_interval_s > 0
         _last_ckpt  = t_start
         if _ckpt_on and self.verbose:
             print(f"  [checkpoint] every {self.checkpoint_interval_s:.0f} s "
                   f"-> {_ckpt_dir}", flush=True)
+        elif self.verbose:
+            print("  [checkpoint] off (set checkpoint_dir= or $CERIDWEN_CHECKPOINT_DIR "
+                  "to write recoverable snapshots)", flush=True)
 
         def _progress_record(logZ, logZ_live, elapsed_s):
             return {
@@ -996,20 +931,18 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             unit=" dead",
             disable=not self.verbose,
         ) as pbar:
-            _iter = 0
+            _iter = 0 if _resume is None else _resume["n_iter"]
             # Reuse evidence reads for the stop condition and progress output.
             # Slice counters are read separately for logical call accounting.
-            _logZ = _get_logZ(live)
-            _logZ_live = _get_logZ_live(live)
-            while float(_logZ_live - _logZ) >= self.logZ_tol:
+            _logZ, _logZ_live = _logz(live)
+            while _logZ_live - _logZ >= self.logZ_tol:
                 rng_key, subkey = jax.random.split(rng_key)
                 _t_iter = time.perf_counter()
 
                 incoming = live
                 live, dead_info = step_fn(subkey, incoming)
                 _iter += 1
-                _logZ = _get_logZ(live)
-                _logZ_live = _get_logZ_live(live)
+                _logZ, _logZ_live = _logz(live)
                 _dt_iter = time.perf_counter() - _t_iter
                 if self.iteration_callback is not None:
                     self.iteration_callback(
@@ -1025,7 +958,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 dead_list.append(dead_info)
                 n_like_calls += int(self._logical_likelihood_calls(dead_info))
                 if _progress_file is not None:
-                    _elapsed = time.perf_counter() - t_start
+                    _elapsed = _elapsed0 + time.perf_counter() - t_start
                     _record = _progress_record(_logZ, _logZ_live, _elapsed)
                     _record["iteration_s"] = _dt_iter
                     _record["dead_per_s"] = _record["n_discarded"] / _elapsed
@@ -1033,120 +966,77 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                     _progress_file.write(json.dumps(_record) + "\n")
                     _progress_file.flush()
                 pbar.update(num_delete)
-                try:
-                    pbar.set_description(
-                        f"NS  logZ={_logZ:.2f}  "
-                        f"ΔlogZ={_logZ_live - _logZ:.2f}"
-                    )
-                except AttributeError:
-                    pass
+                pbar.set_description(f"NS  logZ={_logZ:.2f}  dlogZ={_logZ_live - _logZ:.2f}",
+                                     refresh=False)
+                pbar.set_postfix({"s/iter": f"{_dt_iter:.1f}"}, refresh=False)
 
-                # Periodic checkpoint: finalise + dump a partial snapshot so a
-                # wall-time kill / node crash mid-run is recoverable.
                 if _ckpt_on and (time.perf_counter() - _last_ckpt
                                  >= self.checkpoint_interval_s):
                     _progress = _progress_record(
-                        _logZ, _logZ_live, time.perf_counter() - t_start)
+                        _logZ, _logZ_live, _elapsed0 + time.perf_counter() - t_start)
                     _p = self._dump_snapshot(
                         _ckpt_dir, live, dead_list, ns_utils,
                         _logZ, tag="checkpoint", partial=True,
-                        progress=_progress)
+                        progress=_progress,
+                        resume=self._resume_block(
+                            live, dead_list, rng_key, _iter, n_like_calls,
+                            _elapsed0 + time.perf_counter() - t_start, _config))
                     _last_ckpt = time.perf_counter()
                     if _p and self.verbose:
-                        print(f"  [checkpoint] iter {_iter}: {_p}", flush=True)
+                        pbar.write(f"  [checkpoint] iter {_iter}: {_p}")
 
-        wall_time = time.perf_counter() - t_start
+        wall_time = _elapsed0 + time.perf_counter() - t_start
         if _progress_file is not None:
             _progress_file.close()
         if self.verbose:
             print(
-                f"  Converged  logZ = {_get_logZ(live):.3f}  "
+                f"  Converged  (live-point logZ estimate {_get_logZ(live):.3f}; the final ln Z follows)  "
                 f"({wall_time:.1f} s,  {n_like_calls:,} likelihood calls)"
             )
 
-        # ── Merge live points into dead set ───────────────────────────────
-        # Version-aware finalise + dead-point unpack (see _finalise_dead).
-        # The ``update_info`` kwarg only exists in newer BlackJAX; 0.1.0b0
-        # ships ``finalise(live, dead)`` with no such param, so passing it
-        # unconditionally raises ``TypeError`` only AFTER convergence,
-        # losing a multi-hour run.  The guard lives in _finalise_dead so it
-        # (and the periodic-checkpoint path) cannot drift.
         _dead_positions, _dead_logl, _dead_logl_birth = self._finalise_dead(
             live, dead_list, ns_utils)
 
-        # ── Rescue pickle ─────────────────────────────────────────────────
-        # Dump the finalised dead points so any failure further down the save
-        # path (anesthetic, evidence, the caller's I/O) is recoverable rather
-        # than discarding a multi-hour run.  Same format as the periodic
-        # checkpoints; loadable via load_checkpoint().  partial=False marks a
-        # fully-converged snapshot.
         _rescue_dir = self._resolve_ckpt_dir()
         if _rescue_dir:
-            _progress = _progress_record(
-                _get_logZ(live), _get_logZ_live(live), wall_time)
+            _progress = _progress_record(*_logz(live), wall_time)
             self._dump_snapshot(_rescue_dir, live, dead_list, ns_utils,
                                 _get_logZ(live), tag="rescue", partial=False,
-                                progress=_progress)
+                                progress=_progress,
+                                finalised=(_dead_positions, _dead_logl, _dead_logl_birth))
 
-        # ── Evidence & importance weights (anesthetic preferred) ─────────
-        log_Z        = float(_get_logZ(live))
-        log_Z_err    = float("nan")
-        log_weights  = None
+        # dead set is in deletion order, NOT sorted by logL; weights follow sample order
+        import numpy as np
+        from .ns_weights import nested_log_weights, log_evidence_from_weights
+        _logl_np    = np.asarray(_dead_logl)
+        _birth_np   = np.asarray(_dead_logl_birth)
+        _lw_np      = nested_log_weights(_logl_np, _birth_np)
+        log_weights = jnp.asarray(_lw_np)
+        log_Z       = None
+        log_Z_err   = float("nan")
         try:
             from anesthetic import NestedSamples
-            import numpy as np
 
             _raw   = _dead_positions
             _names = [n for n in _raw if n in theta_init]
-            _cols  = [
-                np.asarray(_raw[n]).reshape(
-                    len(np.asarray(_dead_logl)), -1
-                )
-                for n in _names
-            ]
+            _cols  = [np.asarray(_raw[n]).reshape(_logl_np.shape[0], -1) for n in _names]
             _data  = np.hstack(_cols)
             _ns    = NestedSamples(
                 _data,
-                logL       = np.asarray(_dead_logl),
-                logL_birth = np.asarray(_dead_logl_birth),
+                logL       = _logl_np,
+                logL_birth = _birth_np,
                 logzero    = float("nan"),
             )
             log_Z     = float(_ns.logZ())
             log_Z_err = float(_ns.logZ(12).std())
-            # Extract proper NS importance weights from anesthetic.
-            # These encode the prior-volume compression at each dead point.
-            log_weights = jnp.asarray(np.asarray(_ns.logw()))
         except Exception:
-            pass  # fall back to live.logZ and manual weights below
+            pass
+        if log_Z is None:
+            log_Z = log_evidence_from_weights(_lw_np)
 
-        # Fallback: compute log-weights from prior volume shrinkage if
-        # anesthetic is unavailable or failed.
-        if log_weights is None:
-            n_dead  = len(jnp.asarray(_dead_logl))
-            n_live  = self.num_live
-            # Standard NS trapezoid rule: log(X_{i-1} - X_{i+1}) / 2
-            # where X_i = exp(-i / n_live) is the prior volume fraction.
-            log_vols = -jnp.arange(n_dead, dtype=float) / n_live
-            log_dvol = jnp.log(
-                jnp.exp(jnp.roll(log_vols, 1) - log_vols)
-                - jnp.exp(jnp.roll(log_vols, -1) - log_vols)
-            ) + log_vols
-            # Fix boundary: first and last points
-            log_dvol = log_dvol.at[0].set(
-                jnp.log1p(-jnp.exp(-1.0 / n_live))
-            )
-            log_dvol = log_dvol.at[-1].set(
-                log_vols[-1] - jnp.log(n_live)
-            )
-            log_weights = log_dvol
-
-        # ── Pack samples ──────────────────────────────────────────────────
-        # Squeeze trailing size-1 axes so scalar params have shape (n_dead,)
-        # rather than (n_dead, 1), matching typical user expectation.
         samples = {}
         for name in theta_init:
-            arr = jnp.asarray(_dead_positions[name])   # (n_dead, *shape)
-            # Squeeze only if the parameter was a scalar (shape (1,))
+            arr = jnp.asarray(_dead_positions[name])
             if arr.ndim > 1 and arr.shape[-1] == 1:
                 arr = jnp.squeeze(arr, axis=-1)
             samples[name] = arr

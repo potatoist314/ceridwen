@@ -34,10 +34,11 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _gridfixture import require_test_grid  # noqa: E402
 
-from ceridwen import CSPBasis, SSPData  # noqa: E402
+from ceridwen import CSPBasis, SSPData, Cosmology  # noqa: E402
 
 KW = dict(zh_const=True, add_neb=False, add_igm=False,
-          add_dust=False, add_diffuse_dust=True, verbose=False)
+          add_dust=False, add_diffuse_dust=True, verbose=False,
+          cosmo=Cosmology.planck18())
 
 
 @pytest.fixture(scope="module")
@@ -49,14 +50,14 @@ def test_shortcut_matches_full_theta_structure(ssp):
     lb = jnp.linspace(0.0, 12.0, 6)
     via_theta = CSPBasis(
         ssp, theta={"lookback_time": lb, "sfh": jnp.ones(6),
-                    "Z": jnp.array([-1.85])}, **KW)
+                    "logzsol": jnp.array([-0.15])}, **KW)
     via_shortcut = CSPBasis(ssp, lookback_time=lb, **KW)
 
     np.testing.assert_allclose(np.asarray(via_shortcut.sfh_times),
                                np.asarray(via_theta.sfh_times))
     assert via_shortcut.n_time == via_theta.n_time == 6
     assert via_shortcut.sfh_per_bin is False
-    assert via_shortcut.zh_is_scalar is True          # zh_const -> 'Z' mode
+    assert via_shortcut.zh_is_scalar is True          # zh_const -> 'logzsol' mode
     # Neutral initial Z must lie inside the grid: no clamp messages.
     assert via_shortcut.check_param_ranges(warn=False) == []
 
@@ -72,14 +73,14 @@ def test_shortcut_time_varying_zh(ssp):
     kw = dict(KW, zh_const=False)
     csp = CSPBasis(ssp, lookback_time=jnp.linspace(0.0, 12.0, 6), **kw)
     assert csp.zh_is_scalar is False
-    assert csp.theta_init["zh"].shape == (6,)
+    assert csp.theta_init["logzsol_hist"].shape == (6,)
 
 
 def test_theta_and_shortcut_are_mutually_exclusive(ssp):
     lb = jnp.linspace(0.0, 12.0, 6)
     with pytest.raises(ValueError, match="not both"):
         CSPBasis(ssp, theta={"lookback_time": lb, "sfh": jnp.ones(6),
-                             "Z": jnp.array([-1.85])},
+                             "logzsol": jnp.array([-0.15])},
                  lookback_time=lb, **KW)
 
 
@@ -91,15 +92,37 @@ def test_no_structure_raises_with_both_routes_named(ssp):
 def test_missing_sfh_is_a_valueerror_not_keyerror(ssp):
     with pytest.raises(ValueError, match="'sfh'"):
         CSPBasis(ssp, theta={"lookback_time": jnp.linspace(0.0, 12.0, 6),
-                             "Z": jnp.array([-1.85])}, **KW)
+                             "logzsol": jnp.array([-0.15])}, **KW)
 
 
 def test_missing_lookback_time_is_a_valueerror_not_keyerror(ssp):
     with pytest.raises(ValueError, match="'lookback_time'"):
-        CSPBasis(ssp, theta={"sfh": jnp.ones(6), "Z": jnp.array([-1.85])},
+        CSPBasis(ssp, theta={"sfh": jnp.ones(6), "logzsol": jnp.array([-0.15])},
                  **KW)
 
 
 def test_single_node_grid_rejected(ssp):
     with pytest.raises(ValueError, match="at least"):
         CSPBasis(ssp, lookback_time=jnp.array([0.0]), **KW)
+
+
+def test_cosmology_is_required(ssp):
+    kw = dict(KW); del kw["cosmo"]
+    with pytest.raises(TypeError, match="explicit cosmology"):
+        CSPBasis(ssp, lookback_time=jnp.linspace(0.0, 12.0, 6), **kw)
+    with pytest.raises(TypeError, match="ceridwen Cosmology"):
+        CSPBasis(ssp, lookback_time=jnp.linspace(0.0, 12.0, 6), **dict(kw, cosmo="Planck18"))
+
+
+def test_tuniv_is_gone(ssp):
+    with pytest.raises(TypeError, match="tuniv"):
+        CSPBasis(ssp, lookback_time=jnp.linspace(0.0, 12.0, 6), tuniv=13.8, **KW)
+
+
+def test_age_at_and_repr(ssp):
+    csp = CSPBasis(ssp, lookback_time=jnp.linspace(0.0, 12.0, 6), **KW)
+    assert isinstance(csp.age_at(0.0), float)
+    assert csp.age_at(0.0) == pytest.approx(13.787, abs=0.02)      # Planck18
+    assert csp.age_at(2.0) < csp.age_at(0.5) < csp.age_at(0.0)
+    text = repr(csp)
+    assert "Planck18" in text and "tuniv" not in text

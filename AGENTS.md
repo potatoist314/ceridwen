@@ -11,16 +11,25 @@ observed-frame projection) fit with nested sampling or VI-preconditioned NUTS.
 
 ## Conventions that are easy to get wrong — do not assume the common defaults
 
-1. **Metallicity is log10 of ABSOLUTE Z, not Z/Z_sun.** The parameter `Z`
-   (and `ssp_lgmet`) is `log10(Z)` in absolute units. A solar value is roughly
-   `-1.85` (Z_sun ≈ 0.014), *not* `0.0`. Priors like `Uniform(low=-2.5, high=0.2)`
-   are correct; do not "fix" them to be centred on 0.
+1. **Metallicity is SOLAR-RELATIVE: `logzsol = log10(Z/Z_sun)`.** The parameters
+   are `theta["logzsol"]` (constant, shape `(1,)`) and `theta["logzsol_hist"]`
+   (shape `(n_time,)`); `0.0` is solar on every grid. Z_sun is the **grid's own** solar node,
+   resolved at load from `zsun=`, the file's `log10_zsun` provenance, or the content-hash
+   table in `ceridwen/ssps/grid_metadata.py` — never from `isoc_type` (FSPS versions give MIST's
+   `zsol` as 0.0142, 0.0191 or 0.0185 under the same name). A grid whose Z_sun is unknown
+   raises. Typical ranges: BPASS `[-2.30, +0.30]` (Z_sun 0.020), MIST/aMIST `[-2.50, +0.50]`
+   (Z_sun 0.0185). `Uniform(low=-2.0, high=0.2)` is safe on every shipped grid; a bounded
+   prior wider than the grid raises. The absolute-metallicity keys `Z` / `zh` raise everywhere,
+   printing the converted value. On MIST/aMIST grids `logzsol` **is `[Fe/H]`** and the total
+   metallicity is the derived `logzsol_total` = `[Z/H]`. `gas_logz` is
+   solar-relative (CLOUDY axis); `CSPBasis(gas_tied=True)` sets
+   `gas_logz := logzsol`.
 
 2. **`lookback_time` INCREASES with index; index 0 = today.** Element 0 is the
    present, the last element is the oldest bin (≈ age of the universe). The SFH
-   array `sfh` is indexed the same way. The OLD decreasing convention
+   array `sfh` is indexed the same way. A decreasing convention
    (`lookback = T_univ - t_grid`) is rejected at construction with a `ValueError`
-   — do not reintroduce it, and do not "helpfully" reverse arrays.
+   — do not use it, and do not "helpfully" reverse arrays.
 
    A construction-time grid is REQUIRED (either `CSPBasis(ssp,
    lookback_time=...)` or a full `theta=` dict): it is where monotonicity and
@@ -35,8 +44,14 @@ observed-frame projection) fit with nested sampling or VI-preconditioned NUTS.
    redshifted by (1 + zred) onto the data pixels, never the other way. Model
    spectra are `F_nu` (per unit frequency). Broadband fluxes are AB maggies.
    Emission-line fluxes are erg s⁻¹ cm⁻². Stellar mass is supplied as
-   `logmass` = log10(M⋆/M_sun); the forward model is evaluated at unit mass
-   and scaled by `10**logmass`.
+   `logmass` = log10(M⋆/M_sun); the spectrum of `theta['sfh']` is scaled by `10**logmass`.
+   The SSP weights sum to the integral of `theta['sfh']` over the construction lookback
+   grid (`csp.sfh_times`, or a predict-time `theta['lookback_time']`) at every redshift:
+   with `track_zred_age=True` the grid is stretched to `age(zred)` and the SFR scaled so
+   that this mass is kept. So `logmass` is the formed mass whenever `theta['sfh']`
+   integrates to 1 M_sun on the construction grid, as `logsfr_ratios_to_sfh(...,
+   sfh_times_yr=csp.sfh_times)` arranges (trapezoidal rule, item 4), fixed or free
+   redshift; a directly sampled `sfh` carries its own normalisation.
 
 4. **SFH mass normalisation is mass-weighted (trapezoidal), not mean-SFR.** See
    `model/transforms.py` (`logsfr_ratios_to_sfh`). Getting this wrong biases
@@ -44,22 +59,27 @@ observed-frame projection) fit with nested sampling or VI-preconditioned NUTS.
 
 ## Hard requirements (the model will not run otherwise)
 
-- **float64 must be on.** `import ceridwen` already calls
-  `jax.config.update("jax_enable_x64", True)`. Do not disable it; evidence
+- **float64 must be on.** `import ceridwen` calls
+  `jax.config.update("jax_enable_x64", ...)` with True unless the environment sets
+  `CERIDWEN_X64=0` (a debugging switch: never set it for a fit). Do not disable it; evidence
   estimates and gradients depend on it.
-- **FSPS + `$SPS_HOME` are required at runtime,** not just to build the SSP cache.
+- **The FSPS data files (`$SPS_HOME`) are required at runtime** for nebular and dust
+  emission, not just to build the SSP cache (python-fsps itself only for building grids).
   The CLOUDY nebular grids and Draine & Li dust-emission templates are read from
   `$SPS_HOME` whenever `add_neb=True` or `add_dust_emission=True`. Building the
   SSP cache (`SSPData.from_fsps`) also needs FSPS.
-- **`sedpy_jax`** (PyPI: `sedpy-jax`) provides filter convolutions and smoothing;
-  it is imported at package import time.
-- **Nested sampling needs `blackjax.nss`/`blackjax.ns`**, now merged into the
-  official blackjax (blackjax-devs) but not yet in a tagged PyPI release.
-  `pyproject.toml` pins blackjax's `main` branch via direct git reference, so
-  `pip install` pulls it automatically. Consequence: ceridwen is git/source-
-  installed, not PyPI, until a blackjax release ships NSS — then swap the pin for
-  `blackjax>=X.Y` (requires-python stays >=3.11). Don't "simplify" this to a
-  stock released `blackjax` pin yet; the released versions still lack NSS.
+- **Filters and attenuation curves are internal**:
+  `ceridwen/observation/filters.py` and `ceridwen/dust/attenuation_laws.py`,
+  vendored from `sedpy-jax` (MIT), with the 293 filter `.par` files and the two
+  reference spectra under `ceridwen/data/`. There is no `sedpy` dependency; do
+  not add one.
+- **Nested sampling needs `blackjax.nss`/`blackjax.ns`**, released in blackjax
+  1.6; `pyproject.toml` requires `blackjax>=1.6` (which forces `jax>=0.9` and
+  Python >= 3.11). Every dependency is a normal PyPI requirement: never add a
+  direct git/URL reference, PyPI refuses to publish a package that has one.
+  blackjax >= 1.6 has no `window_adaptation(progress_bar=)`; don't pass it. Its signature
+  ends in `**extra_parameters`, which are forwarded to the kernel, so an unknown kwarg
+  is not rejected there -- it fails later inside `blackjax.nuts`, or silently does nothing.
 
 ## Staying JAX-correct when editing the package
 
@@ -82,22 +102,26 @@ branches. When modifying it:
 # Primary model builders are available straight from the top level:
 from ceridwen import (SSPData, CSPBasis, SedModel,
                       DustModel, DustEmission, NebularModel, fitSED, read_result_h5)
+# (DustModel is the module ceridwen.dust.DustModel, holding the classes Dust / DiffuseDust)
 # Observation containers, priors and samplers live in clear sub-namespaces:
 from ceridwen.observation import Photometry, Spectrum, Lines
 from ceridwen.priors import (Prior, Uniform, TopHat, Normal, ClippedNormal,
-                             LogNormal, StudentT)
+                             LogNormal, LogUniform, StudentT)
 from ceridwen.sampler import run_sampler
+from ceridwen.optimize import map_fit          # MAP (L-BFGS from prior draws)
 from ceridwen.likelihood import DiagonalGaussianLikelihood, MultiObservationLikelihood
+from ceridwen.resultfile import rebuild_model, check_model_against_result
 ```
 
 Equivalent namespaced paths also work: `ceridwen.ssps.SSPData`,
 `ceridwen.csp.CSPBasis`, `ceridwen.model.SedModel`.
 
-- The canonical nebular class is `NebularModel`. `NebularModelFSPSMatch`
-  (bug-for-bug FSPS reproduction) is intentionally internal — only use it via
-  `CSPBasis(..., match_fsps=True)` if you specifically need FSPS reproducibility.
-- `ssps/ssp_data.py` no longer stores `log_qq`; the nebular model derives the
-  ionising-photon rate internally. Old HDF5 caches with a `log_qq` dataset still
+- The only nebular class is `NebularModel`; there is no bug-for-bug FSPS variant
+  (upstream FSPS matches the strict `NebularModel`). `init_neb_params={"match_fsps": True}`
+  is ignored with a warning, and `CSPBasis(..., match_fsps=True)`
+  raises a `TypeError` like any unknown keyword. Do not add either.
+- `ssps/ssp_data.py` does not store `log_qq`; the nebular model derives the
+  ionising-photon rate internally. HDF5 caches with a `log_qq` dataset
   load (the field is ignored).
 
 ## Canonical workflow
@@ -106,8 +130,8 @@ Step 0 build/load the SSP cache → build `CSPBasis` → wrap observations
 (`Photometry`/`Spectrum`/`Lines`) → `SedModel(csp, observations, priors=...)` →
 `fitSED(...)` or `run_sampler(...)`. The end-to-end, runnable reference is
 [`examples/quickstart.py`](examples/quickstart.py); the joint photometry +
-spectroscopy + lines workflow is in
-[`examples/tutorial_joint_fit.ipynb`](examples/tutorial_joint_fit.ipynb).
+spectroscopy + lines workflow is in [`docs/tutorial.md`](docs/tutorial.md) and
+`examples/demo_2_photometry_lines.py` / `examples/demo_3_spectrum_advanced.py`.
 
 ## Package architecture / module map
 
@@ -116,25 +140,47 @@ population → dust attenuation/emission → nebular → IGM → observed-frame
 projection → likelihood → sampler.
 
 - `ssps/` — `ssp_data.py`: `SSPData` (frozen dataclass, HDF5 I/O, ionising-photon
-  rate derived internally; HDF5 caches the SSP spectral grid). `ssp_basis.py`:
+  rate derived internally; HDF5 caches the SSP spectral grid; schema 3.0 adds the optional
+  surviving-mass table `ssp_stellar_mass`, carried by the published solar-scaled grids (not
+  yet the α grid: `mfrac=False` there) and recorded by
+  `from_fsps`, used only for `mfrac` (`fitSED`'s `/derived/mfrac`, `PostProcess`); an older
+  grid loads without it and its messages say to fetch the current copy or rebuild; a table
+  above `STELLAR_MASS_MAX` is refused at load with a warning). `stellar_mass.py`: FSPS's
+  surviving mass with its lowest IMF bin corrected on truncated (pre-main-sequence MIST)
+  isochrones, used by `from_fsps` and `scripts/attach_stellar_mass.py`. `ssp_basis.py`:
   `SSPBasis`, `FastStepBasis` (thin FSPS wrappers + tabular SFH binning).
 - `csp/` — `csp.py`: `CSPBasis`, the core forward model. Holds the `get_spectrum_*`
   variants (stellar ± dust attenuation ± dust emission ± nebular), step/linear
   SFH interpolation, constant or time-varying metallicity, dict-based `theta`,
-  fully JAX-traceable. `csp_svd.py`: SVD-accelerated variant.
+  fully JAX-traceable; `predict` projects onto the observations (static
+  line-to-band basis for fixed-z photometry, painted lines otherwise).
+  `csp_afe.py`: `CSPBasis_afe`, the [alpha/Fe] variant without a nebular model.
+  `spectrum_calibration.py`: `spectrum_scaling` / `spectrum_calib` factor (one per
+  spectrum, `spectrum_scaling_<obs.name>` with several). The profiled alternative is
+  `Spectrum(polynomial_order=M)`, solved in the likelihood (`likelihood/poly_calibration.py`),
+  or marginalised analytically with `polynomial_mode="marginalize"`
+  (`likelihood/poly_marginal.py`, `PolyMarginalGaussianLikelihood`).
+- `broadening.py` — `Kinematics` (sigma_gal / sigma_gas, fixed or theta keys),
+  `Instrument` (LSF; `scale=` multiplies its width, a float or a sampled theta key with a
+  bounded prior), `SpectralProjector` (continuum FFT kernel + banded
+  instrument response + analytic line painting on the observed pixels),
+  `PhotometricBroadener`. The only place spectral widths are set.
 - `dust/` — `DustModel.py`: `Dust`/`DiffuseDust`, age-binned attenuation with
-  multiple switchable laws per bin via `lax.switch` (params are plain dicts).
-  `DustEmission.py`: DL07 + THEMIS grids, bilinear interp in (qPAH, Umin), dust
+  one attenuation law per bin, evaluated in a Python loop over the bins and stacked
+  (params are plain dicts).
+  `DustEmission.py`: DL07 + THEMIS grids (`CSPBasis(duste_model=...)`, default DL07),
+  bilinear interp in (qPAH, Umin), dust
   mass. `AGBDustShell.py`: optional AGB circumstellar dust.
-- `neb/` — `NebularGridModel.py`: `NebularModel` (physically strict; CLOUDY grids,
-  trilinear interp in gas_logz/gas_logu/age, precomputed line profiles, velocity
-  broadening). `NebularGridModelSVD.py`: SVD-accelerated subclass.
-  `NebularGridModel_fsps_match.py`: internal FSPS-reproducing variant (via
-  `match_fsps=True` only).
-- `observation/` — `base.py` (ABC), `photometry.py` (filter convolution via
-  `sedpy_jax.FilterSet` → matrix-vector projection), `spectrum.py` (interpolation
-  matrix `H`, resolution smoothing, single GEMV), `lines.py` (Gaussian weight
-  matrix `W`), `gp.py` (GP residuals). `observation.py` is a re-export shim so
+- `neb/` — `NebularGridModel.py`: `NebularModel` (CLOUDY grids, default
+  `cloudy_dust=False` = `ZAU_ND_<isoc>` as in FSPS/Prospector, `True` = `ZAU_WD`; each cube
+  interpolated against its own gas_logz/gas_logu/age axes, line profiles at
+  the pixel floor, `line_profiles(sigma)` for the photometric line basis).
+- `observation/` — `base.py` (`Observation` base class), `photometry.py` (filter convolution via
+  `filters.FilterSet` → matrix-vector projection `_T`, optional
+  `PhotometricBroadener` and static line basis), `spectrum.py` (`Instrument`
+  + `SpectralProjector` built by `setup_for_model`), `lines.py` (line fluxes
+  read from the nebular grid by `CSPBasis`; Gaussian aperture matrix `W` for
+  `Lines.predict` alone), `gp.py` (`GaussianProcess`, host-side GP likelihood for `Spectrum.log_likelihood`; `fitSED` uses its values as fixed hyperparameters of `GPGaussianLikelihood`). `observation.py` is a re-export shim so
   `from ceridwen.observation.observation import Photometry, Spectrum, Lines`
   still works.
 - `model/` — `model.py`: `SedModel` (`predict`, `apply_transforms`, `ln_prior`,
@@ -144,17 +190,49 @@ projection → likelihood → sampler.
 - `likelihood/` — `likelihood.py`: `DiagonalGaussianLikelihood`,
   `MultiObservationLikelihood`, pure-JAX `lnlike_diag_gaussian`, masking,
   `make_lnprobfn()` (the jitted log-posterior factory). `noise_model.py`:
-  `DiagonalNoiseModel` (optional jitter + calibration error). `theta.py`:
-  `ThetaVector`, a registered JAX PyTree giving both flat-array and named access.
+  `DiagonalNoiseModel` (noise floor, optional error scale / jitter / calibration error,
+  named per observation `log_jitter_<kind>[_<obs.name>]` in `fitSED`, optional
+  Prospector-style outlier mixture `f_outlier` / `nsigma_outlier` per observation
+  (`f_outlier_spec/_phot/_lines[_<obs.name>]` in `fitSED`, all default 0 = off: switch on
+  explicitly), applied by the likelihood kernels `lnlike_diag_outlier[_with_upper_limits]`;
+  `docs/outlier_model.md`). `gp_likelihood.py`: `GPGaussianLikelihood` /
+  `lnlike_gp_gaussian`, the squared-exponential GP on a spectrum's whitened residuals
+  (dense Cholesky, static mask as identity rows), built by `fit._likelihood_for` when
+  `log_gp_amp_spec[_<obs.name>]` and `log_gp_length_spec[_<obs.name>]` are set or the
+  Spectrum has `noise=GaussianProcess(...)` (`docs/gp_likelihood.md`); it refuses a
+  calibration polynomial on the same spectrum. `poly_calibration.py`: the profiled calibration polynomial;
+  `poly_marginal.py`: `PolyMarginalGaussianLikelihood`, the polynomial integrated out under a
+  Gaussian prior (`Spectrum(polynomial_mode="marginalize")`); `eline_marginal.py`: the
+  emission-line flux marginalisation.
 - `sampler/` — `priors.py` (TFP-JAX priors with logpdf/sample/unit_transform),
-  `nested.py` (BlackJAX nested sampling), `nuts.py` (NUTS, VI-preconditioned),
+  `nested.py` (BlackJAX nested sampling; periodic checkpoints carry the sampler state, and
+  `resume_from=` continues a killed run bit for bit), `nuts.py` (NUTS, VI-preconditioned),
   `vi.py` (VI transport maps: TriL, IAF/NeuTra), `runner.py` (`SamplerAdapter`
   protocol, `SamplingResult`, `run_sampler`, `to_anesthetic`).
 - `cosmology.py` — JAX-native flat ΛCDM (Planck 18) with an astropy fallback.
-- `igm.py` — IGM attenuation (`Madau1995`), extensible via the `IGMModel` ABC.
-- `fit.py` — `fitSED` (top-level convenience wrapper) + `read_result_h5`; writes
-  `<output_dir>/ceridwen_result.h5` (obs, model/priors as JSON, samples,
-  log-weights, log-evidence).
+- `igm.py` — IGM attenuation (`Madau1995`; `MadauDampingDLA` = Madau × damping wing × DLA,
+  with theta keys `x_HI` / `logN_HI` / `z_dla` declared in `IGMModel.param_names` and passed
+  as `attenuation(..., params=)` by `CSPBasis._igm_transmission`), extensible via the
+  `IGMModel` ABC. `igm_factor` scales the Madau forest only; it is NOT `x_HI`.
+- `fit.py` — `fitSED` (top-level convenience wrapper) + `read_result_h5` /
+  `load_result_h5` / `result_cosmology`; writes `<output_dir>/ceridwen_result.h5`
+  (obs incl. sky / calibration / upper limits and each likelihood's noise model,
+  model/priors as JSON, kinematics, cosmology, samples, log-weights, log-evidence,
+  `csp_config` + `sfh_times_yr`, `/provenance`: version, git state, sampler settings,
+  rng key; `read_provenance`; `/derived/mfrac` per sample when the grid has a mass table,
+  `fitSED(mfrac=)`, `read_derived_h5`). `/derived` holds only pure, cheap, exactly
+  reproducible functions of theta and the model; everything else stays in `PostProcess`.
+- `resultfile.py` — `rebuild_model` / `check_model_against_result` / `priors_from_result`:
+  rebuild a `SedModel` from a result file given the CSP, observations and transform callables
+  (not stored), and name every difference between a model and the file.
+- `optimize.py` — `map_fit` (L-BFGS on fitSED's log-posterior from `theta_init` + N prior
+  draws; `.theta` is a `free_param_init`), `laplace_sigma`; `fitSED(optimize=True)` starts NUTS
+  there and writes `/map`.
+- `postprocess.py` — `PostProcess` (equal-weight draws, SFH averages, formed and
+  surviving mass (`mfrac`: the file's `/derived/mfrac`, else the grid's mass table), UV and
+  ionising properties,
+  posterior predictions); `plotting.py` — summary, corner
+  and diagnostic figures.
 
 Design patterns to follow when extending: frozen dataclasses for immutable data
 (`SSPData`); HDF5 for large spectral grids; modular dust laws (multiple per age
@@ -178,13 +256,19 @@ bin, automatic parameter renaming when a law is reused); `@jit`/`vmap` throughou
 ## Repository pointers
 
 - `README.md` — install + quick start for humans.
-- `GOTCHAS.md` — the misuse/user-error guide (metallicity-units trap, silent
+- `GOTCHAS.md` — the misuse/user-error guide (metallicity conventions, silent
   `theta` typos, …). Read it before constructing models; it expands on the
   conventions above.
 - `examples/quickstart.py` — minimal runnable fit (mock photometry).
-- Tests live in `tests/`; they resolve a committed SSP grid via
-  `tests/_gridfixture.py` (under `tests/fixtures/`) and skip cleanly if it (or
-  FSPS) is absent. Run `pytest -m "not fsps and not gpu"` for the FSPS-free subset.
+- Tests live in `tests/`; they resolve an SSP grid via `tests/_gridfixture.py`
+  (`$CERIDWEN_TEST_SSP` → `tests/fixtures/<name>` → `ceridwen/data/test_data/` →
+  the `fetch_grid` cache, `$CERIDWEN_GRID_DIR` or `~/.ceridwen/grids`, checksum-verified,
+  never downloading). The main test grid is NOT committed: it is the published BPASS
+  grid; `fetch_grid("mist_bpass_v2")` once is enough (CI does this and also sets
+  `$CERIDWEN_TEST_SSP`). The MILES and alpha-enhanced grids are found the same way. Without a grid, or without
+  `$SPS_HOME` for the nebular tests, tests *skip*, and a run with skips is not a
+  pass: run `pytest -m "not fsps and not gpu" -ra` for the FSPS-free subset and
+  read the skip summary. See "Verification" in `README.md`.
 
 ## Don't
 
