@@ -9,7 +9,7 @@ only (or down-weight everything else).  See
 Wavelengths in ``ABSORPTION_FEATURES`` are REST-FRAME, IN-AIR angstroms, as
 tabulated in the Lick/IDS system (Worthey et al. 1994; Trager et al. 1998)
 and the usual line lists.  ``feature_windows`` converts them to vacuum with
-``sedpy_jax.observate.air2vac`` -- the same conversion ``StellarIndices``
+``ceridwen.observation.filters.air2vac`` -- the same conversion ``StellarIndices``
 uses -- and redshifts them onto the observed pixel grid.
 
 Two kinds of entry exist:

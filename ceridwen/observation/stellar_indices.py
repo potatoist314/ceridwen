@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from .filters import air2vac
 
+from ..broadening import Instrument, Kinematics
 from .base import Observation
 from .spectrum import Spectrum
 
@@ -94,6 +95,28 @@ LEGAC_DR2_STELLAR_INDEX_DEFINITIONS = (
         (4000.0, 4100.0),
     ),
 )
+
+
+def _instrument(resolution, smoothtype, res_convention, wavelength):
+    """The ``Instrument`` of a (resolution, smoothtype, res_convention) triple:
+    "R" -> R_fwhm / R_sigma, "vel" -> fwhm_kms / sigma_kms, "lambda" -> fwhm_aa /
+    sigma_aa, "lsf" -> fwhm_aa / sigma_aa tabulated on ``wavelength``; None -> None."""
+    if smoothtype is None or resolution is None:
+        return None
+    if smoothtype == "R" and res_convention is None:
+        raise ValueError("StellarIndices: smoothtype='R' requires res_convention='fwhm' "
+                         "(R = lambda/FWHM) or 'sigma' (R = lambda/sigma_lambda)")
+    fwhm = res_convention == "fwhm"
+    if smoothtype == "R":
+        return Instrument.R_fwhm(resolution) if fwhm else Instrument.R_sigma(resolution)
+    if smoothtype == "vel":
+        return Instrument.fwhm_kms(resolution) if fwhm else Instrument.sigma_kms(resolution)
+    if smoothtype == "lambda":
+        return Instrument.fwhm_aa(resolution) if fwhm else Instrument.sigma_aa(resolution)
+    if smoothtype == "lsf":
+        return (Instrument.fwhm_aa if fwhm else Instrument.sigma_aa)(resolution, wave=wavelength)
+    raise ValueError(f"StellarIndices: smoothtype={smoothtype!r} is not one of "
+                     "None, 'vel', 'R', 'lambda', 'lsf'")
 
 
 def _band_weights(grid: np.ndarray, lower: float, upper: float) -> np.ndarray:
@@ -217,18 +240,22 @@ class StellarIndices(Observation):
         evaluation_wave = np.unique(np.concatenate((inside, finite_edges)))
         self._evaluation_wave = jnp.asarray(evaluation_wave)
 
+        if not (self.inres == "auto" or self.inres == 0.0):
+            raise ValueError("StellarIndices: inres must be 'auto' (subtract the SSP library "
+                             f"curve) or 0.0 (subtract nothing), got {self.inres!r}")
+        observed_wave = evaluation_wave * (1.0 + float(zred))
         self._spectrum_projector = Spectrum(
-            wavelength=evaluation_wave * (1.0 + float(zred)),
-            resolution=self.resolution,
-            smoothtype=self.smoothtype,
-            res_convention=self.res_convention,
-            inres=self.inres,
-            sigma_losvd=self.sigma_losvd,
+            wavelength=observed_wave,
+            instrument=_instrument(self.resolution, self.smoothtype,
+                                   self.res_convention, observed_wave),
+            subtract_library=self.inres == "auto",
+            projector="chain",
             name=f"{self.name}_projector",
         )
         self._spectrum_projector.setup_for_model(
             wave_model,
             zred=zred,
+            kinematics=Kinematics(sigma_gal=float(self.sigma_losvd or 0.0)),
             lib_resolution=lib_resolution,
         )
 

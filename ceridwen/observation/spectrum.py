@@ -68,6 +68,11 @@ class Spectrum(Observation):
         prior width s_0, degenerate with the mass unless photometry anchors the level.
     polynomial_prior_sigma : float or array (M+1,) -- the prior widths s (finite, >= 0; 0 pins
         a coefficient at 0); required with ``polynomial_mode="marginalize"``, refused otherwise.
+    projector : "fft" (default) or "chain" -- "fft": ``broadening.SpectralProjector``.
+        "chain": the LOSVD + LSF chain of the speedups branch (``observation/_chain.py``, the
+        LEGA-C production path; needs ``sedpy_jax``).  It paints no nebular lines, applies no
+        IGM after the LOSVD, and takes no sampled redshift, instrument scale or
+        ``marginalize_elines``.
 
     Notes
     -----
@@ -117,6 +122,7 @@ class Spectrum(Observation):
         polynomial_regularization = 0.0,
         polynomial_mode    = "profile",
         polynomial_prior_sigma = None,
+        projector          = "fft",
         **kwargs,
     ):
         for k in list(kwargs):
@@ -169,6 +175,17 @@ class Spectrum(Observation):
                                 elines_to_fit, elines_to_fix, elines_to_ignore, noise)
         if self.polynomial_mode == "marginalize":
             self._check_marginal_polynomial(noise)
+        if projector not in ("fft", "chain"):
+            raise ValueError(f"Spectrum(): projector must be 'fft' or 'chain', got {projector!r}")
+        self.projector = projector
+        self._chain = None
+        if projector == "chain":
+            if self.marginalize_elines or self.zred_range is not None:
+                raise ValueError(
+                    "Spectrum(projector='chain') takes no marginalize_elines or zred_range; "
+                    "use projector='fft'")
+            from ._chain import chain_resolution
+            chain_resolution(instrument, self._wavelength)
 
         super().__init__(
             flux        = flux,
@@ -331,6 +348,17 @@ class Spectrum(Observation):
             kinematics = Kinematics.none()
         if zred_range is None:
             zred_range = self.zred_range
+        if self.projector == "chain":
+            if zred_range is not None or line_wave_rest is not None:
+                raise ValueError(
+                    f"Spectrum {self.name!r}: projector='chain' takes no sampled redshift and "
+                    "paints no nebular lines; use projector='fft'")
+            from ._chain import ChainProjector
+            self._chain = ChainProjector(
+                self.name, self._wavelength, self.instrument, self.subtract_library,
+                kinematics, wave_model, zred, lib_resolution)
+            self.model_support = self._chain.model_support
+            return
         lib = None
         if lib_resolution is not None and self.instrument is not None and self.subtract_library:
             lw = np.asarray(lib_resolution[0], dtype=np.float64)
@@ -357,13 +385,19 @@ class Spectrum(Observation):
         projector built with ``zred_range``, the redshift.  ``transmission`` (a callable of the
         rest wavelength, the IGM): applied after the galaxy's sigma_gal and before the
         instrument; ``spectrum`` is then the continuum before the IGM."""
-        if self._proj is None:
+        if self._proj is None and self._chain is None:
             raise RuntimeError(
                 "Spectrum.predict() called before setup_for_model(): the "
                 "projector has not been built. Call "
                 "spec.setup_for_model(wave_model, zred=..., kinematics=...) once "
                 "(before the first predict / JIT trace)."
             )
+        if self._chain is not None:
+            if line_flux is not None or transmission is not None:
+                raise ValueError(
+                    f"Spectrum {self.name!r}: projector='chain' paints no lines and applies "
+                    "no IGM transmission; use projector='fft'")
+            return self._chain.predict(spectrum, {} if theta is None else theta)
         return self._proj.predict(spectrum, line_flux, {} if theta is None else theta,
                                   transmission=transmission)
 
@@ -402,6 +436,83 @@ class Spectrum(Observation):
             lam0_obs = opz * float(lam0_rest)
             dlam     = lam0_obs * dv / c_kms
             self.mask_wavelength_range(lam0_obs - dlam, lam0_obs + dlam)
+
+    def select_absorption_features(self, features=None, zred=0.0,
+                                   window_kms=1000.0, mode="drop",
+                                   downweight=10.0):
+        """
+        Restrict the likelihood to stellar absorption features.
+
+        Builds an observed-frame pixel mask from
+        ``ceridwen.observation.absorption_features`` (rest-frame Lick
+        bandpasses and line centres, converted to vacuum and redshifted by
+        ``1 + zred``) and applies it in one of two ways:
+
+        ``mode="drop"``
+            Pixels outside every feature window leave the likelihood:
+            ``self.mask &= in_feature``.  Continuum-shape information is
+            removed from the spectrum entirely.
+        ``mode="downweight"``
+            Every pixel stays, but ``self.uncertainty`` outside the windows
+            is multiplied by ``downweight`` (> 1), so each continuum pixel
+            counts ``1 / downweight**2`` as much.  A fitted fractional
+            calibration term (``DiagonalNoiseModel(use_fractional=True)``)
+            still adds in quadrature on top of the inflated sigma.
+
+        Parameters
+        ----------
+        features : iterable of str or AbsorptionFeature, optional
+            Feature names, group names (``"balmer"``, ``"fe"``, ...) or
+            feature objects.  Default: the whole catalogue.
+        zred : float
+            Redshift applied to the rest-frame windows.
+        window_kms : float
+            Half-width [km/s] of the window around a line-centre entry.
+            Band entries use their bandpass and ignore it.
+        mode : {"drop", "downweight"}
+        downweight : float
+            Sigma inflation factor for ``mode="downweight"``; must be > 1.
+
+        Returns
+        -------
+        in_feature : np.ndarray of bool, shape (n_pix,)
+            True for pixels inside a feature window (before combination with
+            the existing mask).  Also stored as ``self.feature_mask``; the
+            settings are stored in ``self.pixel_selection``.
+        """
+        from .absorption_features import absorption_feature_mask, select_features
+
+        if mode not in {"drop", "downweight"}:
+            raise ValueError(f"mode must be 'drop' or 'downweight', got {mode!r}")
+        if mode == "downweight" and not float(downweight) > 1.0:
+            raise ValueError(f"downweight must be > 1, got {downweight!r}")
+        if self._wavelength is None:
+            raise RuntimeError("select_absorption_features needs a wavelength grid")
+        resolved = select_features(features)
+        in_feature = absorption_feature_mask(
+            np.asarray(self._wavelength), zred=zred, features=resolved,
+            window_kms=window_kms,
+        )
+        if mode == "drop":
+            new_mask = np.asarray(self.mask) & in_feature
+            if not new_mask.any():
+                raise ValueError(
+                    "select_absorption_features: no fitted pixels fall inside "
+                    "an absorption-feature window at this redshift"
+                )
+            self.mask = jnp.asarray(new_mask)
+        else:
+            factor = np.where(in_feature, 1.0, float(downweight))
+            self.uncertainty = self.uncertainty * jnp.asarray(factor)
+        self.feature_mask = in_feature
+        self.pixel_selection = {
+            "mode": mode,
+            "window_kms": float(window_kms),
+            "downweight": float(downweight) if mode == "downweight" else None,
+            "features": [f.name for f in resolved],
+            "n_feature_pixels": int(np.sum(np.asarray(self.mask) & in_feature)),
+        }
+        return in_feature
 
     def _sky_corrected_data(self):
         if self.sky is not None:
@@ -532,7 +643,9 @@ class Spectrum(Observation):
             f"  wavelength    : {wmin} – {wmax} Å",
             f"  instrument    : {res_str}",
             f"  subtract lib. : {self.subtract_library}",
-            f"  projector     : " + ("not built" if self._proj is None else
+            f"  projector     : " + ("chain, " + ("built" if self._chain is not None else "not built")
+                                    if self.projector == "chain" else
+                                    "not built" if self._proj is None else
                                     (f"built, zred sampled in [{self._proj.zred_range[0]:g}, {self._proj.zred_range[1]:g}]"
                                      if self._proj.free_z else f"built, zred = {self._proj.opz_ref - 1:g}")),
             f"  logify        : {self.logify_spectrum}",

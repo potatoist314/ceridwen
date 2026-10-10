@@ -26,6 +26,10 @@ import jax.numpy as jnp
 import numpy as np
 from sedpy_jax.smoothing import _lin_grid, _log_grid, _lsf_grid, _lsf_subtract_inres
 
+# Speed of light [km/s] of the chain projector (``observation/base.py`` of the
+# speedups branch); kept so the production predictions stay bitwise.
+_CKMS = 2.998e5
+
 __all__ = [
     "combined_sigma_lambda",
     "make_static_smoother",
@@ -109,8 +113,6 @@ def combined_sigma_lambda(wave, sigma_target, sigma_losvd_kms, sigma_library):
         Effective Gaussian sigma [AA] at each wavelength, floored at one
         wavelength pixel where the subtraction would leave zero or less.
     """
-    from .base import _CKMS
-
     wave = np.asarray(wave, dtype=np.float64)
     var = np.zeros_like(wave)
 

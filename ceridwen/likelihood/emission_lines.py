@@ -118,11 +118,16 @@ def read_fsps_line_list(sps_home: Optional[str] = None) -> tuple[np.ndarray, lis
 
 
 def _sigma_inst_kms(spectrum, wave) -> np.ndarray:
-    """The spectrum's instrumental Gaussian sigma [km/s] on its pixels."""
-    if spectrum.smoothtype is None:
+    """The spectrum's instrumental Gaussian sigma [km/s] on its pixels, as its
+    projector uses it (``projector="chain"``: the chain's arithmetic)."""
+    if spectrum.instrument is None:
         return np.zeros_like(wave)
-    sigma = spectrum._resolution_as_sigma()
-    if spectrum.smoothtype in ("vel", "R"):
+    if spectrum.projector != "chain":
+        return np.asarray(spectrum.instrument.sigma_kms_at(wave), dtype=np.float64)
+    from ..observation._chain import chain_resolution, resolution_as_sigma
+    smoothtype, resolution, convention = chain_resolution(spectrum.instrument, wave)
+    sigma = resolution_as_sigma(smoothtype, resolution, convention)
+    if smoothtype in ("vel", "R"):
         return np.full_like(wave, float(sigma))
     return _CKMS * np.broadcast_to(np.asarray(sigma, dtype=np.float64), wave.shape) / wave
 
@@ -196,6 +201,9 @@ class EmissionLineColumns:
         spectrum,
         zred: float,
         *,
+        sigma_gas_kms: float = 0.0,
+        sigma_key: Optional[str] = None,
+        zred_key: Optional[str] = None,
         names: Optional[Sequence[str]] = None,
         sps_home: Optional[str] = None,
         blend_correlation: float = 0.5,
@@ -207,13 +215,16 @@ class EmissionLineColumns:
         Parameters
         ----------
         spectrum : Spectrum
-            Its wavelength grid, mask and instrumental resolution are used.
-            A sampled redshift (``free_z``) and dispersion
-            (``fit_sigma_smooth``) are read from ``theta["zred"]`` and
-            ``theta["sigma_smooth"]``; otherwise ``zred`` and
-            ``spectrum.sigma_losvd`` are fixed.
+            Its wavelength grid, mask and instrument are used.
         zred : float
             Catalogue redshift; line coverage is tested here.
+        sigma_gas_kms : float
+            Line dispersion [km/s] for the coverage test, the band matrix of
+            :meth:`with_photometry` and the ridge; also the dispersion of
+            :meth:`columns` when ``sigma_key`` is None.
+        sigma_key, zred_key : str, optional
+            ``theta`` keys of a sampled line dispersion (for example the
+            ``Kinematics.sigma_gal`` key, ``"sigma_smooth"``) and redshift.
         names : sequence of str, optional
             FSPS names of the candidate lines.  Default: every FSPS line.
         blend_correlation : float
@@ -221,13 +232,13 @@ class EmissionLineColumns:
             ``zred``) exceeds this in absolute value form a pair, strongest
             first; a line joins at most one pair.
         sigma_max_kms : float, optional
-            Hard upper limit of the ``sigma_smooth`` prior; see
+            Hard upper limit of the prior on the sampled dispersion; see
             :attr:`sigma_max_kms`.
         """
         wave = np.asarray(spectrum.wavelength, dtype=np.float64)
         used = np.asarray(spectrum.mask, dtype=bool)
         s_inst = _sigma_inst_kms(spectrum, wave)
-        s_gas = float(spectrum.sigma_losvd or 0.0)
+        s_gas = float(sigma_gas_kms)
         table_wave, table_names = read_fsps_line_list(sps_home)
         rows = (range(table_wave.size) if names is None
                 else [table_names.index(n) for n in names])
@@ -251,8 +262,7 @@ class EmissionLineColumns:
             wave_obs=wave, sigma_inst_kms=s_inst,
             wave_rest=table_wave[keep], names=tuple(kept),
             zred=float(zred), sigma_gas_kms=s_gas,
-            zred_key="zred" if spectrum.free_z else None,
-            sigma_key="sigma_smooth" if spectrum.fit_sigma_smooth else None,
+            zred_key=zred_key, sigma_key=sigma_key,
             tie=tie, sigma_max_kms=sigma_max_kms,
         )
         information, diag = lines._check_conditioning(spectrum)
@@ -381,7 +391,9 @@ class EmissionLineColumns:
         unc = np.asarray(spectrum.uncertainty, dtype=np.float64)
         used = np.asarray(spectrum.mask, dtype=bool) & np.isfinite(unc) & (unc > 0)
         w = np.where(used, 1.0 / np.where(unc > 0, unc, 1.0) ** 2, 0.0)
-        A = np.asarray(self.columns({"zred": self.zred, "sigma_smooth": self.sigma_gas_kms}))
+        A = np.asarray(self.columns({k: v for k, v in ((self.zred_key, self.zred),
+                                                       (self.sigma_key, self.sigma_gas_kms))
+                                     if k is not None}))
         M = A.T @ (w[:, None] * A)
         d = 1.0 / np.sqrt(np.maximum(np.diag(M), np.finfo(float).tiny))
         C = d[:, None] * M * d[None, :]
