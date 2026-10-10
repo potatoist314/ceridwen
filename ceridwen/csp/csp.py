@@ -586,7 +586,7 @@ class CSPBasis:
 
         self._known_theta_keys = set(self.param_names) | {
             'lookback_time', 'logzsol', 'logzsol_hist',
-            'logmass', 'zred', 'lumdist_mpc', 'igm_factor', 'eline_scaling',
+            'logmass', 'zred', 'lumdist_mpc', 'flux_factor', 'igm_factor', 'eline_scaling',
             'frac_obrun', 'spectrum_scaling', 'spectrum_calib',
         } | set(getattr(getattr(self, "igm", None), "param_names", ()))
 
@@ -1278,7 +1278,10 @@ class CSPBasis:
 
     def _flux_factor(self, theta):
         """(1+z) (10 pc / D)^2 x L_sun/Hz -> cgs; D from ``theta['lumdist_mpc']`` when
-        present, else D_L(``theta['zred']``)."""
+        present, else D_L(``theta['zred']``).  ``theta['flux_factor']`` (SedModel injects it
+        for a fixed distance) replaces the per-call luminosity-distance quadrature."""
+        if "flux_factor" in theta:
+            return jnp.ravel(theta["flux_factor"])[0]
         from ..cosmology import flux_factor_cgs
         z_scalar = jnp.ravel(theta["zred"])[0]
         lumdist = (jnp.ravel(theta["lumdist_mpc"])[0]
