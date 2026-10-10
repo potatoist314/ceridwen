@@ -152,13 +152,17 @@ def noll(wave, tau_noll=1.0, delta=0.0, c_r=0.0, Ebump=0.0, **kwargs):
     :param delta: slope of power-law modifying Calzetti
     :param c_r: constant modifying effective R_v (e.g., c_r = -delta)
     :returns: optical depth τ(λ)
+
+    The bump centre (2175 Å) and FWHM (350 Å) follow Kriek & Conroy (2013,
+    ApJL 775, L16, Eq. 2): x0 = 1e4/2175 μm⁻¹, gamma = 0.035 μm * x0**2.
+    Pass ``x0`` and ``gamma`` as kwargs to override them.
     """
     # Calzetti baseline (normalized to τ_V = 1)
     kcalz = calzetti(wave, tau_cal00=1.0, R_v_cal00=4.05) - 1.0
     
     # Drude bump at 2175 Å, input in inverse μm
     x = 1e4 / wave  # inverse microns
-    bump = Ebump / 4.05 * drude(x, **kwargs)
+    bump = Ebump / 4.05 * drude(x, **{"x0": 1e4 / 2175.0, "gamma": 350e-4 * (1e4 / 2175.0) ** 2, **kwargs})
     
     # Modified attenuation curve
     k = kcalz + bump
