@@ -84,6 +84,10 @@ class SSPDataAfe(SSPData):
     _display_title = "SSPDataAfe"
     _schema_label = "SSPDataAfe schema 3.1"
     _extra_datasets = ("ssp_afe",)
+    # Host NumPy flux, deliberately: under x64 a jnp array puts the full float64
+    # cube (611 MB for the published grid) on the device, where nothing reads it --
+    # CSPBasis_afe keeps only a float32 copy. save() round-trips float64 unchanged.
+    _flux_on_host = True
 
     @classmethod
     def _schema_version(cls) -> str:

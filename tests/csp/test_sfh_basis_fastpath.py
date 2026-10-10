@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from ceridwen import Cosmology
 from ceridwen.csp.csp_afe import CSPBasis_afe
 
 
@@ -22,6 +23,8 @@ def fixed_ssp():
         ssp_wave=np.linspace(1000.0, 10000.0, 11, dtype=np.float32),
         ssp_lg_age_gyr=np.linspace(-3.0, 1.14, 107, dtype=np.float32),
         ssp_lgmet=np.linspace(-2.0, 0.4, 13, dtype=np.float32),
+        # Z_sun = 1, so ssp_lgmet values are logzsol values.
+        log10_zsun=0.0,
         ssp_resolution=None,
         isoc_type=None,
         spec_library=None,
@@ -33,7 +36,7 @@ def build_csp(ssp, *, reference=False, **overrides):
         "theta": {
             "lookback_time": LOOKBACK_GYR,
             "sfh": jnp.ones(8),
-            "Z": jnp.array([-0.8]),
+            "logzsol": jnp.array([-0.8]),
             "afe": jnp.array([0.2]),
         },
         "zh_const": True,
@@ -41,7 +44,7 @@ def build_csp(ssp, *, reference=False, **overrides):
         "add_dust": False,
         "add_diffuse_dust": False,
         "add_dust_emission": False,
-        "sigma_losvd_kms": 0.0,
+        "cosmo": Cosmology.planck18(),
         "verbose": False,
     }
     options.update(overrides)
@@ -66,7 +69,7 @@ def theta(afe, metallicity, sfh=None):
         sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
     return {
         "afe": jnp.array([afe]),
-        "Z": jnp.array([metallicity]),
+        "logzsol": jnp.array([metallicity]),
         "sfh": jnp.asarray(sfh),
     }
 
@@ -220,9 +223,9 @@ def model_pair(ssp, lookback, *, per_bin=False, zh_const=True, dust=False):
     n_sfh = lookback.size - 1 if per_bin else lookback.size
     initial = {"lookback_time": lookback, "sfh": jnp.ones(n_sfh), "afe": jnp.array([0.2])}
     if zh_const:
-        initial["Z"] = jnp.array([-0.8])
+        initial["logzsol"] = jnp.array([-0.8])
     else:
-        initial["zh"] = jnp.full(lookback.size, -0.8)
+        initial["logzsol_hist"] = jnp.full(lookback.size, -0.8)
     options = dict(theta=initial, zh_const=zh_const, add_dust=dust, add_diffuse_dust=dust)
     reference = build_csp(ssp, reference=True, **options)
     automatic = build_csp(ssp, **options)
@@ -232,10 +235,10 @@ def model_pair(ssp, lookback, *, per_bin=False, zh_const=True, dust=False):
     # Young-weighted SFH, so stars under 10 Myr carry a visible share of the light.
     inputs.update(afe=jnp.array([0.13]), sfh=jnp.geomspace(300.0, 0.3, n_sfh))
     if zh_const:
-        inputs["Z"] = jnp.array([-0.73])
+        inputs["logzsol"] = jnp.array([-0.73])
     else:
         # Off-grid values, both grid edges and values beyond them.
-        inputs["zh"] = jnp.linspace(-2.1, 0.5, lookback.size) + 0.07 * jnp.sin(
+        inputs["logzsol_hist"] = jnp.linspace(-2.1, 0.5, lookback.size) + 0.07 * jnp.sin(
             jnp.arange(lookback.size)
         )
     if dust:
@@ -277,10 +280,10 @@ def test_evolving_metallicity_gradients_match_reference(fixed_ssp):
     reference, automatic, inputs = model_pair(fixed_ssp, FOURTEEN_BINS_GYR, zh_const=False, dust=True)
 
     def objective(csp, zh, sfh):
-        return jnp.sum(csp.get_spectrum({**inputs, "zh": zh, "sfh": sfh}))
+        return jnp.sum(csp.get_spectrum({**inputs, "logzsol_hist": zh, "sfh": sfh}))
 
-    expected = jax.grad(objective, argnums=(1, 2))(reference, inputs["zh"], inputs["sfh"])
-    actual = jax.grad(objective, argnums=(1, 2))(automatic, inputs["zh"], inputs["sfh"])
+    expected = jax.grad(objective, argnums=(1, 2))(reference, inputs["logzsol_hist"], inputs["sfh"])
+    actual = jax.grad(objective, argnums=(1, 2))(automatic, inputs["logzsol_hist"], inputs["sfh"])
     for actual_part, expected_part in zip(actual, expected):
         np.testing.assert_allclose(actual_part, expected_part, rtol=8e-5, atol=3e-2)
 

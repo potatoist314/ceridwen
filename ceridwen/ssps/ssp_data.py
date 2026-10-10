@@ -198,6 +198,7 @@ class SSPData:
     _display_title = "SSPData"
     _schema_label = "SSP schema 3.0"
     _extra_datasets: tuple = ()
+    _flux_on_host = False
 
     def _expected_flux_shape(self) -> tuple:
         return (int(self.ssp_lgmet.size), int(self.ssp_lg_age_gyr.size),
@@ -561,8 +562,9 @@ class SSPData:
                 'ssp_lgmet':      jnp.array(raw['ssp_lgmet']),
                 'ssp_lg_age_gyr': jnp.array(raw['ssp_lg_age_gyr']),
                 'ssp_wave':       jnp.array(raw['ssp_wave']),
-                'ssp_flux':       jnp.asarray(raw['ssp_flux'] if flux_dtype is None
-                                              else raw['ssp_flux'].astype(flux_dtype)),
+                'ssp_flux':       (np.asarray if cls._flux_on_host else jnp.asarray)(
+                                      raw['ssp_flux'] if flux_dtype is None
+                                      else raw['ssp_flux'].astype(flux_dtype)),
             }
             extra = {name: (jnp.array(v) if v is not None else None)
                      for name, v in raw_extra.items()}

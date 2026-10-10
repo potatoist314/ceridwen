@@ -11,13 +11,14 @@ available as :meth:`CSPBasis_afe.logzsol_total` / ``grid_metadata.logzsol_total`
 import os
 import warnings
 
+import jax
 import numpy as np
 import jax.numpy as jnp
 import pprint
 
 from ceridwen.csp.csp import (CSPBasis, LOGZSOL_KEYS, REMOVED_METALLICITY_KEYS,
                               _check_duste_model, _default_logzsol,
-                              removed_metallicity_key_error)
+                              removed_metallicity_key_error, tiny_number)
 from ceridwen.ssps.grid_metadata import logzsol_total as _logzsol_total, refused_cell_bounds
 
 
@@ -28,6 +29,10 @@ class CSPBasis_afe(CSPBasis):
     ``SSPDataAfe`` grid (4-D ``ssp_flux`` with an ``ssp_afe`` axis).  theta["afe"] is
     optional: absent, the plane closest to [alpha/Fe] = 0 is used.  The SFH weights,
     dust, projection, flux factor and cosmology are those of ``CSPBasis``.
+
+    Every step-SFH model on a fixed lookback grid pre-contracts the SSP age axis into a
+    per-bin SFH basis at construction (:meth:`_configure_sfh_basis_fastpath`); the
+    spectrum is then a sum over the SFH bins instead of over the SSP ages.
     """
 
     def __init__(
@@ -98,7 +103,10 @@ class CSPBasis_afe(CSPBasis):
         init_dust_params = ({'bin_edges': [(-jnp.inf, -1.97)], 'laws': ['powerlaw']}
                             if init_dust_params is None else dict(init_dust_params))
 
-        _flux_in = jnp.asarray(SSPData.ssp_flux)
+        # Host NumPy on purpose: jnp.asarray would put the float64 cube on
+        # the device only for the float32 cast below to copy it again. The
+        # cast happens on the host and one float32 cube is uploaded.
+        _flux_in = np.asarray(SSPData.ssp_flux)
         _afe_in  = getattr(SSPData, "ssp_afe", None)
         if _flux_in.ndim != 4 or _afe_in is None:
             raise TypeError(
@@ -219,6 +227,8 @@ class CSPBasis_afe(CSPBasis):
             )
         self.sfh_interp = sfh_interp
         self.zh_const = bool(zh_const)
+        self._has_age_dependent_dust = bool(add_dust)
+        self._has_dust_emission = bool(add_dust_emission)
         if zh_const:
             if sfh_interp == 'step':
                 self.calculate_ssp_weights = self.calculate_ssp_weights_const_zh_step
@@ -233,12 +243,196 @@ class CSPBasis_afe(CSPBasis):
             print(f"SFH integration scheme : {sfh_interp}")
 
         self.initialize_model_structure(theta)
+        self._configure_sfh_basis_fastpath()
 
         if verbose:
             print("\nCSPBasis (dict theta) — registered parameters:")
             pprint.pprint({k: v.shape for k, v in self.theta_init.items()})
 
         self.check_param_ranges(self.theta_init)
+
+    def _configure_sfh_basis_fastpath(self):
+        """Pre-contract the SSP age axis into a fixed per-bin SFH basis.
+
+        Every model whose SSP weights are linear in the per-bin SFR on the
+        construction-time age grid uses it: step SFH, constant or per-node
+        metallicity, fixed lookback grid.  Each bin keeps its own basis
+        spectrum, so a per-bin metallicity interpolates bin by bin.
+        Age-dependent (birth-cloud) dust stays exact: ages that share one row
+        of ``_age_bin_mix`` share one attenuation curve, so each such age
+        group keeps its own basis.
+        """
+        self.sfh_basis_fastpath = False
+        self._sfh_basis = None
+        self._sfh_basis_tables = {}
+        self._sfh_bin_to_age = None
+        if self.sfh_interp != "step":
+            reason = "sfh_interp='linear' weights are not linear in the SFH"
+        elif self.track_zred_age:
+            reason = "track_zred_age changes the age grid for each sample"
+        else:
+            reason = None
+        if reason is not None:
+            warnings.warn(
+                f"SFH basis fast path is off: {reason}. The general path "
+                "sums the full SSP age cube on every call.",
+                stacklevel=3,
+            )
+            return self
+
+        operator = self._make_sfh_bin_to_age_operator()
+        if self._has_age_dependent_dust:
+            rows, group = np.unique(
+                np.asarray(self._age_bin_mix), axis=0, return_inverse=True
+            )
+        else:
+            rows, group = np.zeros((1, 0)), np.zeros(self._n_age, dtype=int)
+        in_group = np.ravel(group)[None, :] == np.arange(len(rows))[:, None]
+        self._sfh_bin_to_age = operator
+        self._sfh_basis = jnp.einsum(
+            "ga,na,pzaw->pzgnw",
+            jnp.asarray(in_group, dtype=jnp.float32),
+            operator,
+            self.flux,
+        )
+        self._dust_group_mix = jnp.asarray(rows, dtype=jnp.float32)
+        self.sfh_basis_fastpath = True
+        return self
+
+    def _sfh_basis_table(self, wave):
+        """``_sfh_basis`` on the model wavelengths ``wave`` (a static slice)
+        as ``(table, rows)``: ``table[afe, z, rows[g, n]]`` is the basis
+        spectrum of group ``g`` and bin ``n``.  The table holds the nonzero
+        ``(g, n)`` spectra once, plus one zero row that the empty ones share
+        (the birth-cloud group has ages in the first bin only).  Cached per
+        slice."""
+        key = (wave.start, wave.stop)
+        if key not in self._sfh_basis_tables:
+            basis = np.asarray(self._sfh_basis)[..., wave]
+            nonzero = np.any(basis != 0, axis=(0, 1, 4))
+            group, bin_ = np.nonzero(nonzero)
+            rows = np.full(nonzero.shape, group.size)
+            rows[group, bin_] = np.arange(group.size)
+            table = basis[:, :, group, bin_]
+            if not nonzero.all():
+                table = np.concatenate([table, np.zeros_like(table[:, :, :1])], axis=2)
+            # A device array even when the first call is inside a trace.
+            with jax.ensure_compile_time_eval():
+                self._sfh_basis_tables[key] = (jnp.asarray(table), rows)
+        return self._sfh_basis_tables[key]
+
+    def _make_sfh_bin_to_age_operator(self):
+        """Return the exact static ``(n_time - 1, n_age)`` bin-to-age operator.
+
+        Row ``i`` spreads bin ``i``'s duration over the SSP Voronoi cells it
+        overlaps, as the step branch of ``_ssp_weights`` does.
+        """
+        t_young = self.sfh_times[:-1]
+        t_old = self.sfh_times[1:]
+        dt = t_old - t_young
+        overlap = jnp.maximum(
+            0.0,
+            jnp.minimum(t_old[:, None], self._ssp_voronoi_hi[None, :])
+            - jnp.maximum(t_young[:, None], self._ssp_voronoi_lo[None, :]),
+        )
+        total = overlap.sum(axis=1)
+        scale = jnp.where(total > 0, dt / jnp.where(total > 0, total, 1.0), 0.0)
+        return (overlap * scale[:, None]).astype(jnp.float32)
+
+    def _use_sfh_basis(self, theta):
+        """Return whether this call can use the SFH basis (trace-time static)."""
+        if not self.sfh_basis_fastpath:
+            return False
+        if "lookback_time" in theta:
+            warnings.warn(
+                "theta['lookback_time'] changes the age grid for this call; "
+                "the SFH basis fast path is bypassed.",
+                stacklevel=3,
+            )
+            return False
+        return True
+
+    def _dust_group_attenuation(self, attn, theta):
+        """Age-dependent attenuation for each basis age group, ``(n_group, n_wave)``."""
+        tau = jnp.einsum(
+            "gb,bw->gw", self._dust_group_mix, attn.astype(jnp.float32)
+        )
+        attn_group = jnp.exp(-tau)
+        # FSPS-style OB-runaway dust escape (``add_dust.f90`` L93-94).
+        if "frac_obrun" in theta:
+            fo = jnp.ravel(theta["frac_obrun"])[0].astype(jnp.float32)
+            attn_group = (jnp.float32(1.0) - fo) * attn_group + fo
+        return attn_group
+
+    def _sfh_basis_coords(self, theta):
+        """Return alpha and metallicity interpolation coordinates.
+
+        The metallicity coordinates are scalars for ``theta["logzsol"]`` and one
+        per SFH bin for ``theta["logzsol_hist"]``, with the same bracketing as
+        ``_ssp_weights``.
+        """
+        if self._n_afe == 1 or "afe" not in theta:
+            # Same static plane choice as ``_flux_at_afe``.
+            plane = 0 if self._n_afe == 1 else self._afe_solar_idx
+            afe_lo = afe_hi = jnp.asarray(plane, dtype=jnp.int32)
+            afe_weight = jnp.asarray(0.0, dtype=jnp.float32)
+        else:
+            afe_hi, afe_weight = self._afe_coords(theta)
+            afe_lo = afe_hi - 1
+
+        if self.zh_const:
+            target_z = jnp.ravel(theta["logzsol"])[0]
+            z_hi = jnp.clip(
+                jnp.searchsorted(
+                    self.zmet, target_z, side="left", method="compare_all"
+                ),
+                1,
+                self._n_z - 1,
+            )
+            z_lo = z_hi - 1
+            z0 = self.zmet[z_lo]
+            z1 = self.zmet[z_hi]
+            z_weight = jnp.clip((target_z - z0) / (z1 - z0), 0.0, 1.0)
+        else:
+            zh = theta["logzsol_hist"]
+            zbin = zh if self.zh_per_bin else 0.5 * (zh[:-1] + zh[1:])
+            z_lo = jnp.clip(
+                jnp.searchsorted(self.zmet, zbin, method="compare_all") - 1,
+                0,
+                self._n_z - 2,
+            )
+            z_hi = z_lo + 1
+            z0 = self.zmet[z_lo]
+            z1 = self.zmet[z_hi]
+            z_weight = jnp.clip(
+                (zbin - z0) / jnp.maximum(z1 - z0, tiny_number), 0.0, 1.0
+            )
+        return afe_lo, afe_hi, afe_weight, z_lo, z_hi, z_weight
+
+    def _spectrum_from_sfh_basis(self, theta, wave=slice(None)):
+        """Unattenuated spectrum of each basis age group, ``(n_group, n_wave)``,
+        on the model wavelengths ``wave`` (a static slice)."""
+        sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
+        sfh_bin = sfh if self.sfh_per_bin else 0.5 * (sfh[:-1] + sfh[1:])
+        afe_lo, afe_hi, afe_weight, z_lo, z_hi, z_weight = self._sfh_basis_coords(theta)
+        afe_weight = afe_weight.astype(jnp.float32)
+        z_weight = z_weight.astype(jnp.float32)
+        table, rows = self._sfh_basis_table(wave)
+
+        if self.zh_const:
+            def corner(afe, z):
+                return table[afe, z][rows]                          # (g, n, w)
+        else:
+            z_weight = z_weight[:, None]
+
+            def corner(afe, z):
+                # Bin n reads its own metallicity plane z[n].
+                return table[afe][z[None, :], rows]
+
+        lower = (1.0 - z_weight) * corner(afe_lo, z_lo) + z_weight * corner(afe_lo, z_hi)
+        upper = (1.0 - z_weight) * corner(afe_hi, z_lo) + z_weight * corner(afe_hi, z_hi)
+        group_basis = (1.0 - afe_weight) * lower + afe_weight * upper
+        return jnp.einsum("n,gnw->gw", sfh_bin, group_basis)
 
     def initialize_model_structure(self, theta):
         """``CSPBasis.initialize_model_structure`` plus the optional scalar theta['afe']."""
@@ -317,7 +511,7 @@ class CSPBasis_afe(CSPBasis):
         """``(k, w)`` with the interpolated plane ``(1 - w) * flux[k - 1] + w * flux[k]``; edges clamp like the metallicity interpolation."""
         target_afe = jnp.ravel(theta["afe"])[0]
         k = jnp.clip(
-            jnp.searchsorted(self.afe_grid, target_afe, side='left'),
+            jnp.searchsorted(self.afe_grid, target_afe, side='left', method='compare_all'),
             1, self._n_afe - 1,
         )
         a0 = self.afe_grid[k - 1]
@@ -450,6 +644,14 @@ class CSPBasis_afe(CSPBasis):
         _ = include_lines
         attn, attn_diffuse = self.attenuate_dust(self.wave, theta)
 
+        if self._use_sfh_basis(theta):
+            groups = self._spectrum_from_sfh_basis(theta)
+            if self._has_age_dependent_dust:
+                groups = groups * self._dust_group_attenuation(attn, theta)
+            spectrum = groups.sum(axis=0)
+            spectrum *= jnp.exp(-attn_diffuse.astype(jnp.float32))
+            return spectrum.reshape((-1,))
+
         M       = self._age_bin_mix
         tau_age = jnp.einsum("ab,bw->aw", M, attn.astype(jnp.float32))
         attn_age= jnp.exp(-tau_age)
@@ -468,20 +670,27 @@ class CSPBasis_afe(CSPBasis):
         """Dust attenuation + dust emission (``include_lines`` ignored)."""
         _ = include_lines
         attn, attn_diffuse = self.attenuate_dust(self.wave, theta)
-
-        M             = self._age_bin_mix
-        tau_age       = jnp.einsum("ab,bw->aw", M, attn.astype(jnp.float32))
-        attn_age      = jnp.exp(-tau_age)
         diffuse_curve = jnp.exp(-attn_diffuse.astype(jnp.float32))
 
-        if "frac_obrun" in theta:
-            fo = jnp.ravel(theta["frac_obrun"])[0].astype(jnp.float32)
-            attn_age = (jnp.float32(1.0) - fo) * attn_age + fo
+        if self._use_sfh_basis(theta):
+            groups             = self._spectrum_from_sfh_basis(theta)
+            spectrum_dust_free = groups.sum(axis=0)
+            attenuated         = jnp.einsum(
+                "gw,gw->w", groups, self._dust_group_attenuation(attn, theta)
+            )
+        else:
+            M        = self._age_bin_mix
+            tau_age  = jnp.einsum("ab,bw->aw", M, attn.astype(jnp.float32))
+            attn_age = jnp.exp(-tau_age)
 
-        weights           = self.calculate_ssp_weights(theta).astype(jnp.float32)
-        spectrum_dust_free= self._contract(theta, weights)
-        attenuated        = self._contract(theta, weights, attn_age)
-        attenuated       *= diffuse_curve
+            if "frac_obrun" in theta:
+                fo = jnp.ravel(theta["frac_obrun"])[0].astype(jnp.float32)
+                attn_age = (jnp.float32(1.0) - fo) * attn_age + fo
+
+            weights            = self.calculate_ssp_weights(theta).astype(jnp.float32)
+            spectrum_dust_free = self._contract(theta, weights)
+            attenuated         = self._contract(theta, weights, attn_age)
+        attenuated *= diffuse_curve
 
         dust_emi_spectrum, _mdust, _tduste = self.dust_emi.compute_dust_emission(
             spec_attn      = attenuated,
@@ -497,5 +706,7 @@ class CSPBasis_afe(CSPBasis):
     def get_spectrum_nodattn_nodem_noneb(self, theta, *, include_lines=None):
         """Stellar continuum only."""
         _ = include_lines
+        if self._use_sfh_basis(theta):
+            return self._spectrum_from_sfh_basis(theta).sum(axis=0)
         weights  = self.calculate_ssp_weights(theta=theta).astype(jnp.float32)
         return self._contract(theta, weights)

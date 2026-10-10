@@ -77,7 +77,8 @@ def mass_mapped_beta(
         Coordinate in [0, 1].
     logz_mean, logz_0, logz_max : array_like or float
         log10 of the formed-mass-weighted metallicity ``<Z>``, the initial
-        metallicity ``Z_0 <= <Z>`` and the grid top, in ``ssp_lgmet`` units.
+        metallicity ``Z_0 <= <Z>`` and the grid top, on one log10 Z scale
+        (``logzsol`` for a CSP theta; a common offset leaves ``beta`` unchanged).
     beta_min, beta_max : float
         Prior range of ``beta`` before the grid limit.
 
@@ -121,11 +122,12 @@ def mass_mapped_zh(sfh, sfh_times_yr, logz_mean, beta, logz_0, sfh_per_bin=False
     sfh_times_yr : array_like, shape (n,)
         Lookback-time nodes in years (``CSPBasis.sfh_times``).
     logz_mean : array_like, shape (1,)
-        log10 ``<Z>`` in ``ssp_lgmet`` units.
+        log10 ``<Z>`` on one log10 Z scale (``logzsol`` for a CSP theta;
+        a common offset shifts ``zh`` by the same offset).
     beta : array_like, shape (1,)
         Enrichment shape in (0, 1), e.g. from :func:`mass_mapped_beta`.
     logz_0 : array_like, shape (1,)
-        log10 ``Z_0 <= <Z>`` in ``ssp_lgmet`` units.
+        log10 ``Z_0 <= <Z>`` on the same scale as ``logz_mean``.
     sfh_per_bin : bool
         ``sfh`` holds one SFR per bin.
 
@@ -133,7 +135,7 @@ def mass_mapped_zh(sfh, sfh_times_yr, logz_mean, beta, logz_0, sfh_per_bin=False
     -------
     zh : jnp.ndarray, shape (n - 1,)
         log10 metallicity per bin, index 0 = youngest bin; the per-bin
-        ``theta["zh"]`` of ``CSPBasis_afe``.
+        ``theta["logzsol_hist"]`` of ``CSPBasis_afe``.
     """
     sfh = jnp.clip(jnp.asarray(sfh, dtype=float), 1e-30, None)
     sfh_bin = sfh if sfh_per_bin else 0.5 * (sfh[:-1] + sfh[1:])

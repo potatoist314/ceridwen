@@ -154,12 +154,13 @@ class CSPBasis:
     SSPData : SSPData -- SSP grids (wave, flux, ages, metallicities, optional resolution curve).
     theta : dict -- initial values; must contain "lookback_time" (Gyr, increasing, index 0 = today,
         >= 2 nodes) and "sfh", plus "logzsol" (zh_const=True, shape (1,)) or "logzsol_hist"
-        (zh_const=False, shape (n_time,)), both log10(Z/Z_sun) of the grid.  Mutually exclusive
+        (zh_const=False, shape (n_time,) per node or (n_time - 1,) per bin), both log10(Z/Z_sun)
+        of the grid.  Mutually exclusive
         with ``lookback_time=``.
     lookback_time : array -- shortcut for ``theta``: the node grid only, neutral initial values
         (sfh = 1, metallicity = grid median).
     sfh_per_bin : bool -- with ``lookback_time=``, one SFR per bin (n_time-1,) instead of per node.
-    zh_const : bool -- constant metallicity ("logzsol") or a history ("logzsol_hist", one per node).
+    zh_const : bool -- constant metallicity ("logzsol") or a history ("logzsol_hist", one per node or per bin).
     gas_tied : bool -- gas-phase metallicity follows the stellar one, gas_logz := logzsol (or
         logzsol_hist[0], today's value), as Prospector ties them; "gas_logz" is then not a
         parameter.  The two are the SAME NUMBER, not the same absolute Z: logzsol uses the SSP
@@ -555,9 +556,16 @@ class CSPBasis:
                 "gives 'gas_logz'; remove one (a tied gas metallicity is not a parameter).")
 
         self.zh_is_scalar = None
+        # ``logzsol_hist`` follows the two ``sfh`` conventions: one value per node
+        # (bins average adjacent nodes) or one value per bin (used directly).
+        self.zh_per_bin = False
         if 'logzsol_hist' in theta:
             zh = jnp.atleast_1d(jnp.asarray(theta['logzsol_hist'], dtype=float))
-            assert zh.shape == (self.n_time,), "'logzsol_hist' must match 'lookback_time' length"
+            assert zh.shape in ((self.n_time,), (self.n_time - 1,)), (
+                f"'logzsol_hist' shape {zh.shape} must be ({self.n_time},) (per node) "
+                f"or ({self.n_time - 1},) (per bin)"
+            )
+            self.zh_per_bin = zh.shape == (self.n_time - 1,)
             self.zh_is_scalar = False
         elif 'logzsol' in theta:
             Z = jnp.atleast_1d(jnp.asarray(theta['logzsol'], dtype=float))
@@ -1535,7 +1543,7 @@ class CSPBasis:
             return total_weights
 
         zh   = theta["logzsol_hist"]
-        zbin = 0.5 * (zh[:-1] + zh[1:])
+        zbin = zh if self.zh_per_bin else 0.5 * (zh[:-1] + zh[1:])
         k    = jnp.clip(jnp.searchsorted(self.zmet, zbin) - 1, 0, self._n_z - 2)
 
         z0 = self.zmet[k]
