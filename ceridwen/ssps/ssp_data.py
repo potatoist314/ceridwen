@@ -620,11 +620,12 @@ class SSPData:
         return arrays, extra, meta
 
     @classmethod
-    def load(cls, filename, flux_dtype=None, zsun=None):
+    def load(cls, filename, flux_dtype=None, zsun=None, axis_meaning=None):
         """Load a grid from HDF5; raises ValueError if the file lacks ``ssp_resolution``. ``flux_dtype`` casts the flux cube on read.
-        ``zsun`` supplies the grid's solar metallicity when it is neither recorded in the file nor in ``grid_metadata.CHASH_TABLE``."""
+        ``zsun`` supplies the grid's solar metallicity when it is neither recorded in the file nor in ``grid_metadata.CHASH_TABLE``;
+        ``axis_meaning`` likewise supplies what logzsol is on the grid ("feh" or "log_z_over_zsun")."""
         arrays, _extra, meta = cls._read_h5(filename, flux_dtype=flux_dtype)
-        return cls(**arrays, **meta, zsun=zsun)
+        return cls(**arrays, **_with_axis_meaning(meta, axis_meaning), zsun=zsun)
 
     @classmethod
     def from_fsps(cls, save_to: Optional[str] = None,
@@ -662,6 +663,16 @@ class SSPData:
         if save_to is not None:
             data.save(save_to)
         return data
+
+
+def _with_axis_meaning(meta, axis_meaning):
+    """``meta`` with ``axis_meaning`` filled in from the ``load`` keyword; refuses a contradiction."""
+    if axis_meaning is None:
+        return meta
+    recorded = meta.get("axis_meaning")
+    if recorded is not None and recorded != axis_meaning:
+        raise ValueError(f"axis_meaning={axis_meaning!r} contradicts the file's {recorded!r}")
+    return {**meta, "axis_meaning": axis_meaning}
 
 
 def _collect_ssp_and_meta(**kwargs):
