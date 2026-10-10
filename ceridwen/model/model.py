@@ -156,16 +156,6 @@ class SedModel:
             self._zred_fixed = jnp.array([self.zred])
             if self.lumdist_mpc is not None:
                 self._lumdist_fixed = jnp.array([self.lumdist_mpc])
-        # For a fixed distance the flux factor is a constant, so the quadrature inside
-        # flux_factor_cgs must not run in the compiled hot path.  Computed once here
-        # through jit, so the value matches a compiled per-call evaluation, and injected
-        # into the CSP theta by predict().  A sampled zred never sees this constant.
-        self._flux_factor_fixed = None
-        if self._zred_fixed is not None:
-            from ..cosmology import flux_factor_cgs
-            self._flux_factor_fixed = jnp.atleast_1d(jax.jit(
-                lambda z, d: flux_factor_cgs(z, self.cosmo, lumdist_mpc=d)
-            )(self._zred_fixed[0], None if self._lumdist_fixed is None else self._lumdist_fixed[0]))
 
         self.zred_is_free = ("zred" in self.param_names) or ("zred" in self.transforms)
         grid_rescaled = (bool(getattr(csp, "track_zred_age", False))
@@ -212,6 +202,18 @@ class SedModel:
                 "lumdist_mpc= (nearby object) for physical units, or ignore this if "
                 "the data are in the same unitless convention",
                 stacklevel=2)
+
+        # For a fixed distance the flux factor is a constant, so the quadrature inside
+        # flux_factor_cgs must not run in the compiled hot path.  Computed once here,
+        # after every construction guard (no trace before them), through jit so the
+        # value matches a compiled per-call evaluation; predict() injects it into the
+        # CSP theta.  A sampled zred never sees this constant.
+        self._flux_factor_fixed = None
+        if self._zred_fixed is not None:
+            from ..cosmology import flux_factor_cgs
+            self._flux_factor_fixed = jnp.atleast_1d(jax.jit(
+                lambda z, d: flux_factor_cgs(z, self.cosmo, lumdist_mpc=d)
+            )(self._zred_fixed[0], None if self._lumdist_fixed is None else self._lumdist_fixed[0]))
 
 
     def _check_metallicity_setup(self, free_param_init):
