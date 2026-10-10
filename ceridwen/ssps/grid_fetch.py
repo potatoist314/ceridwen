@@ -48,8 +48,8 @@ REGISTRY: dict[str, dict] = {
     # The Kroupa IMF sets the relative numbers of stars born at different masses.
     # These spectra were already calculated and supplied by M. J. Park.
     # Each fit loads them from this file; it does not run FSPS again.
-    # Z controls iron relative to hydrogen. afe controls alpha elements relative to iron.
-    # Both affect the total amount of metals. Z alone is not the total metal content.
+    # logzsol controls iron relative to hydrogen. afe controls alpha elements relative to iron.
+    # Both affect the total amount of metals. logzsol alone is not the total metal content.
     # For what each stored value means, read SSPDataAfe in ssps/ssp_data_afe.py.
     # For how the original values are converted, read scripts_afe/build_afe_hr_grid.py.
     "amist_c3k_hr_krou_afe": {
