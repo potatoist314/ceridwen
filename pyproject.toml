@@ -77,6 +77,7 @@ dependencies = [
     "optax>=0.2.3",       # VI (NeuTra) preconditioning training loop
     "anesthetic>=2.14",   # nested-sampling posteriors, evidence, corner plots
     "pytest>=7.0",        # test runner (so `pytest` works with no extra install)
+    "sedpy-jax>=0.1.1",   # Spectrum(projector="chain"): grid helpers in observation/_smoothing.py
 ]
 
 # The ONE thing that cannot be a core dependency is FSPS (`python-fsps`): it is

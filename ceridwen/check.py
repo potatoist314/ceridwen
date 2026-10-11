@@ -59,7 +59,7 @@ def check_environment(verbose: bool = True) -> bool:
                    "need it.")
 
     # Filters and attenuation curves are part of ceridwen itself (vendored
-    # from sedpy-jax, which is not a dependency), so what is worth checking is
+    # from sedpy-jax; only projector="chain" imports sedpy-jax), so what is worth checking is
     # that the data files came along with the install.
     try:
         from ceridwen.observation.filters import list_available_filters
