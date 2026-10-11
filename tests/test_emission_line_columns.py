@@ -27,7 +27,7 @@ from ceridwen.likelihood import (
     PolynomialCalibration,
 )
 from ceridwen.likelihood.calibration import _bvn_upper, log_positive_probability
-from ceridwen.broadening import Instrument
+from ceridwen.broadening import FWHM_TO_SIGMA, Instrument
 from ceridwen.observation import Spectrum
 
 jax.config.update("jax_enable_x64", True)
@@ -326,3 +326,14 @@ def test_atomic_doublets_share_one_flux_at_the_fsps_ratio():
     assert lines.zred_key is None
     with pytest.raises(ValueError, match="fixed redshift"):
         replace(lines, zred_key="zred").with_photometry(None, "photometry")
+
+
+def test_line_widths_follow_the_spectrum_projector():
+    """projector="chain" keeps the chain's c = 2.998e5 km/s (production numbers);
+    the default projector uses the instrument's own width."""
+    from ceridwen.likelihood.emission_lines import _sigma_inst_kms
+    instrument = Instrument.R_fwhm(3500.0)
+    chain = Spectrum(wavelength=WAVE, instrument=instrument, projector="chain")
+    fft = Spectrum(wavelength=WAVE, instrument=instrument)
+    assert np.all(_sigma_inst_kms(chain, WAVE) == float(2.998e5 / 3500.0) * FWHM_TO_SIGMA)
+    np.testing.assert_array_equal(_sigma_inst_kms(fft, WAVE), instrument.sigma_kms_at(WAVE))
