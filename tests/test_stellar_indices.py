@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ceridwen import Cosmology
 from ceridwen.fit import read_result_h5, write_result_h5
 from ceridwen.observation import StellarIndexDefinition, StellarIndices
 from ceridwen.sampler.runner import SamplingResult
@@ -94,6 +95,7 @@ def test_hdf5_preserves_index_metadata(tmp_path):
         transforms={},
         param_names=["logmass"],
         zred=0.0,
+        cosmo=Cosmology.planck18(),
     )
     result = SamplingResult(
         samples={"logmass": jnp.array([10.0, 10.1])},

@@ -27,6 +27,7 @@ from ceridwen.likelihood import (
     PolynomialCalibration,
 )
 from ceridwen.likelihood.calibration import _bvn_upper, log_positive_probability
+from ceridwen.broadening import Instrument
 from ceridwen.observation import Spectrum
 
 jax.config.update("jax_enable_x64", True)
@@ -241,10 +242,10 @@ def test_likelihood_without_lines_is_the_polynomial_likelihood():
 @pytest.mark.skipif(not os.environ.get("SPS_HOME"), reason="needs $SPS_HOME for emlines_info.dat")
 def test_from_spectrum_selects_covered_lines_with_enough_unmasked_pixels():
     spec = Spectrum(wavelength=WAVE, flux=_continuum(), uncertainty=_continuum() / 30,
-                    resolution=3500.0, smoothtype="R", res_convention="fwhm",
-                    sigma_losvd=SIGMA_GAS, fit_sigma_smooth=True, free_z=True, name="spectrum")
+                    instrument=Instrument.R_fwhm(3500.0), projector="chain", name="spectrum")
     spec.mask_wavelength_range(4862.7629 * (1 + ZRED) - 30, 4862.7629 * (1 + ZRED) + 30)
-    lines = EmissionLineColumns.from_spectrum(spec, ZRED)
+    lines = EmissionLineColumns.from_spectrum(spec, ZRED, sigma_gas_kms=SIGMA_GAS,
+                                              sigma_key="sigma_smooth", zred_key="zred")
     assert "[O II] 3726" in lines.names and "[O III] 5007" in lines.names
     assert "Ba-beta 4861" not in lines.names          # masked: fewer than 3 pixels
     assert lines.zred_key == "zred" and lines.sigma_key == "sigma_smooth"
@@ -272,7 +273,7 @@ def test_photometry_shares_the_line_flux_exactly():
         keys=("photometry", "spectrum"),
         likelihoods=(DiagonalGaussianLikelihood(),
                      DiagonalGaussianLikelihood(calibration=cal, emission_lines=lines)))
-    data = {"spectrum": (y, sigma, mask), "photometry": (y_p, sigma_p, mask_p)}
+    data = {"spectrum": (y, sigma, mask, None, None), "photometry": (y_p, sigma_p, mask_p, None, None)}
     value = float(joint.loglike(data, {"spectrum": mu, "photometry": mu_p}, {}))
 
     plain = DiagonalGaussianLikelihood(calibration=cal)
@@ -301,7 +302,7 @@ def test_loglike_without_shared_lines_is_the_per_observation_sum():
     multi = MultiObservationLikelihood(
         keys=("a", "b"),
         likelihoods=(DiagonalGaussianLikelihood(), DiagonalGaussianLikelihood(calibration=cal)))
-    data = {"a": (y, sigma, mask), "b": (y, sigma, mask)}
+    data = {"a": (y, sigma, mask, None, None), "b": (y, sigma, mask, None, None)}
     expected = (jnp.zeros(()) + multi.likelihoods[0](y, mu, sigma, mask, params={})[0]
                 + multi.likelihoods[1](y, mu, sigma, mask, params={})[0])
     assert float(multi.loglike(data, {"a": mu, "b": mu}, {})) == float(expected)
@@ -310,9 +311,8 @@ def test_loglike_without_shared_lines_is_the_per_observation_sum():
 @pytest.mark.skipif(not os.environ.get("SPS_HOME"), reason="needs $SPS_HOME for emlines_info.dat")
 def test_atomic_doublets_share_one_flux_at_the_fsps_ratio():
     spec = Spectrum(wavelength=WAVE, flux=_continuum(), uncertainty=_continuum() / 30,
-                    resolution=3500.0, smoothtype="R", res_convention="fwhm",
-                    sigma_losvd=SIGMA_GAS, name="spectrum")
-    lines = EmissionLineColumns.from_spectrum(spec, ZRED)
+                    instrument=Instrument.R_fwhm(3500.0), projector="chain", name="spectrum")
+    lines = EmissionLineColumns.from_spectrum(spec, ZRED, sigma_gas_kms=SIGMA_GAS)
     names = list(lines.names)
     assert "[O III] 5007 (+[O III] 4959)" in lines.free_names
     assert "[O III] 4959" not in lines.free_names

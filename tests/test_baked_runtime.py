@@ -1,10 +1,11 @@
-"""Baked runtime path for a sampled ``sigma_smooth`` and ``zred``.
+"""Baked smoothers of the chain projector for a sampled ``sigma_smooth``.
 
-``Spectrum(baked_runtime=True)`` precomputes the static indices, weights and
-tapers of the two-stage smoothing chain and replaces the binary search of the
-redshift stretch with a lookup table.  The operators are unchanged, so the
-prediction and the log-likelihood must equal the ``baked_runtime=False`` path
-(sedpy_jax smoothers and ``jnp.interp``) to rounding error.
+``Spectrum(projector="chain")`` builds its smoothing chain from
+``observation/_smoothing``, which precomputes the static indices, weights and
+tapers that the ``sedpy_jax.smoothing`` factories rebuild on every call.  The
+operators are unchanged, so the prediction and the log-likelihood must equal
+those of the sedpy_jax factories to rounding error.  The chain takes no sampled
+redshift (a sampled z uses upstream's projector), so ``zred`` is fixed here.
 """
 from __future__ import annotations
 
@@ -17,15 +18,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from sedpy_jax import smoothing as sedpy_smoothing
 
 jax.config.update("jax_enable_x64", True)
 
+from ceridwen.broadening import Instrument, Kinematics
 from ceridwen.likelihood import (
     DiagonalGaussianLikelihood,
     DiagonalNoiseModel,
     PolynomialCalibration,
 )
 from ceridwen.model.model import SedModel
+from ceridwen.observation import _smoothing
 from ceridwen.observation._smoothing import (make_static_grid_interp,
                                              make_vel_smoother)
 from ceridwen.sampler.priors import ClippedNormal, Normal
@@ -33,6 +37,7 @@ from ceridwen.observation.spectrum import Spectrum
 
 Z0 = 0.70
 N_POINTS = 25
+WIDE = 1e5  # a sigma bound too wide for a short pad: the full 2n zero pad
 
 
 def _model_grid(lo=2500.0, hi=6000.0, resolving_power=6000.0):
@@ -54,16 +59,25 @@ def _observed_grid():
     return wo + 2e-7 * (wo - wo[0]) ** 2 / 0.6
 
 
-# smoothtype, resolution, inres, library curve: the scalar-FFT, the
-# constant-wavelength and the wavelength-dependent LSF instrument stages.
+# Instrument, library-curve subtraction: the scalar-FFT, the constant-wavelength
+# and the wavelength-dependent LSF instrument stages.
 ROUTES = {
-    "vel_scalar": dict(smoothtype="R", resolution=2600.0, inres=0.0, lib=False),
-    "lambda_scalar": dict(smoothtype="lambda", resolution=2.5, inres=0.0, lib=False),
-    "vel_library_curve": dict(smoothtype="R", resolution=2600.0, inres="auto", lib=True),
+    "vel_scalar": dict(instrument=Instrument.R_fwhm(2600.0), lib=False),
+    "lambda_scalar": dict(instrument=Instrument.fwhm_aa(2.5), lib=False),
+    "vel_library_curve": dict(instrument=Instrument.R_fwhm(2600.0), lib=True),
 }
 
 
-def _build(route, baked, sigma_smooth_max=None):
+def _sedpy_factories(monkeypatch):
+    """Point the chain at the per-call sedpy_jax smoothers (no sigma bound: 2n pad)."""
+    monkeypatch.setattr(_smoothing, "make_vel_smoother",
+                        lambda wave, outwave, inres=0.0, sigma_max=None:
+                        sedpy_smoothing.make_vel_smoother(wave, outwave, inres=inres))
+    monkeypatch.setattr(_smoothing, "make_wave_smoother", sedpy_smoothing.make_wave_smoother)
+    monkeypatch.setattr(_smoothing, "make_lsf_smoother", sedpy_smoothing.make_lsf_smoother)
+
+
+def _build(route, sigma_max=WIDE):
     cfg = ROUTES[route]
     wo = _observed_grid()
     wm = _model_grid()
@@ -71,14 +85,12 @@ def _build(route, baked, sigma_smooth_max=None):
     data = np.interp(wo, wm * (1.0 + Z0), _model_spectrum(wm))
     spec = Spectrum(
         wavelength=wo, flux=data * (1.0 + 0.02 * rng.standard_normal(wo.size)),
-        uncertainty=0.02 * data, smoothtype=cfg["smoothtype"],
-        resolution=cfg["resolution"], res_convention="fwhm", inres=cfg["inres"],
-        sigma_losvd=200.0, fit_sigma_smooth=True, free_z=True,
-        baked_runtime=baked, name="spec",
+        uncertainty=0.02 * data, instrument=cfg["instrument"],
+        subtract_library=cfg["lib"], projector="chain", name="spec",
     )
     lib = (wm, np.linspace(20.0, 45.0, wm.size)) if cfg["lib"] else None
     spec.setup_for_model(wm, zred=Z0, lib_resolution=lib,
-                         sigma_smooth_max=sigma_smooth_max)
+                         kinematics=Kinematics(sigma_gal="sigma_smooth", sigma_max=sigma_max))
     return spec, wm
 
 
@@ -89,36 +101,34 @@ def _sampled_points():
         1.0 + 0.05 * rng.standard_normal((N_POINTS, wm.size)))
     return (jnp.asarray(spectra, dtype=jnp.float32),
             jnp.asarray(rng.uniform(80.0, 350.0, N_POINTS)),
-            jnp.asarray(rng.uniform(Z0 - 0.1, Z0 + 0.1, N_POINTS)),
             jnp.asarray(rng.uniform(np.log(0.01), np.log(0.10), N_POINTS)))
 
 
+def _evaluate(spec, wm):
+    spectra, sigma, log_f = _sampled_points()
+    likelihood = DiagonalGaussianLikelihood(
+        noise_model=DiagonalNoiseModel(use_fractional=True),
+        calibration=PolynomialCalibration.from_spectrum(
+            spec, order=10, fit_constant=False, prior_sigma=0.1,
+            marginalize=True),
+    )
+
+    def point(flux, s, lf):
+        mu = spec.predict(flux, wm, theta={"sigma_smooth": s})
+        lnl, _ = likelihood(spec.flux, mu, spec.uncertainty, spec.mask,
+                            params={"log_f_calib": lf[None]})
+        return mu, lnl
+
+    return (np.asarray(v) for v in jax.jit(jax.vmap(point))(spectra, sigma, log_f))
+
+
 @pytest.mark.parametrize("route", ROUTES)
-def test_prediction_and_log_likelihood_match_unbaked_path(route):
-    spectra, sigma, zred, log_f = _sampled_points()
-    results = {}
-    for baked in (False, True):
-        spec, wm = _build(route, baked)
-        likelihood = DiagonalGaussianLikelihood(
-            noise_model=DiagonalNoiseModel(use_fractional=True),
-            calibration=PolynomialCalibration.from_spectrum(
-                spec, order=10, fit_constant=False, prior_sigma=0.1,
-                marginalize=True),
-        )
-
-        def point(flux, s, z, lf, spec=spec, wm=wm, likelihood=likelihood):
-            mu = spec.predict(flux, wm, sigma_smooth=s, zred=z)
-            lnl, _ = likelihood(spec.flux, mu, spec.uncertainty, spec.mask,
-                                params={"log_f_calib": lf[None]})
-            return mu, lnl
-
-        results[baked] = jax.jit(jax.vmap(point))(spectra, sigma, zred, log_f)
-
-    mu_old, lnl_old = (np.asarray(v) for v in results[False])
-    mu_new, lnl_new = (np.asarray(v) for v in results[True])
+def test_prediction_and_log_likelihood_match_sedpy_smoothers(route, monkeypatch):
+    mu_new, lnl_new = _evaluate(*_build(route))
+    with monkeypatch.context() as m:
+        _sedpy_factories(m)
+        mu_old, lnl_old = _evaluate(*_build(route))
     assert np.all(np.isfinite(lnl_old))
-    # The shorter zero pad moves the wrap of the taper's Nyquist cut-off, a
-    # 1e-10 term of the FFT method itself for a kernel two pixels wide.
     np.testing.assert_allclose(mu_new, mu_old, rtol=1e-9, atol=0.0)
     # chi-square sums of order 1e6 carry the 1e-12 prediction rounding.
     np.testing.assert_allclose(lnl_new, lnl_old, rtol=1e-9, atol=1e-5)
@@ -130,27 +140,8 @@ SIGMA_MAX = 350.0  # upper limit of the sigma drawn in _sampled_points
 @pytest.mark.parametrize("route", ROUTES)
 def test_sigma_bound_pad_matches_the_2n_pad(route):
     """An upper bound on the sampled sigma shortens the LOSVD zero pad only."""
-    spectra, sigma, zred, log_f = _sampled_points()
-    results = {}
-    for bound in (None, SIGMA_MAX):
-        spec, wm = _build(route, True, sigma_smooth_max=bound)
-        likelihood = DiagonalGaussianLikelihood(
-            noise_model=DiagonalNoiseModel(use_fractional=True),
-            calibration=PolynomialCalibration.from_spectrum(
-                spec, order=10, fit_constant=False, prior_sigma=0.1,
-                marginalize=True),
-        )
-
-        def point(flux, s, z, lf, spec=spec, wm=wm, likelihood=likelihood):
-            mu = spec.predict(flux, wm, sigma_smooth=s, zred=z)
-            lnl, _ = likelihood(spec.flux, mu, spec.uncertainty, spec.mask,
-                                params={"log_f_calib": lf[None]})
-            return mu, lnl
-
-        results[bound] = jax.jit(jax.vmap(point))(spectra, sigma, zred, log_f)
-
-    mu_old, lnl_old = (np.asarray(v) for v in results[None])
-    mu_new, lnl_new = (np.asarray(v) for v in results[SIGMA_MAX])
+    mu_old, lnl_old = _evaluate(*_build(route, sigma_max=WIDE))
+    mu_new, lnl_new = _evaluate(*_build(route, sigma_max=SIGMA_MAX))
     assert not np.array_equal(mu_new, mu_old)  # the shorter transform ran
     np.testing.assert_allclose(mu_new, mu_old, rtol=1e-9, atol=0.0)
     np.testing.assert_allclose(lnl_new, lnl_old, rtol=1e-9, atol=1e-5)

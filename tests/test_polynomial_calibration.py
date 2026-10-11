@@ -225,6 +225,8 @@ def _afe_grid():
 
 
 def test_recovers_tilt_through_csp_afe_forward_model():
+    from ceridwen import Cosmology
+    from ceridwen.broadening import Instrument
     from ceridwen.csp import CSPBasis_afe
     from ceridwen.ssps import SSPDataAfe
 
@@ -234,10 +236,10 @@ def test_recovers_tilt_through_csp_afe_forward_model():
         ssp, lookback_time=jnp.linspace(0.0, 7.0, 5),
         zh_const=True, sfh_interp="step",
         add_dust=False, add_diffuse_dust=True,
-        sigma_losvd_kms=0.0, verbose=False,
+        cosmo=Cosmology.planck18(), verbose=False,
     )
-    spec = Spectrum(wavelength=WAVE, resolution=200.0, smoothtype="vel",
-                    name="spec")
+    spec = Spectrum(wavelength=WAVE, instrument=Instrument.sigma_kms(200.0),
+                    projector="chain", name="spec")
     spec.setup_for_model(csp.wave, zred=zred,
                          lib_resolution=getattr(csp, "lib_resolution", None))
     theta = dict(csp.all_params)
