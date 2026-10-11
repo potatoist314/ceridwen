@@ -60,6 +60,15 @@ import numpy as np
 
 # Use the same reference number as the older low-resolution grid.
 # Its logarithm gives the shift between [Fe/H] and the fitted Z parameter.
+'''
+HERE's THE CRITICAL PART
+
+ZSUN_MIST = 0.0185 (absolute metallicity)
+
+IE THE SSP GRID USES Z SUN ABSOLUTE AS 0.0185
+
+
+'''
 ZSUN_MIST = 0.0185
 LGMET_OFFSET = math.log10(ZSUN_MIST)          # = -1.7328282657...
 
@@ -134,6 +143,10 @@ def main() -> None:
     ssp_afe        = afe_u
     # Shift the iron-abundance numbers to the scale used by the fitted Z parameter.
     # With the default offset, add 1.7328283 to a fitted Z to recover [Fe/H].
+    '''
+    CRITICAL PART 2 - 
+    
+    '''
     ssp_lgmet      = feh_u + offset
     # Change the age unit from years to billions of years, keeping a logarithmic scale.
     ssp_lg_age_gyr = logt_u - 9.0

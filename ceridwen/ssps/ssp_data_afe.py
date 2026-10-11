@@ -132,7 +132,7 @@ class SSPDataAfe:
 
     Provenance fields are identical in meaning to ``SSPData``.
     """
-
+    # This stuff is type annotation
     ssp_lgmet: jnp.ndarray          # (n_met,) iron-abundance values for our alpha-MC grid
     ssp_afe: jnp.ndarray            # (n_afe,) [alpha/Fe]
     ssp_lg_age_gyr: jnp.ndarray     # (n_ages,) log10(age / Gyr)
