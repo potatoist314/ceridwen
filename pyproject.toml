@@ -69,7 +69,7 @@ dependencies = [
     "h5py>=3.16",
     "astropy>=8.0",
     "tensorflow-probability>=0.25",
-    "blackjax>=1.6",
+    "blackjax>=1.6.dev98",  # 1.6.dev98+gf73e12956 (the Vast image) has the blackjax/ns/ of 1.6 (above)
     "tqdm>=4.65",
     # Everything needed to import, fit, plot, and test CERIDWEN is core, so a
     # plain `pip install .` gives a fully-featured install with no extras to
