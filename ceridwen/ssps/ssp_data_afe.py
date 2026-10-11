@@ -79,7 +79,7 @@ class SSPDataAfe(SSPData):
     ssp_resolution : np.ndarray (n_wave,) or None -- sigma_v(lambda) [km/s] on ``ssp_wave``; required by save/load
     ssp_stellar_mass : np.ndarray (n_afe, n_met, n_ages) or None -- surviving mass per M_sun formed (optional)
     """
-
+    # This stuff is type annotation
     ssp_afe: jnp.ndarray = field(kw_only=True)
 
     _display_title = "SSPDataAfe"
