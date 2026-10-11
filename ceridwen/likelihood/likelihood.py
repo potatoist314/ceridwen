@@ -385,7 +385,6 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         return lnlike_diag_gaussian(
             y, mu, noise_out.inv_var, noise_out.log_det, mask
         )
-        return lnl + ln_extra, aux
 
     # ------------------------------------------------------------------
     def with_photometry(self, y, mu, sigma_obs, mask, params, photometry) -> Array:
