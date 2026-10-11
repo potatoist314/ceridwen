@@ -140,6 +140,27 @@ def test_flipped_byte_is_not_matched(tmp_path):
     assert SSPData.load(str(dst), zsun=0.020).log10_zsun == -1.6989700043360187
 
 
+def test_axis_meaning_kwarg_for_an_unrecorded_grid(tmp_path):
+    """load(axis_meaning=) fills a grid that is in no table and records no axis meaning."""
+    import h5py
+    import shutil
+    dst = tmp_path / "unrecorded.h5"
+    shutil.copyfile(_path("mist_bpass_v2"), dst)
+    with h5py.File(dst, "r+") as f:
+        flux = f["ssp_flux"]
+        flux[0, 0, 0] = float(flux[0, 0, 0]) * 1.0000001
+        for k in ("log10_zsun", "chash", "axis_meaning"):
+            if k in f.attrs:
+                del f.attrs[k]
+    assert SSPData.load(str(dst), zsun=0.020).axis_meaning is None
+    assert SSPData.load(str(dst), zsun=0.020,
+                        axis_meaning="log_z_over_zsun").axis_meaning == "log_z_over_zsun"
+    with h5py.File(dst, "r+") as f:
+        f.attrs["axis_meaning"] = "feh"
+    with pytest.raises(ValueError, match="contradicts"):
+        SSPData.load(str(dst), zsun=0.020, axis_meaning="log_z_over_zsun")
+
+
 def test_provenance_round_trips(tmp_path):
     """save() writes log10_zsun / axis_meaning / chash and load() reads them back."""
     ssp, _ = _load("mist_bpass_v2")

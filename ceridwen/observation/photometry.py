@@ -10,12 +10,12 @@ from .base import Observation
 _FILTERSET_CACHE = {}
 
 
-def _filterset(filternames):
-    """One ``FilterSet`` per distinct filter-name tuple, shared by every Photometry that uses it."""
-    key = tuple(filternames)
+def _filterset(filternames, directory=None):
+    """One ``FilterSet`` per distinct (filter-name tuple, directory), shared by every Photometry that uses it."""
+    key = (tuple(filternames), directory)
     fs = _FILTERSET_CACHE.get(key)
     if fs is None:
-        fs = FilterSet(list(key))
+        fs = FilterSet(list(key[0]), **({} if directory is None else {"directory": directory}))
         _FILTERSET_CACHE[key] = fs
     return fs
 
@@ -26,6 +26,7 @@ class Photometry(Observation):
     Parameters
     ----------
     filters : list of str or Filter -- names are resolved in the filter library
+    filter_directory : str -- directory of the ``<name>.par`` curves; None = the package library
     upper_limit : bool array (n_filters,) -- True = one-sided (model > data only) chi-squared penalty
 
     Attributes
@@ -44,7 +45,8 @@ class Photometry(Observation):
     )
     _meta = ("kind", "name", "filternames")
 
-    def __init__(self, filters=[], name=None, upper_limit=None, **kwargs):
+    def __init__(self, filters=[], name=None, upper_limit=None, filter_directory=None, **kwargs):
+        self.filter_directory = filter_directory
         self.set_filters(filters)
         self.upper_limit = (
             None if upper_limit is None
@@ -65,7 +67,7 @@ class Photometry(Observation):
         except (AttributeError, TypeError):
             self.filternames = list(filters)
 
-        self.filterset = _filterset(self.filternames)
+        self.filterset = _filterset(self.filternames, getattr(self, "filter_directory", None))
         self.filters   = list(self.filterset.filters)
         self.wave_eff = [f.wave_effective for f in self.filters]
         self._wavelength = jnp.asarray([f.wave_effective for f in self.filters])

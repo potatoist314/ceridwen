@@ -812,6 +812,8 @@ def write_result_h5(
                     og.attrs["zred_ref"] = float(proj.opz_ref - 1.0)
             if hasattr(obs, "filternames"):
                 og.attrs["filternames"] = json.dumps(obs.filternames)
+            if getattr(obs, "filter_directory", None) is not None:
+                og.attrs["filter_directory"] = str(obs.filter_directory)
             if hasattr(obs, "line_names") and obs.line_names is not None:
                 og.attrs["line_names"] = json.dumps(list(obs.line_names))
             if hasattr(obs, "line_ind") and obs.line_ind is not None:

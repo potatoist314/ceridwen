@@ -15,6 +15,7 @@ from ceridwen.ssps.ssp_data import (
     LIBRARY_IMF_KWARGS,
     _validate_fsps_kwargs,
     _read_fsps_provenance,
+    _with_axis_meaning,
     _import_fsps,
     fsps_stellar_mass_source,
     isochrone_points_or_none,
@@ -186,9 +187,9 @@ class SSPDataAfe(SSPData):
         f.attrs['flux_axis_order'] = '(afe, met, age, wave)'
 
     @classmethod
-    def load(cls, filename, flux_dtype=None, zsun=None):
+    def load(cls, filename, flux_dtype=None, zsun=None, axis_meaning=None):
         """Load from HDF5; a 3-D grid without ``ssp_afe`` is promoted to n_afe = 1 at [alpha/Fe] = 0.
-        ``zsun`` as for :meth:`SSPData.load`."""
+        ``zsun`` and ``axis_meaning`` as for :meth:`SSPData.load`."""
         arrays, extra, meta = cls._read_h5(filename, flux_dtype=flux_dtype)
         ssp_afe = extra['ssp_afe']
         if ssp_afe is None:
@@ -196,7 +197,7 @@ class SSPDataAfe(SSPData):
             arrays['ssp_flux'] = arrays['ssp_flux'][None, ...]
             if meta.get('ssp_stellar_mass') is not None:
                 meta['ssp_stellar_mass'] = meta['ssp_stellar_mass'][None, ...]
-        return cls(**arrays, ssp_afe=ssp_afe, **meta, zsun=zsun)
+        return cls(**arrays, ssp_afe=ssp_afe, **_with_axis_meaning(meta, axis_meaning), zsun=zsun)
 
     @classmethod
     def from_fsps(cls, save_to: Optional[str] = None,
