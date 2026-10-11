@@ -203,6 +203,18 @@ class SedModel:
                 "the data are in the same unitless convention",
                 stacklevel=2)
 
+        # For a fixed distance the flux factor is a constant, so the quadrature inside
+        # flux_factor_cgs must not run in the compiled hot path.  Computed once here,
+        # after every construction guard (no trace before them), through jit so the
+        # value matches a compiled per-call evaluation; predict() injects it into the
+        # CSP theta.  A sampled zred never sees this constant.
+        self._flux_factor_fixed = None
+        if self._zred_fixed is not None:
+            from ..cosmology import flux_factor_cgs
+            self._flux_factor_fixed = jnp.atleast_1d(jax.jit(
+                lambda z, d: flux_factor_cgs(z, self.cosmo, lumdist_mpc=d)
+            )(self._zred_fixed[0], None if self._lumdist_fixed is None else self._lumdist_fixed[0]))
+
 
     def _check_metallicity_setup(self, free_param_init):
         """Refuse the removed absolute-metallicity keys, and check every metallicity prior /
@@ -631,18 +643,23 @@ class SedModel:
         """Predictions keyed by observation name from the free-parameter dict.
         A fixed zred/lumdist_mpc is injected into the CSP theta here; without a
         'zred' the CSP applies no flux factor and the outputs are not maggies."""
-        model_theta = self.apply_transforms(theta)
-        if self._zred_fixed is not None and "zred" not in model_theta:
-            if model_theta is theta:
-                model_theta = dict(model_theta)
-            model_theta["zred"] = self._zred_fixed
-        if self._lumdist_fixed is not None and "lumdist_mpc" not in model_theta:
-            if model_theta is theta:
-                model_theta = dict(model_theta)
-            model_theta["lumdist_mpc"] = self._lumdist_fixed
+        model_theta = self._with_fixed_distance(self.apply_transforms(theta))
         return self.csp.predict(model_theta, self.observations,
                                 kinematics=self.kinematics,
                                 broaden_photometry=self.broaden_photometry)
+
+    def _with_fixed_distance(self, model_theta):
+        """``model_theta`` plus the fixed zred / lumdist_mpc and, when both are the fixed
+        ones, the hoisted flux factor (a copy when anything is added)."""
+        add = {}
+        if self._zred_fixed is not None and "zred" not in model_theta:
+            add["zred"] = self._zred_fixed
+        if self._lumdist_fixed is not None and "lumdist_mpc" not in model_theta:
+            add["lumdist_mpc"] = self._lumdist_fixed
+        if ("zred" in add and "lumdist_mpc" not in model_theta
+                and self._flux_factor_fixed is not None):
+            add["flux_factor"] = self._flux_factor_fixed
+        return {**model_theta, **add} if add else model_theta
 
     def predict_with_elines(self, theta: dict[str, Array]):
         """``(predictions, aux)`` for the emission-line marginalisation: the predictions with
@@ -650,13 +667,7 @@ class SedModel:
         the per-observation design columns).  Needs a Spectrum with marginalize_elines=True."""
         if getattr(self, "_eline_system", None) is None:
             raise ValueError("no Spectrum of this model has marginalize_elines=True")
-        model_theta = self.apply_transforms(theta)
-        if self._zred_fixed is not None and "zred" not in model_theta:
-            model_theta = dict(model_theta)
-            model_theta["zred"] = self._zred_fixed
-        if self._lumdist_fixed is not None and "lumdist_mpc" not in model_theta:
-            model_theta = dict(model_theta)
-            model_theta["lumdist_mpc"] = self._lumdist_fixed
+        model_theta = self._with_fixed_distance(self.apply_transforms(theta))
         return self.csp.predict(model_theta, self.observations,
                                 kinematics=self.kinematics,
                                 broaden_photometry=self.broaden_photometry,

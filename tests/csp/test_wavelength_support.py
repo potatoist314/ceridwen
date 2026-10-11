@@ -2,7 +2,8 @@
 
 ``predict`` computes the spectrum on the union of the observations'
 ``model_support`` and zero-fills the rest; the predictions must equal those
-of the whole grid bit for bit.  The SFH basis table keeps each nonzero
+of the whole grid bit for bit.  Upstream's Spectrum sets no ``model_support``,
+so the check uses two Photometry observations.  The SFH basis table keeps each nonzero
 ``(group, bin)`` spectrum once and one shared zero row.
 """
 
@@ -15,8 +16,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from ceridwen import Cosmology
 from ceridwen.csp.csp_afe import CSPBasis_afe
-from ceridwen.observation import Photometry, Spectrum
+from ceridwen.observation import Photometry
 
 LOOKBACK_GYR = jnp.array([0.0, 0.03, 0.1, 0.3, 1.0, 3.0, 5.0, 8.4])
 WAVE = np.geomspace(900.0, 60000.0, 600).astype(np.float32)
@@ -32,6 +34,7 @@ def ssp():
         ssp_wave=WAVE,
         ssp_lg_age_gyr=np.linspace(-3.0, 1.14, 107, dtype=np.float32),
         ssp_lgmet=np.linspace(-2.0, 0.4, 13, dtype=np.float32),
+        log10_zsun=0.0,
         ssp_resolution=None,
         isoc_type=None,
         spec_library=None,
@@ -39,7 +42,8 @@ def ssp():
 
 
 def build(ssp, zh_const):
-    metallicity = {"Z": jnp.array([-0.8])} if zh_const else {"zh": jnp.full(7, -0.8)}
+    metallicity = ({"logzsol": jnp.array([-0.8])} if zh_const
+                   else {"logzsol_hist": jnp.full(7, -0.8)})
     csp = CSPBasis_afe(
         ssp,
         theta={"lookback_time": LOOKBACK_GYR, "sfh": jnp.ones(8),
@@ -49,15 +53,14 @@ def build(ssp, zh_const):
         add_dust=True,
         add_diffuse_dust=True,
         add_dust_emission=False,
-        sigma_losvd_kms=0.0,
+        cosmo=Cosmology.planck18(),
         verbose=False,
     )
-    phot = Photometry(filters=["hsc_g", "hsc_i"], name="photometry")
-    phot.setup_for_model(csp.wave, zred=ZRED)
-    wo = np.arange(6300.0, 8800.0, 2.0)
-    spec = Spectrum(wavelength=wo, flux=np.ones_like(wo), uncertainty=np.ones_like(wo), name="spectrum")
-    spec.setup_for_model(csp.wave, zred=ZRED)
-    return csp, [phot, spec]
+    blue = Photometry(filters=["hsc_g"], name="blue")
+    red = Photometry(filters=["hsc_i"], name="red")
+    for phot in (blue, red):
+        phot.setup_for_model(csp.wave, zred=ZRED)
+    return csp, [blue, red]
 
 
 def thetas(csp, zh_const, n):
@@ -71,9 +74,9 @@ def thetas(csp, zh_const, n):
         theta = dict(base, sfh=jnp.asarray(rng.uniform(0.1, 2.0, 8)),
                      afe=jnp.asarray(rng.uniform(-0.2, 0.6, 1)))
         if zh_const:
-            theta["Z"] = jnp.asarray(rng.uniform(-1.9, 0.3, 1))
+            theta["logzsol"] = jnp.asarray(rng.uniform(-1.9, 0.3, 1))
         else:
-            theta["zh"] = jnp.asarray(rng.uniform(-1.9, 0.3, 7))
+            theta["logzsol_hist"] = jnp.asarray(rng.uniform(-1.9, 0.3, 7))
         draws.append(theta)
     return draws
 
@@ -82,7 +85,7 @@ def thetas(csp, zh_const, n):
 def test_support_prediction_is_bitwise_the_full_grid(ssp, zh_const):
     csp, observations = build(ssp, zh_const)
     draws = thetas(csp, zh_const, 3)
-    support = csp._observation_support(observations, draws[0])
+    support = csp._observation_support(observations, draws[0], None, False)
     assert 0 < support.start < support.stop < WAVE.size
     trimmed_one = jax.jit(lambda t: csp.predict(t, observations))
     trimmed_many = jax.jit(jax.vmap(lambda t: csp.predict(t, observations)))
@@ -90,7 +93,7 @@ def test_support_prediction_is_bitwise_the_full_grid(ssp, zh_const):
     got_one = [trimmed_one(t) for t in draws]
     got_many = trimmed_many(batch)
 
-    csp._observation_support = lambda observations, theta: slice(None)
+    csp._observation_support = lambda *args: slice(None)
     full_one = jax.jit(lambda t: csp.predict(t, observations))
     full_many = jax.jit(jax.vmap(lambda t: csp.predict(t, observations)))
     want_many = full_many(batch)

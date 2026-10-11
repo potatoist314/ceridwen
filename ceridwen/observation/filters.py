@@ -159,16 +159,21 @@ class Filter:
         return wave, trans
 
     def _process_filter_data(self, wave, trans):
-        """Cleans, sorts, and assigns wavelength and transmission arrays."""
-        wave = jnp.array(wave)
-        trans = jnp.array(trans)
+        """Cleans, sorts, and assigns wavelength and transmission arrays.
 
-        valid = jnp.isfinite(trans) & (trans >= 0.0)
+        Construction-time code path: plain NumPy. Loading a filter used to
+        trigger dozens of small JAX JIT compiles; none of this arithmetic is
+        ever traced or differentiated, so it runs eagerly on the host.
+        """
+        wave = np.asarray(wave, dtype=np.float64)
+        trans = np.asarray(trans, dtype=np.float64)
+
+        valid = np.isfinite(trans) & (trans >= 0.0)
         wave_valid = wave[valid]
         trans_valid = trans[valid]
 
-        sort_idx = jnp.argsort(wave_valid)
-        self.npts = valid.sum().item() 
+        sort_idx = np.argsort(wave_valid)
+        self.npts = int(valid.sum())
         self._wavelength = wave_valid[sort_idx]
         self._transmission = trans_valid[sort_idx]
 
@@ -179,16 +184,16 @@ class Filter:
         Trim leading/trailing transmission values that are effectively zero,
         leaving one zero point before and after the active region.
         """
-        trans = self.transmission
-        mask = trans > jnp.max(trans) * min_trans
-        indices = jnp.where(mask)[0]
+        trans = np.asarray(self.transmission)
+        mask = trans > np.max(trans) * min_trans
+        indices = np.where(mask)[0]
 
         if indices.size == 0:
             # No non-zero region found — skip trimming
             return
 
-        start = jnp.maximum(indices[0] - 1, 0)
-        stop = jnp.minimum(indices[-1] + 2, trans.shape[0])
+        start = int(max(indices[0] - 1, 0))
+        stop = int(min(indices[-1] + 2, trans.shape[0]))
         inds = slice(start, stop)
 
         self._wavelength = self._wavelength[inds]
@@ -213,32 +218,29 @@ class Filter:
     
     def gridify_transmission(self, dlnlam, wmin=1e2):
         """Resample transmission curve onto a regular log-lambda grid."""
-        wave = self.wavelength
-        trans = self.transmission
+        wave = np.asarray(self.wavelength, dtype=np.float64)
+        trans = np.asarray(self.transmission, dtype=np.float64)
 
-        ln_wave = jnp.log(wave)
-        ln_wmin = jnp.log(wmin)
-        ln_wave_min = ln_wave.min()
-        ln_wave_max = ln_wave.max()
+        ln_wave = np.log(wave)
+        ln_wmin = float(np.log(wmin))
+        dlnlam = float(dlnlam)
 
-        ind_min = jnp.floor((ln_wave_min - ln_wmin) / dlnlam).astype(int)
+        ind_min = int(np.floor((ln_wave.min() - ln_wmin) / dlnlam))
+        ind_max = int(np.ceil((ln_wave.max() - ln_wmin) / dlnlam))
 
-        ind_max = jnp.ceil((ln_wave_max - ln_wmin) / dlnlam).astype(int)
+        lnlam_grid = np.linspace(ind_min * dlnlam + ln_wmin,
+                                 ind_max * dlnlam + ln_wmin,
+                                 ind_max - ind_min)
+        lam_grid = np.exp(lnlam_grid)
 
-
-        lnlam_grid = jnp.linspace(ind_min * dlnlam + ln_wmin,
-                                ind_max * dlnlam + ln_wmin,
-                                ind_max - ind_min)
-        lam_grid = jnp.exp(lnlam_grid)
-
-        trans_grid = jax_interp(lam_grid, wave, trans, left=0.0, right=0.0)
+        trans_grid = np.interp(lam_grid, wave, trans, left=0.0, right=0.0)
 
         self.wmin = wmin
         self.dlnlam = dlnlam
-        self.inds = slice(int(ind_min), int(ind_max))
+        self.inds = slice(ind_min, ind_max)
         self._wavelength = lam_grid
         self._transmission = trans_grid
-        self.dwave = jnp.gradient(lam_grid)
+        self.dwave = np.gradient(lam_grid)
 
     def get_properties(self):
         props = compute_filter_properties(
@@ -445,27 +447,27 @@ class FilterSet:
         Set filters and initialize shared log-wavelength grid for gridded projections.
         """
         # Native grid spacings (min ∆lnλ from each filter)
-        self.dlnlam_native = jnp.array([jnp.diff(jnp.log(f.wavelength)).min()
-                                        for f in native])
+        self.dlnlam_native = np.array([np.diff(np.log(np.asarray(f.wavelength))).min()
+                                       for f in native])
 
         # Choose global dlnlam
         if dlnlam is None:
-            dlnlam = jnp.minimum(jnp.min(self.dlnlam_native), 1e-3)
+            dlnlam = min(float(np.min(self.dlnlam_native)), 1e-3)
 
         # Set wavelength range
         if wmin is None:
-            wmin = jnp.min(jnp.array([f.wavelength[0] for f in native]))
+            wmin = float(min(np.asarray(f.wavelength)[0] for f in native))
 
         if wmax is None:
-            wmax = jnp.max(jnp.array([f.wavelength[-1] for f in native]))
+            wmax = float(max(np.asarray(f.wavelength)[-1] for f in native))
 
         self.wmin = wmin
         self.dlnlam = dlnlam
-        self.wmax = jnp.exp(jnp.log(wmax) + dlnlam)  # pad upper edge
+        self.wmax = float(np.exp(np.log(wmax) + dlnlam))  # pad upper edge
 
         # Build global wavelength grid
-        self.lnlam = jnp.arange(jnp.log(wmin), jnp.log(self.wmax), dlnlam)
-        self.lam = jnp.exp(self.lnlam)
+        self.lnlam = np.arange(np.log(wmin), np.log(self.wmax), dlnlam)
+        self.lam = np.exp(self.lnlam)
 
 
         # Reload filters onto this shared grid
@@ -594,48 +596,53 @@ class FilterSet:
 
 
 def compute_filter_properties(wave, trans, ab_gnu, lightspeed, vega=None, solar=None):
-    logwave = jnp.log(wave)
-    tmax = jnp.max(trans)
+    # Construction-time code path: plain NumPy (see _process_filter_data).
+    wave = np.asarray(wave, dtype=np.float64)
+    trans = np.asarray(trans, dtype=np.float64)
+    logwave = np.log(wave)
+    tmax = np.max(trans)
 
-    i0 = jnp.trapezoid(trans * logwave, logwave)
-    i1 = jnp.trapezoid(trans, logwave)
-    i2 = jnp.trapezoid(trans * wave, wave)
-    i3 = jnp.trapezoid(trans, wave)
+    i0 = np.trapezoid(trans * logwave, logwave)
+    i1 = np.trapezoid(trans, logwave)
+    i2 = np.trapezoid(trans * wave, wave)
+    i3 = np.trapezoid(trans, wave)
 
-    wave_effective = jnp.exp(i0 / i1)
-    wave_pivot = jnp.sqrt(i2 / i1)
+    wave_effective = np.exp(i0 / i1)
+    wave_pivot = np.sqrt(i2 / i1)
     wave_average = i2 / i3
     rectangular_width = i3 / tmax
-    wpeak = wave[jnp.argmax(trans)]
+    wpeak = wave[np.argmax(trans)]
 
     sel_blue = (wave < wpeak) & (trans < 0.5 * tmax)
-    blue_edge = jnp.where(sel_blue, wave, -1)
-    blue_edge = blue_edge[jnp.argmax(blue_edge)]
+    blue_edge = np.where(sel_blue, wave, -1)
+    blue_edge = blue_edge[np.argmax(blue_edge)]
 
     sel_red = (wave > wpeak) & (trans < 0.5 * tmax)
-    red_edge = jnp.where(sel_red, wave, 1e10)
-    red_edge = red_edge[jnp.argmin(red_edge)]
+    red_edge = np.where(sel_red, wave, 1e10)
+    red_edge = red_edge[np.argmin(red_edge)]
 
-    i4 = jnp.trapezoid(trans * (jnp.log(wave / wave_effective))**2, logwave)
-    gauss_width = jnp.sqrt(i4 / i1)
-    effective_width = 2.0 * jnp.sqrt(2. * jnp.log(2.)) * gauss_width * wave_effective
+    i4 = np.trapezoid(trans * (np.log(wave / wave_effective))**2, logwave)
+    gauss_width = np.sqrt(i4 / i1)
+    effective_width = 2.0 * np.sqrt(2. * np.log(2.)) * gauss_width * wave_effective
 
     flux_ab = ab_gnu * lightspeed / (wave**2)
-    ab_zero_counts = jnp.trapezoid(wave * flux_ab * trans, wave)
-    ab_to_vega = jnp.nan
-    vega_zero_counts = jnp.nan
-    solar_ab_mag = jnp.nan
+    ab_zero_counts = np.trapezoid(wave * flux_ab * trans, wave)
+    ab_to_vega = np.nan
+    vega_zero_counts = np.nan
+    solar_ab_mag = np.nan
 
     if wave_effective < 1e6 and vega is not None:
-        vega_flux = jax_interp(wave, vega[:, 0], vega[:, 1])
-        vega_zero_counts = jnp.trapezoid(wave * vega_flux * trans, wave)
-        ab_to_vega = -2.5 * jnp.log10(ab_zero_counts / vega_zero_counts)
+        vega_np = np.asarray(vega)
+        vega_flux = np.interp(wave, vega_np[:, 0], vega_np[:, 1])
+        vega_zero_counts = np.trapezoid(wave * vega_flux * trans, wave)
+        ab_to_vega = -2.5 * np.log10(ab_zero_counts / vega_zero_counts)
 
     if wave_effective < 1e5 and solar is not None:
-        solar_flux = jax_interp(wave, solar[:, 0], solar[:, 1])
+        solar_np = np.asarray(solar)
+        solar_flux = np.interp(wave, solar_np[:, 0], solar_np[:, 1])
         flux_ratio = wave * solar_flux * trans
-        solar_counts = jnp.trapezoid(flux_ratio, wave)
-        solar_ab_mag = -2.5 * jnp.log10(solar_counts / ab_zero_counts)
+        solar_counts = np.trapezoid(flux_ratio, wave)
+        solar_ab_mag = -2.5 * np.log10(solar_counts / ab_zero_counts)
         
     return {
         "wave_effective": wave_effective,
