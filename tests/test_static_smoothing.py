@@ -25,7 +25,8 @@ from ceridwen.observation._smoothing import (
     combined_sigma_lambda,
     make_static_smoother,
 )
-from ceridwen.observation.base import _CKMS
+from ceridwen.observation._smoothing import _CKMS
+from ceridwen.broadening import Instrument, Kinematics
 
 SIGMA_LOSVD = 259.5      # km/s, a typical quiescent galaxy
 INSTR_R = 2600.0         # resolving power, LEGA-C-like
@@ -42,22 +43,20 @@ def _observed_grid(lo=5800.0, hi=9500.0, n=6000):
 
 
 def _build(fit_sigma_smooth=False, sigma_losvd=SIGMA_LOSVD, smoothtype="R"):
-    """A Spectrum wired the way the joint LEGA-C fits wire it."""
+    """A Spectrum wired the way the joint LEGA-C fits wire it (chain projector)."""
     wo = _observed_grid()
     wm = _model_grid()
-    extra = (dict(resolution=INSTR_R, res_convention="fwhm", inres=0.0)
-             if smoothtype is not None else {})
     spec = Spectrum(
         wavelength=wo,
         flux=np.ones_like(wo),
         uncertainty=np.ones_like(wo),
-        smoothtype=smoothtype,
-        sigma_losvd=sigma_losvd,
-        fit_sigma_smooth=fit_sigma_smooth,
+        instrument=Instrument.R_fwhm(INSTR_R) if smoothtype is not None else None,
+        subtract_library=False,
+        projector="chain",
         name="spec",
-        **extra,
     )
-    spec.setup_for_model(wm, zred=0.0)
+    sigma_gal = "sigma_smooth" if fit_sigma_smooth else sigma_losvd
+    spec.setup_for_model(wm, zred=0.0, kinematics=Kinematics(sigma_gal=sigma_gal))
     return spec, wm, wo
 
 
@@ -200,27 +199,27 @@ def test_resampling_grid_is_never_coarser_than_the_input():
 
 def test_H_is_not_built_until_something_reads_it():
     spec, wm, wo = _build()
-    assert spec._H_cached is None, "_H was materialised despite the FFT path"
-    assert spec._H.shape == (wo.size, wm.size)
-    assert spec._H_cached is not None
+    assert spec._chain._H_cached is None, "_H was materialised despite the FFT path"
+    assert spec._chain.H.shape == (wo.size, wm.size)
+    assert spec._chain._H_cached is not None
 
 
 def test_H_still_interpolates_correctly_when_requested():
     """Lazy construction must not change the matrix it produces."""
     wo, wm = _observed_grid(), _model_grid()
     spec = Spectrum(wavelength=wo, flux=np.ones_like(wo),
-                    uncertainty=np.ones_like(wo), name="plain")
+                    uncertainty=np.ones_like(wo), projector="chain", name="plain")
     spec.setup_for_model(wm, zred=0.0)
     ramp = 3.0 * wm + 11.0                      # linear: interpolation is exact
-    assert np.asarray(spec._H @ ramp) == pytest.approx(3.0 * wo + 11.0, rel=1e-5)
+    assert np.asarray(spec._chain.H @ ramp) == pytest.approx(3.0 * wo + 11.0, rel=1e-5)
 
 
 def test_free_losvd_keeps_the_runtime_sigma_path():
     """fit_sigma_smooth makes the width traced, so the chained form must remain."""
     spec, wm, _ = _build(fit_sigma_smooth=True)
     line = _gaussian_line(wm, 7200.0, 40.0)
-    narrow = np.asarray(spec.predict(line, wm, sigma_smooth=100.0))
-    wide = np.asarray(spec.predict(line, wm, sigma_smooth=400.0))
+    narrow = np.asarray(spec.predict(line, wm, theta={"sigma_smooth": 100.0}))
+    wide = np.asarray(spec.predict(line, wm, theta={"sigma_smooth": 400.0}))
     assert narrow.max() > wide.max(), "a larger sigma must give a shallower line"
 
 
