@@ -5,6 +5,7 @@ imports and data paths repointed at ``ceridwen``.
 """
 import numpy as np
 import os
+import jax
 import jax.numpy as jnp
 from typing import  List, Optional, Tuple
 from jax import vmap
@@ -482,13 +483,19 @@ class FilterSet:
         n_lam = len(self.lam)  # global wavelength grid length
 
         ab_counts = jnp.array([f.ab_zero_counts for f in self.filters])
-        inds_start = jnp.array([f.inds.start for f in self.filters])
-        inds_stop  = jnp.array([f.inds.stop for f in self.filters])
+        starts = np.array([f.inds.start for f in self.filters])
+        stops = np.array([f.inds.stop for f in self.filters])
+        inds_start = jnp.asarray(starts)
+        inds_stop  = jnp.asarray(stops)
 
-        # Stack padded transmission, wavelength, and dwave arrays
-        trans = jnp.stack([pad_to(self.lam, f.transmission, f.inds) for f in self.filters])
-        wave  = jnp.stack([pad_to(self.lam, f.wavelength, f.inds) for f in self.filters])
-        dwave = jnp.stack([pad_to(self.lam, jnp.gradient(f.wavelength), f.inds) for f in self.filters])
+        # Stack padded transmission, wavelength, and dwave arrays. Padding and the
+        # central difference run in NumPy: the same values as pad_to and jnp.gradient
+        # ((a[2:] - a[:-2]) * 0.5 is a[2:] - a[:-2] halved exactly), without one XLA
+        # compile per filter length.
+        trans = jnp.asarray(np.stack([_pad_to_np(self.lam, f.transmission, f.inds) for f in self.filters]))
+        wave  = jnp.asarray(np.stack([_pad_to_np(self.lam, f.wavelength, f.inds) for f in self.filters]))
+        dwave = jnp.asarray(np.stack([_pad_to_np(self.lam, np.gradient(_device_dtype(f.wavelength)), f.inds)
+                                      for f in self.filters]))
 
         def compute_row(trans_j, wave_j, dwave_j, ab_j, istart, istop):
             full = trans_j * wave_j * dwave_j / ab_j
@@ -497,8 +504,9 @@ class FilterSet:
 
         self.trans = vmap(compute_row)(trans, wave, dwave, ab_counts, inds_start, inds_stop)
 
-        self.trans_list = [self.trans[i, inds_start[i]:inds_stop[i]] for i in range(n_filters)]
-        self.frange = jnp.stack([inds_start, inds_stop], axis=1)
+        rows = np.asarray(self.trans)
+        self.trans_list = [jnp.asarray(rows[i, starts[i]:stops[i]]) for i in range(n_filters)]
+        self.frange = jnp.asarray(np.stack([starts, stops], axis=1))
 
     def interp_source(self, inwave, sourceflux):
         """
@@ -681,6 +689,19 @@ def pad_to(grid, array, inds):
     """Pad a filter's array into a full-length grid array using slice `inds`."""
     full = jnp.zeros_like(grid)
     full = full.at[inds].set(array)
+    return full
+
+
+def _device_dtype(array):
+    """The host array in the dtype jnp.asarray gives it (float32 unless x64 is enabled)."""
+    array = np.asarray(array)
+    return array.astype(jax.dtypes.canonicalize_dtype(array.dtype), copy=False)
+
+
+def _pad_to_np(grid, array, inds):
+    """pad_to on the host."""
+    full = np.zeros_like(_device_dtype(grid))
+    full[inds] = _device_dtype(array)
     return full
 
 def load_filters(filternamelist, **kwargs):
