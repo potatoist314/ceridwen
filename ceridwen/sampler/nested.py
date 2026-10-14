@@ -827,7 +827,6 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                    if self.resume_from is not None else None)
         if _resume is None:
             rng_key, prior_key = jax.random.split(rng_key)
-            particles = self._sample_prior(theta_init, prior_key)
 
         # ── Build NSS kernel ──────────────────────────────────────────────
         # loglike_fn / logprior_fn operate on a SINGLE particle (un-batched).
@@ -844,13 +843,14 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             _t0 = time.perf_counter()
 
         if _resume is None:
-            # Compile the step kernel in a thread while init compiles and runs;
-            # the first step_fn call then takes the executable from JAX's cache.
-            live_shape = jax.eval_shape(init_fn, particles)
+            # Compile the step kernel in a thread while the prior draw and init
+            # run; the first step_fn call then takes the executable from JAX's cache.
+            live_shape = jax.eval_shape(
+                init_fn, jax.eval_shape(self._sample_prior, theta_init, prior_key))
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 step_compiled = pool.submit(
                     lambda: step_fn.lower(rng_key, live_shape).compile())
-                live = init_fn(particles)
+                live = init_fn(self._sample_prior(theta_init, prior_key))
                 step_compiled.result()
         else:
             # the saved state replaces the prior draw, init and the first iterations
