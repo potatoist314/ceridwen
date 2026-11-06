@@ -357,7 +357,6 @@ class Spectrum(Observation):
             self._chain = ChainProjector(
                 self.name, self._wavelength, self.instrument, self.subtract_library,
                 kinematics, wave_model, zred, lib_resolution)
-            self.model_support = self._chain.model_support
             return
         lib = None
         if lib_resolution is not None and self.instrument is not None and self.subtract_library:
@@ -379,7 +378,10 @@ class Spectrum(Observation):
     @property
     def model_support(self):
         """``(lo, hi)``: the model-grid indices the projector reads (its log-grid window, which
-        for a sampled redshift covers the whole ``zred_range``); None before setup."""
+        for a sampled redshift covers the whole ``zred_range``; the chain projector's own range,
+        ``_chain.ChainProjector.model_support``); None before setup."""
+        if self._chain is not None:
+            return self._chain.model_support
         if self._proj is None:
             return None
         idx = np.asarray(self._proj.window.grid.idx)
