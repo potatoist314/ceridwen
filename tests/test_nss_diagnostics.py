@@ -116,7 +116,9 @@ def test_carry_stepping_out_counts_the_same_calls_as_stock():
     assert counts[stepping_out_carry] == counts[stepping_out] > 1
 
 
-@pytest.mark.parametrize("kernel", ["carry", "lanes"])
+# "lanes" is checked on its own in tests/test_nss_slice_kernels.py: its replacements are born
+# at the contour (blackjax 1.7's rule), so on blackjax 1.6 it is not bitwise "stock".
+@pytest.mark.parametrize("kernel", ["carry"])
 def test_slice_kernel_is_bitwise_equal_to_stock_blackjax_nss(kernel):
     from ceridwen.sampler import Uniform
     import numpy as np
@@ -150,40 +152,6 @@ def test_slice_kernel_is_bitwise_equal_to_stock_blackjax_nss(kernel):
                                   np.asarray(stock.samples['x']))
     assert carry.log_evidence == stock.log_evidence
     assert carry.n_likelihood_calls == stock.n_likelihood_calls
-
-
-def test_lane_kernel_matches_stock_when_shrinkage_runs_out():
-    """Two likelihood levels: once every live point is on the upper level, no
-    candidate is above the contour and each slice uses all of max_shrinkage."""
-    import blackjax
-    import numpy as np
-
-    inside = lambda p: jnp.all(jnp.abs(p['x']) < 1.2) & (jnp.abs(p['y']) < 1.2)  # noqa: E731
-    loglike = lambda p: jnp.where(inside(p), 1., 0.)  # noqa: E731
-    logprior = lambda p: jnp.where(  # noqa: E731
-        jnp.all(jnp.abs(p['x']) < 2.) & (jnp.abs(p['y']) < 2.), 0., -jnp.inf)
-    stock = blackjax.nss(logprior_fn=logprior, loglikelihood_fn=loglike,
-                         num_inner_steps=4, num_delete=6)
-    lanes = BlackJAXNestedSamplerAdapter(
-        {}, verbose=False, slice_kernel="lanes")._build_nested_sampler(
-            loglike, logprior, 4, 6)
-    keys = jax.random.split(jax.random.key(5), 3)
-    state = jax.jit(stock.init)({
-        'x': jax.random.uniform(keys[0], (30, 2), minval=-2., maxval=2.),
-        'y': jax.random.uniform(keys[1], (30,), minval=-2., maxval=2.)})
-    stock_step, lane_step = jax.jit(stock.step), jax.jit(lanes.step)
-    accepted, shrinks = [], []
-    for key in jax.random.split(keys[2], 12):
-        want, got = stock_step(key, state), lane_step(key, state)
-        for a, b in zip(jax.tree.leaves(want), jax.tree.leaves(got)):
-            assert a.dtype == b.dtype
-            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
-        state = want[0]
-        accepted.append(np.asarray(want[1].update_info.is_accepted))
-        shrinks.append(np.asarray(want[1].update_info.num_shrink))
-    accepted, shrinks = np.concatenate(accepted), np.concatenate(shrinks)
-    assert accepted.any() and not accepted.all()
-    assert shrinks[~accepted].min() == shrinks.max() == 100
 
 
 def test_step_compiled_during_init_compiles_once_and_matches_serial_run(caplog):

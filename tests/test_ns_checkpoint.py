@@ -288,7 +288,7 @@ def test_resume_with_another_slice_kernel_reproduces_the_stock_run(tmp_path, mon
                                                   jax.random.PRNGKey(0))
     _run_killed_after(monkeypatch, 4, checkpoint_dir=str(tmp_path / "killed"),
                       slice_kernel=killed, **_KW)
-    ck_path = glob.glob(os.path.join(tmp_path / "killed", "ns_checkpoint_*.pkl"))[0]
+    ck_path = glob.glob(os.path.join(tmp_path / "killed", "ns_checkpoint_[0-9]*.pkl"))[0]
     res = BlackJAXNestedSamplerAdapter(priors, checkpoint_dir=str(tmp_path / "resumed"),
                                        resume_from=ck_path, slice_kernel=resumed, **_KW).run(
         loglike, logprior, theta_init, jax.random.PRNGKey(0))

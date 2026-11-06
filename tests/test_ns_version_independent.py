@@ -72,7 +72,7 @@ def test_lanes_checkpoint_resumes_bitwise(tmp_path, monkeypatch):
                                        **kw).run(loglike, logprior, theta_init,
                                                  jax.random.PRNGKey(0))
     _run_killed_after(monkeypatch, 4, checkpoint_dir=str(tmp_path / "killed"), **kw)
-    ck_path = glob.glob(os.path.join(tmp_path / "killed", "ns_checkpoint_*.pkl"))[0]
+    ck_path = glob.glob(os.path.join(tmp_path / "killed", "ns_checkpoint_[0-9]*.pkl"))[0]
     res = BlackJAXNestedSamplerAdapter(priors, checkpoint_dir=str(tmp_path / "resumed"),
                                        resume_from=ck_path, **kw).run(
         loglike, logprior, theta_init, jax.random.PRNGKey(0))
