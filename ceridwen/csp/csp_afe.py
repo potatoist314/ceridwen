@@ -464,6 +464,10 @@ class CSPBasis_afe(CSPBasis):
                 )
         self._known_theta_keys = (self._known_theta_keys | {'afe'}) - {'eline_scaling'}
         self._apply_fixed()
+        if hasattr(self, "sfh_basis_fastpath"):
+            # a re-initialised CSP (the shared-template copy of tests/agn/test_copy_rebind.py):
+            # new SFH nodes, so a new SFH basis
+            self._configure_sfh_basis_fastpath()
 
     def check_param_ranges(self, theta=None, warn=True):
         """``CSPBasis.check_param_ranges`` plus theta['afe'] against the [alpha/Fe] grid."""
