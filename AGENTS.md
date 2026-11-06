@@ -59,10 +59,12 @@ observed-frame projection) fit with nested sampling or VI-preconditioned NUTS.
 
 ## Hard requirements (the model will not run otherwise)
 
-- **float64 must be on.** `import ceridwen` calls
-  `jax.config.update("jax_enable_x64", ...)` with True unless the environment sets
-  `CERIDWEN_X64=0` (a debugging switch: never set it for a fit). Do not disable it; evidence
-  estimates and gradients depend on it.
+- **float64 is on wherever the device has it.** `import ceridwen` calls
+  `jax.config.update("jax_enable_x64", ...)` with True, except that an Apple GPU as JAX's
+  default backend (jax-graft) or `CERIDWEN_X64=0` gives float32 mode (`docs/mac_gpu.md`,
+  `ceridwen/precision.py`): the one supported way to run with float64 off. Code never
+  requests `jnp.float64` directly (use `precision.float_dtype()`), host-side NumPy stays
+  float64, and the float64 trace is byte-identical with the switch off (T4).
 - **The FSPS data files (`$SPS_HOME`) are required at runtime** for nebular and dust
   emission, not just to build the SSP cache (python-fsps itself only for building grids).
   The CLOUDY nebular grids and Draine & Li dust-emission templates are read from
@@ -70,8 +72,10 @@ observed-frame projection) fit with nested sampling or VI-preconditioned NUTS.
   SSP cache (`SSPData.from_fsps`) also needs FSPS.
 - **Filters and attenuation curves are internal**:
   `ceridwen/observation/filters.py` and `ceridwen/dust/attenuation_laws.py`,
-  vendored from `sedpy-jax` (MIT), with the 293 filter `.par` files and the two
-  reference spectra under `ceridwen/data/`. There is no `sedpy` dependency; do
+  vendored from `sedpy-jax` (MIT), with the 296 filter `.par` files and the two
+  reference spectra under `ceridwen/data/`. User filters: `Photometry(filter_directory=)`
+  (only that directory), else `$CERIDWEN_FILTER_DIR` then the library
+  (`filters.resolve_filter_file`; a name in both warns). There is no `sedpy` dependency; do
   not add one.
 - **Nested sampling needs `blackjax.nss`/`blackjax.ns`**, released in blackjax
   1.6; `pyproject.toml` requires `blackjax>=1.6` (which forces `jax>=0.9` and
@@ -111,6 +115,7 @@ from ceridwen.sampler import run_sampler
 from ceridwen.optimize import map_fit          # MAP (L-BFGS from prior draws)
 from ceridwen.likelihood import DiagonalGaussianLikelihood, MultiObservationLikelihood
 from ceridwen.resultfile import rebuild_model, check_model_against_result
+from ceridwen.agn import AGNConfig              # CSPBasis(..., agn=AGNConfig())
 ```
 
 Equivalent namespaced paths also work: `ceridwen.ssps.SSPData`,
@@ -139,7 +144,8 @@ The forward model is assembled bottom-up: SSP library → composite stellar
 population → dust attenuation/emission → nebular → IGM → observed-frame
 projection → likelihood → sampler.
 
-- `ssps/` — `ssp_data.py`: `SSPData` (frozen dataclass, HDF5 I/O, ionising-photon
+- `ssps/` — `ssp_data.py`: `SSPData` (frozen dataclass, HDF5 I/O; `ssp_flux` is a read-only
+  host NumPy array, the device holds only the CSP's float32 `csp.flux`; ionising-photon
   rate derived internally; HDF5 caches the SSP spectral grid; schema 3.0 adds the optional
   surviving-mass table `ssp_stellar_mass`, carried by the published solar-scaled grids (not
   yet the α grid: `mfrac=False` there) and recorded by
@@ -152,8 +158,14 @@ projection → likelihood → sampler.
 - `csp/` — `csp.py`: `CSPBasis`, the core forward model. Holds the `get_spectrum_*`
   variants (stellar ± dust attenuation ± dust emission ± nebular), step/linear
   SFH interpolation, constant or time-varying metallicity, dict-based `theta`,
-  fully JAX-traceable; `predict` projects onto the observations (static
-  line-to-band basis for fixed-z photometry, painted lines otherwise).
+  fully JAX-traceable; `predict` projects onto the observations (the photometry adds each
+  line's flux through each filter, `observation/line_photometry.py`; a Spectrum paints them on
+  its pixels).
+  `CSPBasis(fixed={name: value})` holds CSP parameters fixed at construction (out of
+  `param_names`, kept in `theta_init`; `SedModel` makes each a constant transform, GOTCHAS
+  section 28).
+  `CSPBasis(wavelength_support=True)` (opt-in, not byte-identical) synthesises only the
+  model pixels the observations read (`Observation.model_support`, `CSPBasis._support_for`).
   `csp_afe.py`: `CSPBasis_afe`, the [alpha/Fe] variant without a nebular model.
   `spectrum_calibration.py`: `spectrum_scaling` / `spectrum_calib` factor (one per
   spectrum, `spectrum_scaling_<obs.name>` with several). The profiled alternative is
@@ -174,10 +186,12 @@ projection → likelihood → sampler.
 - `neb/` — `NebularGridModel.py`: `NebularModel` (CLOUDY grids, default
   `cloudy_dust=False` = `ZAU_ND_<isoc>` as in FSPS/Prospector, `True` = `ZAU_WD`; each cube
   interpolated against its own gas_logz/gas_logu/age axes, line profiles at
-  the pixel floor, `line_profiles(sigma)` for the photometric line basis).
+  the pixel floor, a FWHM of `res_floor_fwhm_px` pixels).
 - `observation/` — `base.py` (`Observation` base class), `photometry.py` (filter convolution via
-  `filters.FilterSet` → matrix-vector projection `_T`, optional
-  `PhotometricBroadener` and static line basis), `spectrum.py` (`Instrument`
+  `filters.FilterSet.flux_weights` → matrix-vector projection `_T`, the exact integral over the
+  model pixels; windowed at a sampled redshift), `line_photometry.py` (each nebular line's flux
+  through each filter: delta lines, or the exact Gaussian integral with `broaden_photometry`),
+  optional `PhotometricBroadener`, `spectrum.py` (`Instrument`
   + `SpectralProjector` built by `setup_for_model`), `lines.py` (line fluxes
   read from the nebular grid by `CSPBasis`; Gaussian aperture matrix `W` for
   `Lines.predict` alone), `gp.py` (`GaussianProcess`, host-side GP likelihood for `Spectrum.log_likelihood`; `fitSED` uses its values as fixed hyperparameters of `GPGaussianLikelihood`). `observation.py` is a re-export shim so
@@ -186,7 +200,10 @@ projection → likelihood → sampler.
 - `model/` — `model.py`: `SedModel` (`predict`, `apply_transforms`, `ln_prior`,
   `log_prob`; free vs. derived params, `logmass` amplitude scaling).
   `transforms.py`: `logsfr_ratios_to_sfh` and inverse (mass-weighted trapezoidal
-  normalisation).
+  normalisation). `describe.py`: `SedModel.latex()` (parameter table) and
+  `SedModel.display()` (model diagram and prior predictive); a transform's inputs are traced
+  from its program, a constant transform is a fixed parameter, `PARAM_INFO` holds each key's
+  symbol, meaning and unit.
 - `likelihood/` — `likelihood.py`: `DiagonalGaussianLikelihood`,
   `MultiObservationLikelihood`, pure-JAX `lnlike_diag_gaussian`, masking,
   `make_lnprobfn()` (the jitted log-posterior factory). `noise_model.py`:
@@ -209,6 +226,24 @@ projection → likelihood → sampler.
   `resume_from=` continues a killed run bit for bit), `nuts.py` (NUTS, VI-preconditioned),
   `vi.py` (VI transport maps: TriL, IAF/NeuTra), `runner.py` (`SamplerAdapter`
   protocol, `SamplingResult`, `run_sampler`, `to_anesthetic`).
+- `agn/` — the AGN (`CSPBasis(agn=AGNConfig(...))`, `docs/agn.md`). `__init__.py`: `AGNConfig`
+  (static: `agn_mode` "corrected" (default) / "fsps" / "prospector", components, `dust4_type`,
+  `tau_interp`, `agn_energy_balance`), `AGNContext`, the `Component` / `Screen` /
+  `LineComponent` interface, `AGNModel`; AGN2 (CIGALE standard, `agn_mode="cigale"` or
+  "corrected", all off by default): `skirtor.py` `SkirtorTorus` (`torus_model="skirtor16"`),
+  `polar.py` `PolarDust` (`polar_dust=True`), `nlr.py` `FeltreNLR` (`nlr_model="feltre16"`),
+  `blr.py` `BroadLines` (`blr=True`); SKIRTOR / NLR tables and CIGALE's extinction curves
+  from `$CERIDWEN_AGN_DATA` (`agn_data_dir()`; `fetch.py` `fetch_grids` gets the curves).
+  `torus.py`: `NenkovaTorus` (the Nenkova+08 templates
+  from `$SPS_HOME/dust`, resampled per mode). `disk.py`: `TempleDisk` (`data/temple21.txt`).
+  `screen.py`: `AGNScreen` (dust4), `ProspectorDiffuseCurve`. `lines.py`: `AGNLines`
+  (`data/richardson14_a42.csv`, by FSPS line name). `hook.py`: `AGNHook`, the single CSP wiring
+  point (screens, energy balance, the IGM order per mode, provenance). The CSP wraps its
+  spectrum kernel once (`CSPBasis._with_agn`, a BOUND METHOD resolving `self._agn_base` /
+  `self._agn_rest` at call time, so a re-bound copy evaluates its own model) and adds the AGN
+  lines in `predict`
+  (`_agn_line_terms`); theta keys `fagn`, `agn_tau`, `fagn_bbb`, `dust4`, `dust4_index`,
+  `agn_elum`, `agn_eline_sigma` exist only with `agn=`.
 - `cosmology.py` — JAX-native flat ΛCDM (Planck 18) with an astropy fallback.
 - `igm.py` — IGM attenuation (`Madau1995`; `MadauDampingDLA` = Madau × damping wing × DLA,
   with theta keys `x_HI` / `logN_HI` / `z_dla` declared in `IGMModel.param_names` and passed
@@ -225,6 +260,9 @@ projection → likelihood → sampler.
 - `resultfile.py` — `rebuild_model` / `check_model_against_result` / `priors_from_result`:
   rebuild a `SedModel` from a result file given the CSP, observations and transform callables
   (not stored), and name every difference between a model and the file.
+- `update_check.py` — `notify_if_outdated` (called by `fitSED` and `check.py`): warns once when
+  PyPI has a newer release; cached a day, 2 s timeout, silent offline, off with
+  `CERIDWEN_NO_UPDATE_CHECK=1` or `$CI`.
 - `optimize.py` — `map_fit` (L-BFGS on fitSED's log-posterior from `theta_init` + N prior
   draws; `.theta` is a `free_param_init`), `laplace_sigma`; `fitSED(optimize=True)` starts NUTS
   there and writes `/map`.

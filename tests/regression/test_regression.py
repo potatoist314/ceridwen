@@ -3,7 +3,10 @@ Regression test for the CERIDWEN review-driven refactor.
 
 Re-runs every Step-0 baseline evaluation (via ``capture_baseline.compute_baselines``,
 the single source of truth) and compares against the committed ``baselines/*.npz``
-with ``numpy.testing.assert_allclose(atol=1e-10, rtol=1e-7)``.
+with ``numpy.testing.assert_allclose(rtol=1e-7, atol=1e-10 * max|baseline|)`` per array.
+The absolute part scales with each array: a fixed ``atol=1e-10`` (as before 2026-10-12) is
+larger than every value of the cgs arrays (fluxes ~1e-21, flux factors ~1e-58), so it passed
+any change to them.
 
 This must pass identically before and after every refactor phase.  Run:
 
@@ -22,8 +25,13 @@ from capture_baseline import compute_baselines, BASELINE_DIR
 # Tag the whole module so `-m "not fsps"` skips it on FSPS-free machines/CI.
 pytestmark = pytest.mark.fsps
 
-ATOL = 1e-10
-RTOL = 1e-7
+#: absolute tolerance as a fraction of the array's largest finite |value| (``ATOL_SCALE * max``);
+#: an element far below the array's peak is compared to that floor, every other at ``RTOL``
+ATOL_SCALE = 1e-10
+#: summation order differs between jax versions; on jax 0.12.0.1 (arm64) the baselines move by
+#: 1.1e-7 to 7.1e-7 (gp_likelihood gradients), and the float32 AGN-line photometry by 6.3e-6
+RTOL = 2e-6
+RTOL_BY_CATEGORY = {"agn_lines": 2e-5}
 
 
 @pytest.fixture(scope="session")
@@ -58,6 +66,10 @@ CATEGORIES = [
     "dust_laws",
     "dust_emission_themis",
     "lsf_scale",
+    "agn_torus",
+    "agn_disk",
+    "agn_lines",
+    "agn_blr",
 ]
 
 #: v1.0.5 metallicity baselines, one per grid family; each is skipped where its grid is absent;
@@ -67,10 +79,18 @@ OPTIONAL_CATEGORIES = ["logzsol_bpass", "logzsol_mist", "logzsol_afe",
                        "stellar_mass"]
 
 
-@pytest.mark.parametrize("category", CATEGORIES + OPTIONAL_CATEGORIES)
+#: AGN2 categories that need the converted tables of $CERIDWEN_AGN_DATA (not committed: SKIRTOR
+#: 227 MB; see docs/agn.md); absent tables skip LOUDLY, a run with these skips is not a pass
+AGN2_DATA_CATEGORIES = ["agn_skirtor", "agn_polar", "agn_nlr"]
+
+
+@pytest.mark.parametrize("category", CATEGORIES + OPTIONAL_CATEGORIES + AGN2_DATA_CATEGORIES)
 def test_category_matches_baseline(category, fresh):
     if category in OPTIONAL_CATEGORIES and category not in fresh:
         pytest.skip(f"{category}: its SSP grid is not present locally")
+    if category in AGN2_DATA_CATEGORIES and category not in fresh:
+        from capture_baseline import _agn2_data_missing
+        pytest.skip(f"MISSING $CERIDWEN_AGN_DATA/{_agn2_data_missing()}: {category} did NOT run")
     expected = _load(category)
     actual = fresh[category]
     assert set(actual.keys()) == set(expected.keys()), (
@@ -91,8 +111,9 @@ def test_category_matches_baseline(category, fresh):
         assert np.array_equal(act[~finite], exp[~finite], equal_nan=True), (
             f"{category}/{key}: non-finite entries changed"
         )
+        atol = ATOL_SCALE * float(np.max(np.abs(exp[finite])))
         np.testing.assert_allclose(
-            act[finite], exp[finite], atol=ATOL, rtol=RTOL,
+            act[finite], exp[finite], atol=atol, rtol=RTOL_BY_CATEGORY.get(category, RTOL),
             err_msg=f"{category}/{key} changed beyond tolerance",
         )
 

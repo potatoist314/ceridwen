@@ -11,16 +11,56 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ceridwen.observation.observation import (
-    Lines,
-    Observation,
-    Photometry,
-    Spectrum,
-    StellarIndices,
-)
+from ceridwen.observation.observation import Observation, Photometry, Spectrum, Lines
 from ceridwen.broadening import Kinematics, DEFAULT_KINEMATICS, TIED
+from ceridwen.csp.csp import spectrum_model_name as _spectrum_model_name
 
 Array = jax.Array
+
+# agn_eline_sigma (the AGN narrow-line dispersion, km/s): its prior / fixed value must lie in
+# (0, AGN_ELINE_SIGMA_MAX], the Kinematics.sigma_max default; a sampled value is warned about
+# when no Spectrum has an instrumental sigma <= AGN_ELINE_SIGMA_RESOLVE x the prior's upper
+# edge at any AGN line it covers
+AGN_ELINE_SIGMA_MAX = float(Kinematics.__dataclass_fields__["sigma_max"].default)
+AGN_ELINE_SIGMA_RESOLVE = 3.0
+
+
+FIXED_PREFIX = "CSPBasis(fixed="
+
+
+class FixedValue:
+    """The constant transform of a ``CSPBasis(fixed={name: value})`` entry: the same value for
+    every theta, exactly what ``lambda th: jnp.array([value])`` gives.  Its ``__name__``
+    (``CSPBasis(fixed=[...])``) is what the result file records for the transform."""
+
+    def __init__(self, name, value):
+        self.name = name
+        self.value = np.array(value, dtype=np.float64)
+        self.value.setflags(write=False)
+        self.__name__ = (FIXED_PREFIX + "[" + ", ".join(repr(float(x)) for x in self.value)
+                         + "])")
+
+    def __call__(self, theta):
+        return jnp.asarray(self.value)
+
+    def __repr__(self):
+        return f"FixedValue({self.name!r}, {self.value.tolist()})"
+
+
+def _prior_median(prior):
+    """The median of a prior (its mean when the distribution has no quantile)."""
+    d = prior.tfp_dist()
+    try:
+        return np.asarray(d.quantile(0.5), dtype=float)
+    except (NotImplementedError, AttributeError):
+        return np.asarray(d.mean(), dtype=float)
+
+
+def _value_source(model, name):
+    """How a fixed value of ``name`` was given, for the range-check messages."""
+    if name in getattr(model, "fixed", {}):
+        return f"CSPBasis(fixed={{{name!r}: ...}}) gives"
+    return f"the transform for {name!r} gives"
 
 
 class SedModel:
@@ -59,6 +99,18 @@ class SedModel:
         self.observations = list(observations)
         self.priors       = dict(priors) if priors is not None else {}
         self.transforms   = dict(transforms) if transforms is not None else {}
+        self.fixed        = dict(getattr(csp, "fixed", None) or {})
+        for name, value in self.fixed.items():
+            for where, given in (("priors", self.priors), ("transforms", self.transforms),
+                                 ("free_param_init", free_param_init or {})):
+                if name in given:
+                    raise ValueError(
+                        f"{name!r} is fixed on the CSP (CSPBasis(fixed={{{name!r}: "
+                        f"{value.tolist() if value.size > 1 else float(value[0])}}})) and is "
+                        f"also in {where}.  To sample it, build the CSP without it in fixed= "
+                        "and give it a prior; to derive it, drop it from fixed= and keep the "
+                        "transform.")
+            self.transforms[name] = FixedValue(name, value)
         self.zred         = float(zred)
         if kinematics is None:
             kinematics = DEFAULT_KINEMATICS
@@ -115,6 +167,14 @@ class SedModel:
                 if p in self.param_names:
                     self.param_names.remove(p)
 
+        # logmass with a prior and no start value is sampled, from the prior's median
+        if ("logmass" in self.priors and "logmass" not in self.param_names
+                and "logmass" not in self.transforms
+                and "logmass" not in (free_param_init or {})):
+            self.theta_init["logmass"] = jnp.atleast_1d(jnp.asarray(
+                _prior_median(self.priors["logmass"]), dtype=float))
+            self.param_names.append("logmass")
+
         if free_param_init is not None:
             for p, v in free_param_init.items():
                 arr = jnp.atleast_1d(jnp.asarray(v, dtype=float))
@@ -123,18 +183,22 @@ class SedModel:
                     self.param_names.append(p)
 
         self._check_metallicity_setup(free_param_init)
+        self._check_agn_eline_sigma_range()
+        self._check_agn2_prior_ranges()
 
         unknown = sorted(set(self.priors) - set(self.param_names))
         if unknown:
             raise ValueError(
                 f"priors given for {unknown}, which are not sampled parameters "
                 f"(a prior on a derived or misspelled name would be silently ignored); "
-                f"the sampled parameters are {self.param_names}")
+                f"the sampled parameters are {self.param_names}.  A new name that a "
+                f"transform reads (e.g. log_fagn for fagn) must also be in free_param_init")
         unpriored = [p for p in self.param_names if p not in self.priors]
         if unpriored:
             warnings.warn(
                 f"no prior for sampled parameter(s) {unpriored}: NUTS treats them as "
-                "improper flat, nested sampling refuses them", stacklevel=2)
+                "improper flat, nested sampling refuses them.  Give each a prior, or fix it "
+                "with a constant transform", stacklevel=2)
 
         self.kinematics.validate_theta(set(self.theta_init) | set(self.transforms), self.priors)
         self._check_instrument_scales()
@@ -252,13 +316,13 @@ class SedModel:
                 lo = float(np.min(fixed)); hi = float(np.max(fixed))
                 if lo < zlo - 1e-12 or hi > zhi + 1e-12:
                     raise ValueError(
-                        f"the transform for {name!r} gives {np.array2string(fixed, precision=3)}, "
+                        f"{_value_source(self, name)} {np.array2string(fixed, precision=3)}, "
                         f"outside this grid's logzsol range [{zlo:+.3f}, {zhi:+.3f}] (Z_sun = "
                         f"{getattr(csp, 'zsun_nominal', float('nan')):.6g}); the metallicity "
                         "interpolation would clamp there.")
                 if hi < ABSOLUTE_LOOKING_LOGZSOL:
                     warnings.warn(
-                        f"the transform for {name!r} gives {np.array2string(fixed, precision=3)}, "
+                        f"{_value_source(self, name)} {np.array2string(fixed, precision=3)}, "
                         f"below logzsol = {ABSOLUTE_LOOKING_LOGZSOL} everywhere: is it an OLD "
                         f"absolute log10 Z?  It would be logzsol = "
                         f"{np.array2string(fixed - l0, precision=3)}.", stacklevel=3)
@@ -288,6 +352,128 @@ class SedModel:
         self._check_gas_range()
         self._check_afe_range()
         self._check_refused_alpha_cell()
+
+    def _agn_line_hook(self):
+        """The CSP's AGN hook when its AGN lines (and so ``agn_eline_sigma``) are on, else None."""
+        hook = getattr(self.csp, "_agn", None)
+        if hook is None or getattr(hook.model, "lines", None) is None \
+                or "agn_eline_sigma" not in hook.param_names:
+            return None
+        return hook
+
+    def _check_agn_eline_sigma_range(self):
+        """``agn_eline_sigma`` (the AGN narrow-line dispersion, km/s): its prior, constant
+        transform or fixed value must lie in (0, AGN_ELINE_SIGMA_MAX].  Raises at setup."""
+        key = "agn_eline_sigma"
+        if self._agn_line_hook() is None:
+            return
+        from ..csp.csp import prior_support
+        if key in self.priors:
+            lo, hi = prior_support(self.priors[key])
+            what = f"the prior on {key!r} covers [{lo:g}, {hi:g}]"
+        else:
+            if key in self.transforms:
+                try:                     # its value at theta_init (constant or not)
+                    v = np.atleast_1d(np.asarray(self.transforms[key](dict(self.theta_init)),
+                                                 dtype=float))
+                except Exception:
+                    v = None
+                where = _value_source(self, key)
+            elif key in self.theta_init:
+                v = np.atleast_1d(np.asarray(self.theta_init[key], dtype=float))
+                where = f"theta[{key!r}] is"
+            else:
+                return
+            if v is None or v.size == 0:
+                return
+            lo, hi = float(np.min(v)), float(np.max(v))
+            what = f"{where} {np.array2string(v, precision=4)}"
+        fix = (f"Give it a bounded prior inside (0, {AGN_ELINE_SIGMA_MAX:g}], e.g. "
+               "Uniform(low=50.0, high=500.0) (Prospector's), or fix it with a constant "
+               "transform, e.g. transforms={'agn_eline_sigma': lambda th: jnp.array([100.0])}.")
+        if not lo > 0.0:
+            raise ValueError(
+                f"{key} is the Gaussian dispersion [km/s] of the AGN narrow lines and must be "
+                f"> 0, but {what}.  A width <= 0 has no meaning, and the painters divide by it "
+                "(Prospector's AGNSpecModel painter by agn_eline_sigma alone), so it gives NaN "
+                f"predictions and gradients.  {fix}")
+        if not hi <= AGN_ELINE_SIGMA_MAX:
+            raise ValueError(
+                f"{what}, above {AGN_ELINE_SIGMA_MAX:g} km/s (the Kinematics.sigma_max default, "
+                "the widest line the broadening is built for).  The AGN lines are narrow-line-"
+                "region lines with Richardson+14 'a42' NARROW-line ratios; broad-line-region "
+                "widths (thousands of km/s) need a separate BLR component with its own lines, "
+                "ratios and width, which CERIDWEN does not have yet, and fitting broad lines "
+                f"with {key} would give them narrow-line ratios.  {fix}")
+
+    def _check_agn_eline_sigma_resolved(self):
+        """UserWarning when ``agn_eline_sigma`` has a prior (is sampled) but no Spectrum can
+        resolve the AGN lines: no Spectrum, none covers an AGN line with unmasked pixels, or the
+        instrumental sigma at every covered AGN line exceeds AGN_ELINE_SIGMA_RESOLVE x the
+        prior's upper edge (then every width the prior allows is unresolved and the posterior is
+        the prior).  Setup time (``setup_observations``), NumPy only."""
+        key = "agn_eline_sigma"
+        hook = self._agn_line_hook()
+        if hook is None or key not in self.priors:
+            return
+        from ..csp.csp import prior_support
+        from ..broadening import CKMS
+        hi = prior_support(self.priors[key])[1]
+        lines = hook.model.lines
+        lam_rest = np.asarray(lines.line_wave, dtype=np.float64)
+        n_spec, best = 0, None                    # best: (sigma_inst, spectrum, line, z)
+        for obs in self.observations:
+            if getattr(obs, "_kind", None) != "spectrum":
+                continue
+            n_spec += 1
+            proj = getattr(obs, "_proj", None)
+            if proj is None or proj.wave_obs is None:
+                continue
+            w = np.asarray(proj.wave_obs, dtype=np.float64)
+            # the instrument the AGN painter uses (SpectralProjector.setup_agn_lines)
+            s_tab = (0.5 * CKMS * np.gradient(np.log(w)) if proj.instrument is None
+                     else np.asarray(proj.sigma_inst_kms, dtype=np.float64))
+            if proj.free_inst_scale:
+                s_tab = s_tab * float(proj.inst_scale_range[0])
+            m = np.asarray(obs.mask, dtype=bool)
+            used = np.sort(w[m] if m.shape == w.shape else w)
+            if used.size == 0:
+                continue
+            opzs = [float(proj.opz_ref)]
+            if proj.free_z:
+                opzs += [1.0 + float(z) for z in proj.zred_range]
+            for opz in opzs:
+                lam = lam_rest * opz
+                for j in np.flatnonzero((lam >= w.min()) & (lam <= w.max())):
+                    s = float(np.interp(lam[j], w, s_tab))
+                    # covered: an unmasked pixel within 2 instrumental sigma of the centre
+                    half = 2.0 * lam[j] * s / CKMS
+                    k = np.searchsorted(used, lam[j] - half)
+                    if k >= used.size or used[k] > lam[j] + half:
+                        continue
+                    if best is None or s < best[0]:
+                        best = (s, obs.name, lines.line_names[j], opz - 1.0)
+        if n_spec == 0:
+            why = ("the model has no Spectrum: Lines fluxes do not depend on the AGN line width "
+                   "and Photometry only through line light near filter edges")
+        elif best is None:
+            why = ("no Spectrum has unmasked pixels at any AGN line (the 23 Richardson+14 lines "
+                   f"at {lam_rest.min():.0f}-{lam_rest.max():.0f} A rest, at the model redshift)")
+        elif best[0] > AGN_ELINE_SIGMA_RESOLVE * hi:
+            why = (f"the narrowest instrumental dispersion at an AGN line is {best[0]:.0f} km/s "
+                   f"({best[2]} in Spectrum {best[1]!r} at z = {best[3]:.4g}), more than "
+                   f"{AGN_ELINE_SIGMA_RESOLVE:g} x the prior's upper edge {hi:g} km/s, so every "
+                   "width the prior allows is unresolved")
+        else:
+            return
+        warnings.warn(
+            f"{key} is sampled but the data cannot constrain it: {why}.  Its posterior will be "
+            "its prior.  Fix it instead, "
+            "transforms={'agn_eline_sigma': lambda th: jnp.array([100.0])} with no prior, or "
+            "add a Spectrum that resolves the AGN lines (instrumental sigma <= "
+            f"{AGN_ELINE_SIGMA_RESOLVE:g} x {hi:g} km/s at a line, R_FWHM >= "
+            f"{CKMS / (2.3548 * AGN_ELINE_SIGMA_RESOLVE * hi):.0f}).  See docs/agn.md, "
+            "'Fitting the AGN line width'.", UserWarning, stacklevel=4)
 
     def _check_tied_gas_range(self):
         """gas_tied=True (B1-019): the gas metallicity is the stellar logzsol, and a logzsol
@@ -360,9 +546,26 @@ class SedModel:
                 continue
             if float(np.min(fixed)) < glo - 1e-9 or float(np.max(fixed)) > ghi + 1e-9:
                 raise ValueError(
-                    f"the transform for {name!r} gives {np.array2string(fixed, precision=3)}, outside the "
+                    f"{_value_source(self, name)} {np.array2string(fixed, precision=3)}, outside the "
                     f"nebular grid's {name} axis [{glo:+.3f}, {ghi:+.3f}]{grid}; the CLOUDY "
                     "interpolation would clamp to the edge.  Give a value inside the axis.")
+
+    def _check_agn2_prior_ranges(self):
+        """The same rule for the tabulated AGN2 components (SKIRTOR axes, the Feltre+16 NLR axes,
+        and fagn < 1 in "cigale" mode): each part that defines ``check_prior_ranges(priors,
+        prior_support)`` raises for a prior that leaves its grid (a fixed value outside it warns
+        through the hook's ``range_messages``)."""
+        hook = getattr(self.csp, "_agn", None)
+        if hook is None:
+            return
+        from ..csp.csp import prior_support
+        m = hook.model
+        parts = list(m.components.values()) + [getattr(m, a, None)
+                                                for a in ("polar", "lines", "blr", "screen")]
+        for part in parts:
+            check = getattr(part, "check_prior_ranges", None)
+            if check is not None:
+                check(self.priors, prior_support)
 
     def _check_afe_range(self):
         """The logzsol rule for [alpha/Fe] on an alpha grid (B1-011): a bounded prior or a
@@ -379,7 +582,7 @@ class SedModel:
             if fixed is not None and (float(np.min(fixed)) < alo - 1e-12
                                       or float(np.max(fixed)) > ahi + 1e-12):
                 raise ValueError(
-                    f"the transform for 'afe' gives {np.array2string(fixed, precision=3)}, "
+                    f"{_value_source(self, 'afe')} {np.array2string(fixed, precision=3)}, "
                     f"outside this grid's [alpha/Fe] range [{alo:+.3f}, {ahi:+.3f}]; the "
                     "interpolation would clamp there.")
             return
@@ -510,6 +713,8 @@ class SedModel:
                     kinematics=self.kinematics, lib_resolution=lib,
                     line_wave_rest=lines_rest,
                     zred_range=zr, **kw)
+                if getattr(self.csp, "_agn", None) is not None:   # CSPBasis(agn=...) lines
+                    self.csp._setup_agn_spectrum(obs)
             elif kind == "photometry":
                 obs.setup_for_model(self.wave, zred=self.zred)
                 obs.free_z = bool(self.zred_is_free)
@@ -523,6 +728,15 @@ class SedModel:
             self.__dict__.pop(cached, None)
         from ..likelihood.eline_marginal import build_eline_system
         self._eline_system = build_eline_system(self)
+        self._check_agn_eline_sigma_resolved()
+        if self._eline_system is not None:
+            from ..precision import is_x64
+            if not is_x64():
+                raise ValueError(
+                    "Spectrum(marginalize_elines=True) needs float64: the line-flux marginal "
+                    "forms A^T W A in flux units, which float32 cannot hold (docs/mac_gpu.md).  "
+                    "Run this model in float64 (JAX_PLATFORMS=cpu on a Mac), or fit the lines "
+                    "with the nebular grid instead")
 
 
     def _instrument_scale_keys(self) -> tuple:
@@ -722,7 +936,7 @@ class SedModel:
         lines = [
             "SedModel",
             "=" * 50,
-            f"CSP spectrum model : {self.csp.get_spectrum.__name__}",
+            f"CSP spectrum model : {_spectrum_model_name(self.csp)}",
             f"Wavelength range   : {float(self.wave.min()):.0f} – "
                                    f"{float(self.wave.max()):.0f} Å",
             f"Cosmology          : {self.cosmo.describe()}",
@@ -798,457 +1012,40 @@ class SedModel:
                 f"age = {float(self.cosmo.age(self.zred)):.3f} Gyr")
 
 
+    def latex(self, *, caption: str | None = None, label: str = "tab:sedmodel",
+              settings: bool = True, table: bool = True) -> str:
+        """A LaTeX table (``booktabs``) of the model: every free parameter with its prior, every
+        derived parameter with the transform and free parameters it is computed from, every
+        fixed parameter (a constant transform) with its value, and (``settings``) the fixed
+        model settings: SSP grid and IMF, SFH grid, dust laws, redshift, kinematics, the
+        observations, cosmology.  ``table=False`` returns the ``tabular`` alone.  Needs
+        ``\\usepackage{booktabs}`` and ``amsmath``."""
+        from .describe import latex
+        return latex(self, caption=caption, label=label, settings=settings, table=table)
+
     def display(
         self,
         ax=None,
         figsize: tuple[float, float] | None = None,
         return_fig: bool = False,
+        *,
+        predictive: bool = True,
+        n_draws: int = 64,
+        seed: int = 0,
+        title: str | None = None,
     ):
-        """Draw the model as a PGM diagram; returns ``(fig, ax)`` when ``return_fig``."""
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.patches import FancyBboxPatch
-
-        C = dict(
-            bg        = "#FFFFFF",
-            param_fc  = "#FFFFFF",
-            param_ec  = "#222222",
-            vec_fc    = "#EEF3FF",
-            vec_ec    = "#556BBB",
-            sed_fc    = "#E6F2FB",
-            sed_ec    = "#1A6098",
-            phot_fc   = "#FFF4E6",  phot_ec = "#C95800",
-            spec_fc   = "#EDFAED",  spec_ec = "#276929",
-            line_fc   = "#F5EEFF",  line_ec = "#6A22A8",
-            index_fc  = "#E9F7F7",  index_ec = "#176B6B",
-            # observed data nodes (filled = conditioned on)
-            data_fc   = "#37474F",
-            data_ec   = "#1A252B",
-            data_tc   = "#FFFFFF",
-            arr_prior = "#BBBBBB",
-            arr_fwd   = "#555555",
-            arr_obs   = "#777777",
-        )
-
-        def _obs_colors(obs):
-            try:
-                if isinstance(obs, Photometry):
-                    return (C["phot_fc"], C["phot_ec"])
-                if isinstance(obs, Spectrum):
-                    return (C["spec_fc"], C["spec_ec"])
-                if isinstance(obs, Lines):
-                    return (C["line_fc"], C["line_ec"])
-                if isinstance(obs, StellarIndices):
-                    return (C["index_fc"], C["index_ec"])
-            except Exception:
-                pass
-            return {
-                "Photometry": (C["phot_fc"], C["phot_ec"]),
-                "Spectrum":   (C["spec_fc"], C["spec_ec"]),
-                "Lines":      (C["line_fc"], C["line_ec"]),
-                "StellarIndices": (C["index_fc"], C["index_ec"]),
-            }.get(type(obs).__name__, (C["param_fc"], C["param_ec"]))
-
-        _LATEX = {
-            "sfh":         r"$\mathbf{w}_\mathrm{SFH}$",
-            "logzsol":     r"$\log(Z_\star/Z_\odot)$",
-            "logzsol_hist": r"$\log(Z_\star/Z_\odot)(t)$",
-            "logzsol_total": r"$[Z/\mathrm{H}]$",
-            "zred":        r"$z$",
-            "tau_dust":    r"$\hat{\tau}$",
-            "tau_1":       r"$\hat{\tau}_1$",
-            "tau_2":       r"$\hat{\tau}_2$",
-            "dust_index":  r"$\delta_\mathrm{dust}$",
-            "dust_ratio":  r"$f_\mathrm{dust}$",
-            "gas_logz":    r"$\log(Z_\mathrm{gas}/Z_\odot)$",
-            "gas_logu":    r"$\log U$",
-            "sigma_v":     r"$\sigma_v$",
-            "f_agn":       r"$f_\mathrm{AGN}$",
-            "agn_tau":     r"$\tau_\mathrm{AGN}$",
-            "duste_qpah":  r"$q_\mathrm{PAH}$",
-            "duste_umin":  r"$U_\mathrm{min}$",
-            "duste_gamma": r"$\gamma_e$",
-            "mass":        r"$\log M_\star$",
-            "logmass":     r"$\log_{10}\,M_\star$",
-        }
-
-        def _param_label(name: str) -> str:
-            if name in _LATEX:
-                return _LATEX[name]
-            for k, v in _LATEX.items():
-                if k in name:
-                    return v
-            safe = name.replace("_", r"\_")
-            return rf"$\theta_{{\mathrm{{{safe}}}}}$"
-
-        def _prior_label(prior) -> str:
-            if prior is None:
-                return "flat"
-            cls = type(prior).__name__
-            p   = prior.params
-            try:
-                if cls in ("Uniform", "TopHat"):
-                    lo = float(p["low"])
-                    hi = float(p["high"])
-                    return rf"$\mathcal{{U}}({lo:.3g},\,{hi:.3g})$"
-                if cls == "Normal":
-                    mu = float(p["mean"])
-                    sg = float(p["sigma"])
-                    return rf"$\mathcal{{N}}({mu:.3g},\,{sg:.3g})$"
-                if cls == "ClippedNormal":
-                    mu = float(p["mean"])
-                    sg = float(p["sigma"])
-                    return rf"$\mathcal{{N}}_c({mu:.3g},\,{sg:.3g})$"
-                if cls == "LogNormal":
-                    return r"$\mathrm{LogNorm}$"
-                if cls == "LogUniform":
-                    lo = float(p["mini"]);  hi = float(p["maxi"])
-                    return rf"$\log\mathcal{{U}}({lo:.3g},\,{hi:.3g})$"
-                if cls == "StudentT":
-                    return r"$\mathrm{Student}\text{-}t$"
-                if "Multivariate" in cls:
-                    d = int(p["mean"].shape[0])
-                    return rf"$\mathcal{{N}}_{{{d}d}}$"
-            except Exception:
-                pass
-            return r"$p(\theta)$"
-
-        def _is_vector(name: str) -> bool:
-            val = self.theta_init.get(name)
-            if val is None:
-                return False
-            shape = getattr(val, "shape", ())
-            return bool(shape) and shape[0] > 1
-
-        def _shape_str(name: str) -> str:
-            val = self.theta_init.get(name)
-            if val is None:
-                return ""
-            shape = getattr(val, "shape", ())
-            if not shape or (len(shape) == 1 and shape[0] == 1):
-                return ""
-            if len(shape) == 1:
-                return rf"$\times\,{shape[0]}$"
-            return str(shape)
-
-        def _obs_dim(obs) -> str:
-            try:
-                n = int(jnp.size(obs.flux))
-                if isinstance(obs, Photometry):
-                    return rf"$n_{{\mathrm{{filt}}}}={n}$"
-                if isinstance(obs, Spectrum):
-                    return rf"$n_{{\mathrm{{pix}}}}={n}$"
-                if isinstance(obs, Lines):
-                    return rf"$n_{{\mathrm{{lines}}}}={n}$"
-                if isinstance(obs, StellarIndices):
-                    return rf"$n_{{\mathrm{{indices}}}}={n}$"
-                # fallback: match by class name substring
-                cls = type(obs).__name__
-                if "Phot" in cls:
-                    return rf"$n_{{\mathrm{{filt}}}}={n}$"
-                if "Spec" in cls:
-                    return rf"$n_{{\mathrm{{pix}}}}={n}$"
-                if "Line" in cls:
-                    return rf"$n_{{\mathrm{{lines}}}}={n}$"
-                return rf"$n={n}$"
-            except Exception:
-                pass
-            return r"$\hat{y}$"
-
-        C["tr_fc"] = "#FFF8E1"
-        C["tr_ec"] = "#E65100"
-        C["arr_tr"] = "#E65100"
-
-        n_p = len(self.param_names)
-        n_o = len(self.observations)
-        has_transforms = bool(self.transforms)
-
-        fw = max(9.0, n_p * 1.10 + 2.0)
-        fh = 8.2 if has_transforms else 7.4
-        if figsize is not None:
-            fw, fh = figsize
-
-        if ax is None:
-            fig = plt.figure(figsize=(fw, fh), facecolor=C["bg"])
-            ax  = fig.add_axes([0.01, 0.01, 0.98, 0.98],
-                               facecolor=C["bg"])
-            _created = True
-        else:
-            fig = ax.get_figure()
-            _created = False
-
-        ax.set_xlim(0, fw)
-        ax.set_ylim(0, fh)
-        ax.set_aspect("equal", adjustable="box")
-        ax.axis("off")
-
-        _tr_shift = 0.8 if has_transforms else 0.0
-        y_prior = fh - 0.80
-        y_param = fh - 2.05
-        y_trans = y_param - 1.15
-        y_sed   = fh / 2.0 + 0.10 + (_tr_shift / 2)
-        y_obs   = 1.90
-        y_data  = 0.62
-
-        r_p  = 0.34
-        r_v  = 0.36
-        r_d  = 0.30
-
-        x0, x1 = fw * 0.07, fw * 0.93
-        x_p = ([fw / 2] if n_p == 1
-                else list(np.linspace(x0, x1, n_p)))
-
-        ox0, ox1 = fw * 0.15, fw * 0.85
-        x_o = ([fw / 2]           if n_o == 1
-               else [fw*0.33, fw*0.67] if n_o == 2
-               else list(np.linspace(ox0, ox1, n_o)))
-
-        x_sed = fw / 2.0
-
-        def circle(x, y, r, fc, ec, lw=1.3, zorder=3, ls="-", alpha=1.0):
-            ax.add_patch(mpatches.Circle(
-                (x, y), r, facecolor=fc, edgecolor=ec,
-                linewidth=lw, zorder=zorder, linestyle=ls, alpha=alpha,
-            ))
-
-        def rect(x, y, w, h, fc, ec, lw=1.6, zorder=3, rr=0.12):
-            ax.add_patch(FancyBboxPatch(
-                (x - w / 2, y - h / 2), w, h,
-                boxstyle=f"round,pad=0,rounding_size={rr}",
-                facecolor=fc, edgecolor=ec,
-                linewidth=lw, zorder=zorder,
-            ))
-
-        def arrow(x1, y1, x2, y2, color, lw=0.9,
-                  style="->", rad=0.0, ls="solid", zorder=2):
-            ax.annotate(
-                "", xy=(x2, y2), xytext=(x1, y1),
-                arrowprops=dict(
-                    arrowstyle=style, color=color, lw=lw,
-                    connectionstyle=f"arc3,rad={rad}",
-                    linestyle=ls,
-                ),
-                zorder=zorder,
-            )
-
-        def txt(x, y, s, ha="center", va="center",
-                fs=9, color="#222222", weight="normal",
-                style="normal", zorder=6, **kw):
-            ax.text(x, y, s, ha=ha, va=va, fontsize=fs, color=color,
-                    fontweight=weight, fontstyle=style,
-                    zorder=zorder, **kw)
-
-        for i, pname in enumerate(self.param_names):
-            xp    = x_p[i]
-            prior = self.priors.get(pname)
-            plbl  = _prior_label(prior)
-            txt(xp, y_prior, plbl, fs=7.5, color="#444444",
-                style="italic" if prior is None else "normal")
-            arrow(xp, y_prior - 0.16,
-                  xp, y_param + (r_v if _is_vector(pname) else r_p) + 0.05,
-                  C["arr_prior"], lw=0.75, ls="dashed")
-
-        for i, pname in enumerate(self.param_names):
-            xp  = x_p[i]
-            vec = _is_vector(pname)
-
-            if vec:
-                circle(xp + 0.06, y_param - 0.06, r_v,
-                       fc=C["vec_fc"], ec=C["vec_ec"],
-                       lw=0.7, zorder=3, alpha=0.7)
-                circle(xp, y_param, r_v,
-                       fc=C["vec_fc"], ec=C["vec_ec"],
-                       lw=1.3, zorder=4)
-                ds = _shape_str(pname)
-                if ds:
-                    txt(xp + r_v + 0.07, y_param + r_v - 0.08,
-                        ds, fs=6.5, color=C["vec_ec"], ha="left",
-                        style="italic")
-            else:
-                circle(xp, y_param, r_p,
-                       fc=C["param_fc"], ec=C["param_ec"], lw=1.3)
-
-            lbl = _param_label(pname)
-            txt(xp, y_param, lbl, fs=8.5 if not vec else 8.0,
-                weight="bold", color="#111111")
-
-        if has_transforms:
-            n_tr    = len(self.transforms)
-            tr_x0   = fw * 0.15
-            tr_x1   = fw * 0.85
-            x_tr    = ([fw / 2] if n_tr == 1
-                       else list(np.linspace(tr_x0, tr_x1, n_tr)))
-            tr_w, tr_h = 1.70, 0.52
-
-            for j, (derived_name, fn) in enumerate(self.transforms.items()):
-                xt  = x_tr[j]
-                fn_name = getattr(fn, "__name__", "fn")
-
-                ax.add_patch(FancyBboxPatch(
-                    (xt - tr_w / 2, y_trans - tr_h / 2), tr_w, tr_h,
-                    boxstyle="round,pad=0,rounding_size=0.08",
-                    facecolor=C["tr_fc"], edgecolor=C["tr_ec"],
-                    linewidth=1.5, zorder=3, linestyle="--",
-                ))
-                txt(xt, y_trans + 0.10,
-                    rf"$\mathtt{{{fn_name}}}$",
-                    fs=7.5, color=C["tr_ec"], weight="bold")
-                txt(xt, y_trans - 0.12,
-                    rf"$\rightarrow$ {derived_name}",
-                    fs=6.5, color="#555555", style="italic")
-
-                for i, pname in enumerate(self.param_names):
-                    xp  = x_p[i]
-                    vec = _is_vector(pname)
-                    r   = r_v if vec else r_p
-                    arrow(xp, y_param - r - 0.03,
-                          xt,  y_trans + tr_h / 2 + 0.05,
-                          C["arr_tr"], lw=0.7, ls="dashed")
-
-                arrow(xt, y_trans - tr_h / 2 - 0.04,
-                      x_sed, y_sed + (max(3.8, min(fw * 0.42, n_p * 0.88))) / 2 * 0.0 + 0.42,
-                      C["tr_ec"], lw=1.0)
-
-        sed_w = max(3.8, min(fw * 0.42, n_p * 0.88))
-        sed_h = 0.84
-
-        rect(x_sed, y_sed, sed_w, sed_h,
-             C["sed_fc"], C["sed_ec"], lw=2.2)
-        rect(x_sed, y_sed, sed_w - 0.13, sed_h - 0.13,
-             "none", C["sed_ec"], lw=0.6, zorder=4)
-
-        txt(x_sed, y_sed + 0.18,
-            r"$f_\nu(\lambda\,;\,\boldsymbol{\theta})$",
-            fs=13, weight="bold", color=C["sed_ec"])
-
-        variant_raw = getattr(
-            getattr(self.csp, "get_spectrum", None), "__name__", "get_spectrum"
-        )
-        _VARIANT_MAP = {
-            "dattn_dem_neb":       "dust  ·  dust-em.  ·  neb.",
-            "dattn_nodem_neb":     "dust  ·  neb.",
-            "dattn_dem_noneb":     "dust  ·  dust-em.",
-            "dattn_nodem_noneb":   "dust  (no neb.)",
-            "nodattn_nodem_neb":   "neb. only",
-            "nodattn_nodem_noneb": "stellar continuum only",
-        }
-        variant_key  = variant_raw.replace("get_spectrum_", "")
-        variant_disp = _VARIANT_MAP.get(
-            variant_key, variant_key.replace("_", " · "))
-        txt(x_sed, y_sed - 0.20,
-            rf"$\mathtt{{get\_spectrum}}(\boldsymbol{{\theta}})$"
-            rf"  ·  {variant_disp}",
-            fs=7.2, color="#2B5F8A", style="italic")
-
-        for i, pname in enumerate(self.param_names):
-            if has_transforms:
-                continue
-            xp   = x_p[i]
-            vec  = _is_vector(pname)
-            r    = r_v if vec else r_p
-            xt   = x_sed + (xp - x_sed) * 0.30
-            arrow(xp, y_param - r - 0.03,
-                  xt,  y_sed + sed_h / 2 + 0.04,
-                  C["arr_fwd"], lw=0.85)
-
-        for j, obs in enumerate(self.observations):
-            xo       = x_o[j]
-            fc, ec  = _obs_colors(obs)
-            ow, oh  = 1.60, 0.64
-
-            if isinstance(obs, Photometry):
-                obs_type_lbl = "Photometry"
-                proj_lbl     = r"$\mathbf{T}_\mathrm{filt}\!\cdot\!f_\nu$"
-            elif isinstance(obs, Spectrum):
-                obs_type_lbl = "Spectrum"
-                proj_lbl     = r"$\mathbf{H}\!\cdot\!f_\nu$"
-            elif isinstance(obs, Lines):
-                obs_type_lbl = "Lines"
-                proj_lbl     = r"$\mathbf{W}\!\cdot\!f_\nu$"
-            elif isinstance(obs, StellarIndices):
-                obs_type_lbl = "Stellar indices"
-                proj_lbl     = r"$\mathcal{I}[f_\lambda]$"
-            else:
-                obs_type_lbl = type(obs).__name__
-                proj_lbl     = r"$\hat{y}$"
-
-            txt(xo, y_obs + oh / 2 + 0.26, proj_lbl,
-                fs=7.5, color=ec, style="italic")
-
-            xt = x_sed + (xo - x_sed) * 0.22
-            arrow(xt, y_sed - sed_h / 2 - 0.04,
-                  xo, y_obs + oh / 2 + 0.05,
-                  ec, lw=1.1)
-
-            rect(xo, y_obs, ow, oh, fc, ec, lw=1.7)
-            txt(xo, y_obs + 0.13, obs_type_lbl,
-                fs=8.5, weight="bold", color=ec)
-            txt(xo, y_obs - 0.13, obs.name,
-                fs=7.0, color="#555555",
-                family="monospace")
-
-            arrow(xo, y_obs - oh / 2 - 0.04,
-                  xo, y_data + r_d + 0.04,
-                  ec, lw=1.1)
-
-            noise_x = xo + r_d + 0.44
-            noise_y = y_data + 0.20
-            txt(noise_x, noise_y, r"$\sigma_k$",
-                fs=8.5, color="#888888")
-            arrow(noise_x - 0.06, noise_y - 0.13,
-                  xo + r_d + 0.04, y_data + 0.05,
-                  "#BBBBBB", lw=0.75)
-
-            circle(xo, y_data, r_d,
-                   fc=C["data_fc"], ec=C["data_ec"], lw=1.5)
-            txt(xo, y_data, _obs_dim(obs),
-                fs=7.2, color=C["data_tc"], weight="bold")
-
-            txt(xo, y_data - r_d - 0.26,
-                rf"$\mathbf{{y}}_\mathrm{{{obs.name}}}$",
-                fs=8, color="#333333", style="italic")
-
-        lg_y  = 0.28
-        lg_r  = 0.13
-        items = [
-            (C["param_fc"], C["param_ec"], r"latent $\theta_i$"),
-            (C["vec_fc"],   C["vec_ec"],   r"vector param"),
-            (C["data_fc"],  C["data_ec"],  r"observed $y_k$"),
-            (C["sed_fc"],   C["sed_ec"],   r"deterministic node"),
-        ]
-        if has_transforms:
-            items.append((C["tr_fc"], C["tr_ec"], r"transform node"))
-        n_leg = len(items)
-        xs_leg = np.linspace(fw * 0.08, fw * 0.70, n_leg)
-        for lx, (lfc, lec, llbl) in zip(xs_leg, items):
-            circle(lx, lg_y, lg_r, fc=lfc, ec=lec, lw=1.0, zorder=5)
-            txt(lx + 0.22, lg_y, llbl,
-                fs=7.5, ha="left", color="#444444")
-        ax.annotate(
-            "", xy=(fw * 0.82, lg_y), xytext=(fw * 0.80, lg_y),
-            arrowprops=dict(
-                arrowstyle="->", color=C["arr_prior"], lw=0.9,
-                linestyle="dashed",
-            ),
-            zorder=5,
-        )
-        txt(fw * 0.83, lg_y, r"stochastic edge",
-            fs=7.5, ha="left", color="#444444")
-
-        n_tr   = len(self.transforms)
-        tr_str = (rf"  ·  ${n_tr}$ transform{'s' if n_tr != 1 else ''}"
-                  if has_transforms else "")
-        ax.set_title(
-            rf"SedModel — ${n_p}$ free parameters  ·  "
-            rf"${n_o}$ observation{'s' if n_o != 1 else ''}{tr_str}",
-            fontsize=9.5, color="#333333", pad=3,
-        )
-
-
-        if return_fig:
-            return fig, ax
-        plt.show()
-        return None
+        """Draw the model: free parameters with their prior densities, the derived and fixed
+        parameters, the forward model's stages in the order they are applied, and the
+        observations; an edge joins each parameter to the transform or stage that reads it
+        (a transform's inputs are traced from its code).  Below, ``predictive`` adds the 68 and
+        95 per cent range of ``n_draws`` prior draws pushed through the model, with the data
+        (it compiles the model once).  With ``ax`` only the diagram is drawn, into it.
+        The figure uses smplotlib's Hershey fonts when smplotlib is installed (``pip install
+        smplotlib``; it is not imported, so other figures keep their style) and a serif face
+        otherwise.  Returns ``(fig, ax)`` when ``return_fig``."""
+        from .describe import display
+        return display(self, ax=ax, figsize=figsize, return_fig=return_fig,
+                       predictive=predictive, n_draws=n_draws, seed=seed, title=title)
 
     def __repr__(self) -> str:
         obs_repr = ", ".join(o.name for o in self.observations)

@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import pprint
 
 from ceridwen.csp.csp import (CSPBasis, LOGZSOL_KEYS, REMOVED_METALLICITY_KEYS,
-                              _check_duste_model, _default_logzsol,
+                              _check_duste_model, _default_logzsol, _per_pixel, _sel,
                               removed_metallicity_key_error, tiny_number)
 from ceridwen.ssps.grid_metadata import logzsol_total as _logzsol_total, refused_cell_bounds
 
@@ -28,7 +28,9 @@ class CSPBasis_afe(CSPBasis):
     Same constructor and interface as ``CSPBasis`` minus the nebular arguments; requires an
     ``SSPDataAfe`` grid (4-D ``ssp_flux`` with an ``ssp_afe`` axis).  theta["afe"] is
     optional: absent, the plane closest to [alpha/Fe] = 0 is used.  The SFH weights,
-    dust, projection, flux factor and cosmology are those of ``CSPBasis``.
+    dust, projection, flux factor and cosmology are those of ``CSPBasis``, and so are
+    ``wavelength_support`` (opt-in) and ``agn`` (see ``CSPBasis``; L_bol and the dust-free
+    galaxy spectrum are taken at theta['afe'] like the flux cube).
 
     Every step-SFH model on a fixed lookback grid pre-contracts the SSP age axis into a
     per-bin SFH basis at construction (:meth:`_configure_sfh_basis_fastpath`); the
@@ -57,10 +59,14 @@ class CSPBasis_afe(CSPBasis):
         sfh_per_bin=False,
         cosmo=None,
         duste_model="DL07",
+        wavelength_support=False,
+        agn=None,
+        fixed=None,
         **kwargs,
     ):
         self.verbose = bool(verbose)
         self.gas_tied = False          # no nebular model on alpha grids
+        self._wave_support = bool(wavelength_support)
         if kwargs:
             hint = ""
             if "sigma_losvd_kms" in kwargs:
@@ -102,11 +108,10 @@ class CSPBasis_afe(CSPBasis):
             )
         init_dust_params = ({'bin_edges': [(-jnp.inf, -1.97)], 'laws': ['powerlaw']}
                             if init_dust_params is None else dict(init_dust_params))
+        if isinstance(fixed, dict) and 'afe' in fixed and 'afe' not in theta:
+            theta = {**theta, 'afe': fixed['afe']}    # afe is a parameter only when given
 
-        # Host NumPy on purpose: jnp.asarray would put the float64 cube on
-        # the device only for the float32 cast below to copy it again. The
-        # cast happens on the host and one float32 cube is uploaded.
-        _flux_in = np.asarray(SSPData.ssp_flux)
+        _flux_in = np.asarray(SSPData.ssp_flux)            # host NumPy (SSPData keeps it there)
         _afe_in  = getattr(SSPData, "ssp_afe", None)
         if _flux_in.ndim != 4 or _afe_in is None:
             raise TypeError(
@@ -134,7 +139,10 @@ class CSPBasis_afe(CSPBasis):
                 "searchsorted-based interpolation in _flux_at_afe); got "
                 f"{np.asarray(_afe_in).tolist()}."
             )
-        self.flux      = jnp.array(_flux_in, dtype=jnp.float32)  # (n_afe, n_z, n_age, n_wave)
+        # the float32 cast on the device (as CSPBasis: XLA's convert) from a transient copy
+        _f64 = jnp.asarray(_flux_in)
+        self.flux      = _f64.astype(jnp.float32)          # (n_afe, n_z, n_age, n_wave)
+        del _f64
         self.afe_grid  = _afe_in                           # (n_afe,) [alpha/Fe]
         self._n_afe    = int(_afe_in.size)
         # the same cube laid out (n_age, n_afe * n_z, n_wave) for _contract: a sampled afe is
@@ -144,6 +152,9 @@ class CSPBasis_afe(CSPBasis):
                 self.flux.shape[2], -1, self.flux.shape[3])))
         self._afe_solar_idx = int(np.argmin(np.abs(np.asarray(_afe_in))))
         self.wave      = jnp.array(SSPData.ssp_wave)       # (n_wave,)
+        # the attenuation curves are evaluated on this float32 copy: the kernels use them in
+        # float32 (the wavelengths that place lines and pixels stay float64, self.wave)
+        self._wave32   = self.wave.astype(jnp.float32)
         self.ages      = jnp.array(SSPData.ssp_lg_age_gyr) # (n_age,)  log10(Gyr)
         self._setup_metallicity(SSPData)                   # self.zmet: logzsol axis
         self.lib_resolution = (
@@ -220,6 +231,7 @@ class CSPBasis_afe(CSPBasis):
         self.configure_spectrum_model(
             add_dust, add_diffuse_dust, add_dust_emission, sps_home
         )
+        theta = self._install_agn(agn, theta, SSPData, add_dust_emission, sps_home)
 
         if sfh_interp not in ('step', 'linear'):
             raise ValueError(
@@ -243,6 +255,7 @@ class CSPBasis_afe(CSPBasis):
             print(f"SFH integration scheme : {sfh_interp}")
 
         self.initialize_model_structure(theta)
+        self._set_fixed(fixed)
         self._configure_sfh_basis_fastpath()
 
         if verbose:
@@ -299,16 +312,16 @@ class CSPBasis_afe(CSPBasis):
         self.sfh_basis_fastpath = True
         return self
 
-    def _sfh_basis_table(self, wave):
-        """``_sfh_basis`` on the model wavelengths ``wave`` (a static slice)
-        as ``(table, rows)``: ``table[afe, z, rows[g, n]]`` is the basis
+    def _sfh_basis_table(self, support=None):
+        """``_sfh_basis`` on the model pixels ``support`` (a static slice; None = the whole
+        grid) as ``(table, rows)``: ``table[afe, z, rows[g, n]]`` is the basis
         spectrum of group ``g`` and bin ``n``.  The table holds the nonzero
         ``(g, n)`` spectra once, plus one zero row that the empty ones share
         (the birth-cloud group has ages in the first bin only).  Cached per
         slice."""
-        key = (wave.start, wave.stop)
+        key = None if support is None else (support.start, support.stop)
         if key not in self._sfh_basis_tables:
-            basis = np.asarray(self._sfh_basis)[..., wave]
+            basis = _sel(np.asarray(self._sfh_basis), support)
             nonzero = np.any(basis != 0, axis=(0, 1, 4))
             group, bin_ = np.nonzero(nonzero)
             rows = np.full(nonzero.shape, group.size)
@@ -409,15 +422,15 @@ class CSPBasis_afe(CSPBasis):
             )
         return afe_lo, afe_hi, afe_weight, z_lo, z_hi, z_weight
 
-    def _spectrum_from_sfh_basis(self, theta, wave=slice(None)):
+    def _spectrum_from_sfh_basis(self, theta, support=None):
         """Unattenuated spectrum of each basis age group, ``(n_group, n_wave)``,
-        on the model wavelengths ``wave`` (a static slice)."""
+        on the model pixels ``support`` (a static slice; None = the whole grid)."""
         sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
         sfh_bin = sfh if self.sfh_per_bin else 0.5 * (sfh[:-1] + sfh[1:])
         afe_lo, afe_hi, afe_weight, z_lo, z_hi, z_weight = self._sfh_basis_coords(theta)
         afe_weight = afe_weight.astype(jnp.float32)
         z_weight = z_weight.astype(jnp.float32)
-        table, rows = self._sfh_basis_table(wave)
+        table, rows = self._sfh_basis_table(support)
 
         if self.zh_const:
             def corner(afe, z):
@@ -450,6 +463,7 @@ class CSPBasis_afe(CSPBasis):
                     stacklevel=3,
                 )
         self._known_theta_keys = (self._known_theta_keys | {'afe'}) - {'eline_scaling'}
+        self._apply_fixed()
 
     def check_param_ranges(self, theta=None, warn=True):
         """``CSPBasis.check_param_ranges`` plus theta['afe'] against the [alpha/Fe] grid."""
@@ -531,15 +545,16 @@ class CSPBasis_afe(CSPBasis):
         w32  = w.astype(jnp.float32)
         return (jnp.float32(1.0) - w32) * f_lo + w32 * f_hi
 
-    def _contract(self, theta, weights, attn_age=None):
+    def _contract(self, theta, weights, attn_age=None, support=None):
         """sum_{z,a} weights[z,a] flux_afe[z,a,w] (* attn_age[a,w]) with flux_afe the cube at theta['afe'].
 
         Equal to contracting ``_flux_at_afe(theta)`` up to float32 rounding, without building
         that plane: a sampled afe becomes the two-hot vector wa = (1-w) e_{k-1} + w e_k over
         the n_afe axis, folded into the weights and contracted against ``_flux_afe_t`` in one
-        einsum.  Memory stays O(n_z n_age + n_wave) per sample under vmap (B1-022)."""
+        einsum.  Memory stays O(n_z n_age + n_wave) per sample under vmap (B1-022).
+        ``support`` (static slice): those model pixels only (``attn_age`` on them too)."""
         if self._n_afe == 1 or "afe" not in theta:
-            flux = self._flux_at_afe(theta)
+            flux = _sel(self._flux_at_afe(theta), support)
             if attn_age is None:
                 return jnp.einsum("za,zaw->w", weights, flux)
             return jnp.einsum("za,zaw,aw->w", weights, flux, attn_age)
@@ -550,9 +565,10 @@ class CSPBasis_afe(CSPBasis):
               + jnp.where(idx == k, w32, jnp.float32(0.0)))             # (n_afe,)
         wk = (wa[:, None, None] * weights[None]).transpose(2, 0, 1).reshape(
             weights.shape[1], -1)                                        # (n_age, n_afe * n_z)
+        flux_t = _sel(self._flux_afe_t, support)
         if attn_age is None:
-            return jnp.einsum("ak,akw->w", wk, self._flux_afe_t)
-        return jnp.einsum("ak,akw,aw->w", wk, self._flux_afe_t, attn_age)
+            return jnp.einsum("ak,akw->w", wk, flux_t)
+        return jnp.einsum("ak,akw,aw->w", wk, flux_t, attn_age)
 
     def _stellar_mass_at(self, theta):
         """(n_z, n_age) surviving-mass table at theta['afe'], interpolated as ``_flux_at_afe``."""
@@ -563,6 +579,20 @@ class CSPBasis_afe(CSPBasis):
             return m[self._afe_solar_idx]
         k, w = self._afe_coords(theta)
         return (1.0 - w) * jnp.take(m, k - 1, axis=0) + w * jnp.take(m, k, axis=0)
+
+    def _agn_lbol_at(self, theta):
+        """(n_z, n_age) dust-free bolometric table at theta['afe'], interpolated as ``_flux_at_afe``."""
+        L = self._agn_lbol
+        if self._n_afe == 1:
+            return L[0]
+        if "afe" not in theta:
+            return L[self._afe_solar_idx]
+        k, w = self._afe_coords(theta)
+        return (1.0 - w) * jnp.take(L, k - 1, axis=0) + w * jnp.take(L, k, axis=0)
+
+    def _dustfree_stellar(self, theta, W):
+        """(n_wave,) dust-free stellar spectrum at theta['afe'] (``_contract``)."""
+        return self._contract(theta, W.astype(jnp.float32))
 
     def configure_spectrum_model(
         self, add_dust, add_diffuse_dust, add_dust_emission, sps_home
@@ -591,55 +621,12 @@ class CSPBasis_afe(CSPBasis):
         if self.verbose:
             print(f"Spectrum model: {label[key]}")
         self.get_spectrum = mapping[key]
-        # Every model pixel is independent unless dust emission (energy balance)
-        # mixes wavelengths.
-        self._spectrum_on_support = key != 'dust_noneb_dustemi'
 
     def get_spectrum_components(self, theta: dict) -> tuple:
         """``(continuum, zeros)``: no nebular model, so the line component is identically zero."""
         self._warn_unknown_theta_keys(theta)
         continuum = self.get_spectrum(theta=theta, include_lines=False)
         return continuum, jnp.zeros_like(continuum)
-
-    def _observation_support(self, observations, theta, kinematics, broaden_photometry):
-        """Static slice of the model grid that ``observations`` read, or ``slice(None)``
-        when the spectrum cannot be computed on a part: an observation without
-        ``model_support``, a free-z observation with ``zred`` in theta, dust emission,
-        an IGM, kinematic broadening of the photometry, or the general (non-SFH-basis)
-        path."""
-        ranges = [obs.model_support for obs in observations]
-        free_z = "zred" in theta and any(
-            getattr(obs, "free_z", False) for obs in observations)
-        if (not self._spectrum_on_support or not self._use_sfh_basis(theta)
-                or not ranges or any(r is None for r in ranges) or free_z
-                or self.igm is not None
-                or (kinematics is not None and broaden_photometry)):
-            return slice(None)
-        return slice(min(r[0] for r in ranges), max(r[1] for r in ranges))
-
-    def predict(self, theta: dict, observations: list, *, kinematics=None,
-                broaden_photometry=False, eline_system=None) -> dict:
-        """``CSPBasis.predict``, with the spectrum synthesised only on the model
-        wavelengths the observations read (:meth:`_observation_support`) and zero
-        elsewhere."""
-        support = self._observation_support(
-            observations, theta, kinematics, broaden_photometry)
-        if support == slice(None):
-            return super().predict(theta, observations, kinematics=kinematics,
-                                   broaden_photometry=broaden_photometry,
-                                   eline_system=eline_system)
-        if kinematics is not None:
-            self._known_theta_keys |= set(kinematics.free_keys)
-        self._warn_unknown_theta_keys(theta)
-        cont = self.get_spectrum(theta=theta, include_lines=False, wave=support)
-        cont, _ = self._apply_mass_redshift_igm(cont, cont, theta, igm=False)
-        # Zero the unread pixels only after the scaling: XLA CPU (jax 0.11.1)
-        # returns zeros for a pad inside that fusion.
-        cont = jnp.pad(cont, (support.start, len(self.wave) - support.stop))
-        return self._project_observations(
-            cont, cont, observations, theta, paint_lines=False,
-            kinematics=kinematics, broaden_photometry=broaden_photometry,
-            eline_system=eline_system)
 
     def _project_observations(self, spectrum_phot, spectrum_slit,
                               observations, theta, **kw):
@@ -682,21 +669,20 @@ class CSPBasis_afe(CSPBasis):
             lines.append(f"  {k:<28s}: shape {v.shape}")
         return "\n".join(lines)
 
-    def get_spectrum_dattn_nodem_noneb(self, theta, *, include_lines=None,
-                                       wave=slice(None)):
-        """Dust attenuation only (``include_lines`` ignored), on the model wavelengths
-        ``wave`` (a static slice)."""
+    @_per_pixel
+    def get_spectrum_dattn_nodem_noneb(self, theta, *, include_lines=None, support=None):
+        """Dust attenuation only (``include_lines`` ignored); ``support``: those pixels only."""
         _ = include_lines
+        attn, attn_diffuse = self.attenuate_dust(_sel(self._wave32, support), theta)
+
         if self._use_sfh_basis(theta):
-            attn, attn_diffuse = self.attenuate_dust(self.wave[wave], theta)
-            groups = self._spectrum_from_sfh_basis(theta, wave)
+            groups = self._spectrum_from_sfh_basis(theta, support)
             if self._has_age_dependent_dust:
                 groups = groups * self._dust_group_attenuation(attn, theta)
             spectrum = groups.sum(axis=0)
             spectrum *= jnp.exp(-attn_diffuse.astype(jnp.float32))
             return spectrum.reshape((-1,))
 
-        attn, attn_diffuse = self.attenuate_dust(self.wave, theta)
         M       = self._age_bin_mix
         tau_age = jnp.einsum("ab,bw->aw", M, attn.astype(jnp.float32))
         attn_age= jnp.exp(-tau_age)
@@ -706,15 +692,15 @@ class CSPBasis_afe(CSPBasis):
             attn_age = (jnp.float32(1.0) - fo) * attn_age + fo
 
         weights  = self.calculate_ssp_weights(theta).astype(jnp.float32)
-        spectrum = self._contract(theta, weights, attn_age)
+        spectrum = self._contract(theta, weights, attn_age, support)
         spectrum *= jnp.exp(-attn_diffuse.astype(jnp.float32))
 
-        return spectrum.reshape((-1,))[wave]
+        return spectrum.reshape((-1,))
 
     def get_spectrum_dattn_dem_noneb(self, theta, *, include_lines=None):
         """Dust attenuation + dust emission (``include_lines`` ignored)."""
         _ = include_lines
-        attn, attn_diffuse = self.attenuate_dust(self.wave, theta)
+        attn, attn_diffuse = self.attenuate_dust(self._wave32, theta)
         diffuse_curve = jnp.exp(-attn_diffuse.astype(jnp.float32))
 
         if self._use_sfh_basis(theta):
@@ -748,11 +734,11 @@ class CSPBasis_afe(CSPBasis):
         )
         return dust_emi_spectrum
 
-    def get_spectrum_nodattn_nodem_noneb(self, theta, *, include_lines=None,
-                                         wave=slice(None)):
-        """Stellar continuum only, on the model wavelengths ``wave`` (a static slice)."""
+    @_per_pixel
+    def get_spectrum_nodattn_nodem_noneb(self, theta, *, include_lines=None, support=None):
+        """Stellar continuum only; ``support``: those pixels only."""
         _ = include_lines
         if self._use_sfh_basis(theta):
-            return self._spectrum_from_sfh_basis(theta, wave).sum(axis=0)
+            return self._spectrum_from_sfh_basis(theta, support).sum(axis=0)
         weights  = self.calculate_ssp_weights(theta=theta).astype(jnp.float32)
-        return self._contract(theta, weights)[wave]
+        return self._contract(theta, weights, support=support)

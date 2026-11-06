@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-jax.config.update("jax_enable_x64", True)
+import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -56,7 +56,7 @@ def setup():
               "logmass": Uniform(low=9.0, high=12.0),
               "diffuse_tau_kc": ClippedNormal(mean=0.3, sigma=1.0, low=0.0, high=4.0),
               "diffuse_dust_index": Uniform(low=-1.0, high=0.4),
-              "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=1.0),
+              "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=0.3),
               "sigma_gal": Uniform(low=50.0, high=400.0)}
     kin = Kinematics(sigma_gal="sigma_gal")
 
@@ -315,3 +315,34 @@ def test_old_file_without_cloudy_dust_means_the_dusty_grid(setup, tmp_path):
         rebuild_model(path, csp_nd, setup["observations"](), transforms={"sfh": setup["sfh"]})
     csp_wd, m_wd = neb_model(True)
     assert check_model_against_result(m_wd, path).ok
+
+
+@needs_grid
+def test_float32_mode_loads_lnl_and_weights_as_float64(setup, tmp_path):
+    """``load_result_h5`` keeps ln L, its birth contour and the weights float64 on the host in
+    float32 mode, as ``run_sampler`` returns them; float32 resolves ln L ~ 4e4 only to 4e-3,
+    which moved the recomputed posterior weights and raised PostProcess's misalignment warning."""
+    import os
+    import subprocess
+    import h5py
+    path = _write(setup["build"](), tmp_path / "f32.h5")
+    lnl = 38183.7328 + np.array([0.0, 1e-3, 2e-3])
+    with h5py.File(path, "r+") as f:
+        for name, val in (("log_likelihoods", lnl), ("log_likelihoods_birth", lnl - 1.0),
+                          ("log_weights", np.log([0.2, 0.3, 0.5]))):
+            if name in f["samples"]:
+                del f["samples"][name]
+            f["samples"].create_dataset(name, data=val)
+    code = ("import sys, numpy as np, ceridwen\n"
+            "from ceridwen import load_result_h5\n"
+            "assert not ceridwen.precision.is_x64()\n"
+            "r = load_result_h5(sys.argv[1])\n"
+            "for k in ('log_likelihoods', 'log_likelihoods_birth', 'log_weights'):\n"
+            "    print(k, np.asarray(getattr(r, k)).dtype, repr(np.asarray(getattr(r, k)).tolist()))\n")
+    env = dict(os.environ, CERIDWEN_X64="0", JAX_PLATFORMS="cpu")
+    out = subprocess.run([sys.executable, "-c", code, str(path)], env=env, capture_output=True,
+                         text=True, check=True).stdout.splitlines()
+    got = {line.split()[0]: line.split(maxsplit=2)[1:] for line in out}
+    assert all(dt == "float64" for dt, _ in got.values()), got
+    np.testing.assert_array_equal(eval(got["log_likelihoods"][1]), lnl)
+    np.testing.assert_array_equal(eval(got["log_likelihoods_birth"][1]), lnl - 1.0)

@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-jax.config.update("jax_enable_x64", True)
+import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 
 from ceridwen.ssps.ssp_data import SSPData
 from ceridwen.csp.csp     import CSPBasis
@@ -100,15 +100,19 @@ def _build_theta_new(zh_const: bool, per_bin: bool):
     return theta
 
 
-def _build_csp(ssp, theta, *, sfh_interp, zh_const):
+def _build_csp(ssp, theta, *, sfh_interp, zh_const, agn=None, **over):
+    kw = dict(add_dust=False, add_diffuse_dust=False, add_dust_emission=False)
+    kw.update(over)
+    if agn is not None:
+        from ceridwen.agn import AGNConfig
+        agn = AGNConfig(**agn)
     return CSPBasis(
         ssp,
         theta             = theta,
         cosmo             = Cosmology.planck18(),   # the pre-2026-09-03 default
         zh_const          = zh_const,
-        add_dust          = False,
-        add_diffuse_dust  = False,
-        add_dust_emission = False,
+        agn               = agn,
+        **kw,
         add_neb           = True,
         init_neb_params   = {"cloudy_dust": True},   # the grid the goldens were captured with
         nebemlineinspec   = True,
@@ -127,27 +131,45 @@ def _photometry():
     )
 
 
+def _maggies(csp, theta):
+    """The model's photometry of the five SDSS bands, as a fit computes it (``csp.predict``: the
+    exact filter integral and each line's flux through the filters), at theta's redshift."""
+    phot = _photometry()
+    phot.setup_for_model(csp.wave, zred=float(np.ravel(np.asarray(theta.get("zred", [0.0])))[0]))
+    return np.asarray(csp.predict(theta, [phot])[phot.name])
+
+
+# AGN and fixed= configs (tests/baselines/_capture.py --agn / --fixed) carry "agn" (AGNConfig
+# kwargs or None), "csp" (CSPBasis overrides) and "theta" (AGN / dust / zred values)
 CONFIGS = [(c["sfh_interp"], c["zh_const"], c["per_bin"], c["tag"])
            for c in MANIFEST["configs"]]
+_EXTRA = {c["tag"]: c for c in MANIFEST["configs"] if "agn" in c or "csp" in c}
 
 
 @pytest.mark.parametrize("sfh_interp,zh_const,per_bin,tag", CONFIGS)
 def test_lookback_flip_invariant(ssp, sfh_interp, zh_const, per_bin, tag):
+    extra = _EXTRA.get(tag, {})
+    if extra.get("data"):                       # AGN2 configs: converted $CERIDWEN_AGN_DATA tables
+        from ceridwen.agn.skirtor import default_skirtor_path
+        root = pathlib.Path(default_skirtor_path()).parent
+        missing = [n for n in extra["data"] if not (root / n).exists()]
+        if missing:
+            pytest.skip(f"MISSING {root}/{missing}: golden {tag} did NOT run")
     theta = _build_theta_new(zh_const, per_bin)
-    csp   = _build_csp(ssp, theta, sfh_interp=sfh_interp, zh_const=zh_const)
-    phot  = _photometry()
+    csp   = _build_csp(ssp, theta, sfh_interp=sfh_interp, zh_const=zh_const,
+                       agn=extra.get("agn"), **extra.get("csp", {}))
 
     theta_full = {k: jnp.asarray(v) for k, v in csp.theta_init.items()}
     theta_full.setdefault("logmass",       jnp.zeros(1))
     theta_full.setdefault("zred",          jnp.zeros(1))
     theta_full.setdefault("igm_factor",    jnp.ones(1))
     theta_full.setdefault("eline_scaling", jnp.ones(1))
+    theta_full.update({k: jnp.array([v]) for k, v in extra.get("theta", {}).items()})
 
     W_new       = np.asarray(csp.calculate_ssp_weights(theta_full))
     spec_new    = np.asarray(csp.get_spectrum(theta_full))
     lines_new   = np.asarray(csp.get_line_spec(theta_full))
-    spec_phot = csp._apply_mass_redshift_igm(*csp._assemble_observer_spectra(theta_full), theta_full)[0]
-    maggies_new = np.asarray(phot.get_maggies(csp.wave, spec_phot))
+    maggies_new = _maggies(csp, theta_full)
 
     W_ref       = np.load(BASELINES / f"W_{tag}.npy")
     spec_ref    = np.load(BASELINES / f"spec_{tag}.npy")

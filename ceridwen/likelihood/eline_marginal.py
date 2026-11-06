@@ -36,6 +36,8 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import cho_solve, solve_triangular
 
+from ..precision import float_dtype
+
 __all__ = ["ElineSystem", "build_eline_system", "eline_marginal_loglike",
            "eline_marginal_loglike_static",
            "joint_loglike", "eline_line_fluxes", "line_table_for", "line_profiles_on_grid",
@@ -63,7 +65,7 @@ def eline_marginal_loglike(blocks, prior_mean, prior_sd, is_flat, *, return_post
     Returns ln Z, or ``(ln Z, mean, cov)`` of the line-flux posterior with ``return_posterior``.
     """
     is_flat = np.asarray(is_flat, dtype=bool)
-    prior = jnp.asarray(~is_flat, dtype=jnp.float64)
+    prior = jnp.asarray(~is_flat, dtype=float_dtype())
     abar = jnp.where(is_flat, 0.0, prior_mean)
     M = 0.0
     b = 0.0
@@ -77,7 +79,7 @@ def eline_marginal_loglike(blocks, prior_mean, prior_sd, is_flat, *, return_post
         chi2 = chi2 + jnp.sum(w * r1 * r1)
         lognorm = lognorm + log_det_sum
     diag = jnp.diagonal(M)
-    tiny = jnp.finfo(jnp.float64).tiny
+    tiny = jnp.finfo(float_dtype()).tiny
     d = jnp.where(is_flat, 1.0 / jnp.sqrt(jnp.maximum(diag, tiny)), prior_sd)
     P = d[:, None] * M * d[None, :] + jnp.diag(prior)
     L = jnp.linalg.cholesky(P)
@@ -199,16 +201,16 @@ def line_table_for(csp) -> dict:
     return {"wave": np.asarray(wave, dtype=np.float64), "names": names}
 
 
-def line_profiles_on_grid(wave, pos, sigma_kms=0.0, res_floor_factor=2.0):
+def line_profiles_on_grid(wave, pos, sigma_kms=0.0, res_floor_fwhm_px=2.0):
     """(n_wave, n_line) f_nu profiles of unit-luminosity lines at ``pos`` on the model grid
     ``wave``, exactly as ``NebularModel.line_profiles(sigma_kms)`` builds them (default
     NebularModel settings: smooth_velocity, sigma_smooth = 0): a Gaussian in lambda of width
-    sqrt(floor^2 + (pos sigma/c)^2), floor = res_floor_factor x the local pixel width."""
-    from ..neb.NebularGridModel import CLIGHT_AA_S, SQRT_2PI
+    sqrt(floor^2 + (pos sigma/c)^2), floor = res_floor_fwhm_px x the local pixel width / 2.355."""
+    from ..neb.NebularGridModel import CLIGHT_AA_S, SQRT_2PI, FWHM_PER_SIGMA
     lam = np.asarray(wave, dtype=np.float64)
     pos = np.asarray(pos, dtype=np.float64)
     idx = np.clip(np.searchsorted(lam, pos, side="right") - 1, 1, lam.size - 2)
-    floor = (lam[idx + 1] - lam[idx]) * res_floor_factor
+    floor = (lam[idx + 1] - lam[idx]) * res_floor_fwhm_px / FWHM_PER_SIGMA
     base = pos * 0.0 / CLIGHT_AA_S * 1.0e13
     dl0 = np.maximum(base, floor)
     dl = np.sqrt(dl0 ** 2 + (pos * float(sigma_kms) / CLIGHT_AA_S * 1.0e13) ** 2)
@@ -238,6 +240,38 @@ def refuse_without_grid(csp, spec, observations):
             "the Lines observation or build the basis with add_neb=True")
 
 
+def _agn_lines_on(csp) -> bool:
+    """True when the basis carries AGN narrow lines (an ``AGNModel`` with lines, or an
+    ``AGNConfig`` that switches them on), under whatever attribute the CSP keeps it."""
+    from ..agn import AGNConfig, AGNModel
+    hook = getattr(csp, "_agn", None)              # CSPBasis(agn=AGNConfig(...)): an AGNHook
+    if getattr(getattr(hook, "model", None), "lines", None) is not None:
+        return True
+    if getattr(getattr(hook, "model", None), "blr", None) is not None:      # AGN2 broad lines
+        return True
+    for v in getattr(csp, "__dict__", {}).values():
+        if isinstance(v, AGNModel) and (v.lines is not None or v.blr is not None):
+            return True
+        if isinstance(v, AGNConfig) and v.use_any_lines:
+            return True
+    return False
+
+
+def refuse_with_agn_lines(csp, spec):
+    """Setup-time refusal: line marginalisation together with AGN narrow lines (Prospector's
+    ``AGNSpecModel`` asserts the same: "Cannot fit lines when AGN lines included")."""
+    if _agn_lines_on(csp):
+        raise ValueError(
+            f"Spectrum {spec.name!r}: marginalize_elines=True with AGN narrow lines "
+            "(AGNConfig(lines=...) on): the marginalisation frees the flux of every fitted line, "
+            "so an AGN line on top of a nebular line at the same wavelength is degenerate with it "
+            "and agn_elum would be constrained by nothing but the lines outside the fit. "
+            "Prospector refuses this too (AGNSpecModel: 'Cannot fit lines when AGN lines "
+            "included'). Either keep the AGN lines and fit the lines at their CLOUDY + AGN "
+            "fluxes (marginalize_elines=False), or marginalise and switch the AGN lines off, "
+            "AGNConfig(..., lines=False): the fitted line fluxes then absorb the AGN emission")
+
+
 def build_eline_system(model) -> Optional[ElineSystem]:
     """Validate the configuration and build the ``ElineSystem`` (None when no Spectrum
     marginalises its lines).  Every refusal happens here, at setup, never in a kernel."""
@@ -255,6 +289,7 @@ def build_eline_system(model) -> Optional[ElineSystem]:
             f"({[o.name for o in specs]}); only one marginalising Spectrum is supported")
     spec = specs[0]
     csp = model.csp
+    refuse_with_agn_lines(csp, spec)
     neb = getattr(csp, "neb", None)
     has_grid = neb is not None
     if neb is None:
@@ -277,13 +312,14 @@ def build_eline_system(model) -> Optional[ElineSystem]:
                 stacklevel=3)
     fitted_neb = sorted(set(getattr(csp, "neb_param_names", [])) & set(model.param_names))
     if fitted_neb:
+        fixed = ", ".join(f'"{k}": ...' for k in fitted_neb)
         example = ", ".join(f'"{k}": lambda th: jnp.array([...])' for k in fitted_neb)
         raise ValueError(
             f"marginalize_elines=True with the nebular parameter(s) {fitted_neb} sampled: with "
             "the line fluxes marginalised the lines no longer constrain the nebular model, so "
-            "it must not be fitted. Fix them with a constant transform, "
-            f"SedModel(..., transforms={{{example}}}) (and drop their priors), or fit the "
-            "lines at their CLOUDY fluxes instead")
+            f"it must not be fitted. Fix them on the CSP, CSPBasis(..., fixed={{{fixed}}}), or "
+            f"with a constant transform, SedModel(..., transforms={{{example}}}) (and drop "
+            "their priors), or fit the lines at their CLOUDY fluxes instead")
     phots = [o for o in model.observations if isinstance(o, Photometry)]
     lines_obs = [o for o in model.observations if isinstance(o, Lines)]
     for o in phots + lines_obs:
@@ -293,17 +329,6 @@ def build_eline_system(model) -> Optional[ElineSystem]:
                 f"observation {o.name!r} has upper limits; the joint line marginalisation "
                 "is Gaussian and cannot include one-sided data")
     gas = model.kinematics.effective_sigma_gas
-    if phots and model.zred_is_free:
-        raise NotImplementedError(
-            "marginalize_elines=True with Photometry and a sampled zred: the photometric line "
-            "contribution is then painted on the model grid, which the joint marginalisation "
-            "does not support yet. Fix zred, or fit the spectrum without the photometry")
-    if phots and isinstance(gas, str) and model.broaden_photometry:
-        raise NotImplementedError(
-            "marginalize_elines=True with Photometry, a sampled sigma_gas and "
-            "broaden_photometry=True: the photometric lines are then painted on the model grid, "
-            "which the joint marginalisation does not support yet. Fix sigma_gas, or use "
-            "broaden_photometry=False")
 
     proj = spec._proj
     kept = np.asarray(proj.line_idx, dtype=np.int64)
@@ -375,18 +400,14 @@ def build_eline_system(model) -> Optional[ElineSystem]:
                | (np.abs(wave_rest - LYA_REST_AA) < 1.0))
 
     zfix = float(model.zred)
-    phot_cols = {}
-    for o in phots:
-        if has_grid:
-            basis = getattr(o, "_line_basis", None)
-            gnb = np.asarray(basis if basis is not None else neb.gaussnebarr,
-                             dtype=np.float64)[:, fit_rows]
-        else:           # the same profiles NebularModel.line_profiles gives (setup_broadening)
-            s_phot = (float(gas) if (model.broaden_photometry and not isinstance(gas, str)
-                                     and float(gas) > 0.0) else 0.0)
-            gnb = line_profiles_on_grid(np.asarray(csp.wave), pos[fit_rows], s_phot)
-        T = np.asarray(o._T, dtype=np.float64)
-        phot_cols[o.name] = (1.0 + zfix) * (T @ gnb)
+    # maggies per unit line flux: each line's flux through each filter, as the photometry adds
+    # it (Photometry._line_photometry): delta lines, or Gaussians of the fixed gas width; with a
+    # sampled redshift or gas width CSPBasis.predict evaluates them per call instead
+    from ..observation.line_photometry import line_weights, CKMS
+    s_phot = (float(gas) if (model.broaden_photometry and not isinstance(gas, str)) else 0.0)
+    lam_obs = pos[fit_rows] * (1.0 + zfix)
+    phot_cols = {o.name: line_weights(o.filterset, lam_obs, lam_obs * s_phot / CKMS)
+                 for o in phots}
     lines_cols = {}
     for o in lines_obs:
         B = csp._neb_blend_matrix_for(o)
@@ -470,13 +491,13 @@ def eline_marginal_loglike_static(r, st, prior_mean, prior_sd, is_flat):
         chi2 = sum(jnp.sum(jnp.asarray(st["w"][k]) * r[k] * r[k]) for k in keys)
         v = sum(jnp.asarray(st["G"][k]) @ r[k] for k in keys)
         return -0.5 * chi2 + 0.5 * jnp.dot(v, v) + st["const"] - st["lognorm"]
-    prior = jnp.asarray(~is_flat, dtype=jnp.float64)
+    prior = jnp.asarray(~is_flat, dtype=float_dtype())
     abar = jnp.where(is_flat, 0.0, prior_mean)
     r1 = {k: r[k] - jnp.asarray(st["A"][k]) @ abar for k in keys}
     chi2 = sum(jnp.sum(jnp.asarray(st["w"][k]) * r1[k] * r1[k]) for k in keys)
     b = sum(jnp.asarray(st["B"][k]) @ r1[k] for k in keys)
     M = jnp.asarray(st["M"])
-    d = jnp.where(is_flat, 1.0 / jnp.sqrt(jnp.maximum(jnp.diagonal(M), jnp.finfo(jnp.float64).tiny)),
+    d = jnp.where(is_flat, 1.0 / jnp.sqrt(jnp.maximum(jnp.diagonal(M), jnp.finfo(float_dtype()).tiny)),
                   prior_sd)
     L = jnp.linalg.cholesky(d[:, None] * M * d[None, :] + jnp.diag(prior))
     v = solve_triangular(L, d * b, lower=True)

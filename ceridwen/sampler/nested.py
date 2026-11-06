@@ -18,16 +18,20 @@ from .priors import sample_for_parameter
 
 Array = jax.Array
 
+#: inner slice kernels of :class:`BlackJAXNestedSamplerAdapter` (``slice_kernel=``)
+SLICE_KERNELS = ("stock", "carry", "lanes")
+
 
 def stepping_out_carry(rng_key, in_slice, width, max_expansions):
     """Neal (2003) Fig. 3 stepping-out with the slice test in the loop body.
 
-    Drop-in for ``blackjax.mcmc.slice.stepping_out``: same random numbers,
-    same sequence of ``in_slice`` evaluations, bitwise-equal bracket.  The
-    stock loops call ``in_slice`` in their condition, and a vmapped
-    ``lax.while_loop`` evaluates the condition a second time inside its
-    body, so every expansion costs two batched likelihood evaluations.
-    Here the body evaluates the new edge once and carries the result.
+    Drop-in for ``blackjax.mcmc.slice.stepping_out``: same random numbers, same sequence of
+    ``in_slice`` evaluations, bitwise-equal bracket.  The stock loops call ``in_slice`` in
+    their condition, and a vmapped ``lax.while_loop`` evaluates the condition a second time
+    inside its body, so every expansion costs two batched likelihood evaluations.  Here the
+    body evaluates the new edge once and carries the result.
+
+    By Liu Hao (@potatoist314).
     """
     u_key, jk_key = jax.random.split(rng_key)
     u = jax.random.uniform(u_key)
@@ -96,23 +100,30 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
     proposals of a slice step in advance: their key moves once per
     proposal, whatever its outcome) and every candidate is evaluated with
     the same arithmetic in a batch of ``num_delete``, so the new particles
-    and the per-step ``SliceInfo`` are bitwise equal to those of
-    ``blackjax.nss``.
+    and the per-step ``SliceInfo`` equal those of ``blackjax.nss``: bitwise on
+    Apple-silicon CPUs, to the last bits on x86 (where XLA orders the batched
+    arithmetic differently).
 
     Drop-in for ``blackjax.ns.from_mcmc.update_with_mcmc_take_last`` applied
     to ``blackjax.ns.nss.slice_constrained_step`` with the stepping-out
     interval and the covariance proposal.  Returns the ``num_delete`` new
     particles and a ``SliceInfo`` of shape ``(num_delete, num_inner_steps)``.
+
+    By Liu Hao (@potatoist314).
     """
     from functools import partial
     from blackjax.mcmc.slice import SliceInfo
     from blackjax.ns.base import init_state_strategy
-    from blackjax.ns.nss import sample_direction_from_covariance
+    from blackjax.ns import nss as _nss
 
     depth = free_moves + lookahead   # candidates looked at per lane and round
     slots = 2 * lookahead            # stored results per lane
 
-    def update_function(rng_key, state, loglikelihood_0, cov):
+    def update_function(rng_key, state, loglikelihood_0, cov=None, covariance_factor=None):
+        # the proposal's live-point covariance as blackjax's nss provides it: blackjax 1.6 passes
+        # ``cov``; 1.7 passes its Cholesky factor once per outer step (``covariance_factor``,
+        # directions 2 L z / ||z||, the same draw as 1.6's MVN(0, cov) up to rounding). The lane
+        # samples its directions with the same blackjax function as the stock kernel, either way.
         choice_key, sample_key = jax.random.split(rng_key)
         particles = state.particles
         evaluate = jax.vmap(partial(init_state_strategy, logprior_fn=logprior_fn,
@@ -133,8 +144,11 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
                 # The random numbers of one slice step: blackjax.mcmc.slice
                 # build_kernel, _univariate_slice and stepping_out.
                 prop_key, slice_key = jax.random.split(key)
-                direction, _ = ravel_pytree(sample_direction_from_covariance(
-                    prop_key, position, cov))
+                direction, _ = ravel_pytree(
+                    _nss.sample_direction_from_covariance_factor(
+                        prop_key, position, covariance_factor)
+                    if covariance_factor is not None else
+                    _nss.sample_direction_from_covariance(prop_key, position, cov))
                 level_key, interval_key, shrink_key = jax.random.split(slice_key, 3)
                 log_u = jnp.log(jax.random.uniform(level_key))
                 u_key, jk_key = jax.random.split(interval_key)
@@ -346,6 +360,10 @@ def lane_update(logprior_fn, loglikelihood_fn, num_inner_steps, num_delete,
             next=jnp.zeros(num_delete, dtype=i.dtype))
         _, lane, _, info, _ = jax.lax.while_loop(
             lambda c: jnp.any(c[0] < num_inner_steps), round_, (i, start, s, info, stored))
+        # every replacement particle is born at the contour it replaced (blackjax 1.7's
+        # update_with_mcmc_take_last), including chains whose moves were all rejected
+        lane = lane._replace(loglikelihood_birth=jnp.full_like(lane.loglikelihood_birth,
+                                                               loglikelihood_0))
         return lane, SliceInfo(
             is_accepted=info[..., 0] != 0,
             num_expansions=info[..., 1].astype(caps.dtype),
@@ -364,74 +382,46 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
     Parameters
     ----------
-    priors : dict[str, Prior]
-        Mapping from free-parameter name to a Ceridwen ``Prior`` object.
-        **Every free parameter must have a prior** — nested sampling
-        requires a proper (normalisable) prior; an improper flat prior
-        makes the evidence integral undefined.
-    num_live : int, optional
-        Number of live points.  Default 500.
-    num_inner_steps : int, optional
-        Inner MCMC steps per NS iteration.  Default ``n_dims * 5``
-        where ``n_dims`` is the total scalar dimension count.
-    num_delete : int, optional
-        Live points discarded per iteration.  Default
-        ``max(1, num_live // 5)`` — see the module docstring for the
-        rationale.  Must be strictly below ``num_live``.
-    logZ_tol : float, optional
-        Convergence threshold on :math:`\\ln(Z_\\mathrm{live}/Z)`.
-        Default ``-5.0``, terminating with ~0.7 per cent of the
-        evidence still in the live set
-        (:math:`f = e^{tol}/(1 + e^{tol})`).
-    verbose : bool, optional
-        Print a ``tqdm`` progress bar and convergence info.  Default True.
-    checkpoint_interval_s : float, optional
-        Seconds between periodic checkpoints (default 1200 = 20 min;
-        ``<= 0`` disables).  Each checkpoint finalises the accumulated
-        dead points against the current live ensemble and dumps a
-        snapshot, so a run killed mid-flight still yields a recoverable
-        (partial) posterior; the same format is written at convergence
-        as the rescue pickle, and :meth:`load_checkpoint` reads either.
-    checkpoint_dir : str, optional
-        Checkpoint destination.  Resolved at run time as
-        ``checkpoint_dir`` → ``$CERIDWEN_CHECKPOINT_DIR`` →
-        ``$CERIDWEN_RESCUE_DIR``; when none is set, checkpointing is
-        silently skipped (no surprise writes).
-    checkpoint_frame_fn : callable, optional
-        Function that receives a bounded, equal-weight posterior sample and
-        returns a compact serialisable visualization payload.  Periodic and
-        final frames are retained separately from the overwritten recovery
-        checkpoint, so a later tool can show the actual inference history.
-    checkpoint_frame_draws : int, optional
-        Maximum equal-weight posterior draws retained per frame.  Default 128.
-    checkpoint_frame_limit : int, optional
-        Maximum compact frames retained for one process.  Default 64.
-    checkpoint_frame_max_bytes : int, optional
-        Maximum serialised size of one compact frame.  Default 2 MiB.
-    iteration_callback : callable, optional
-        Called after each completed step with ``(iteration, key, incoming,
-        outgoing, info, compiled_step, elapsed_seconds)``. Default None.
-        Intended for profiling; the callback must not modify the sampler state.
-    slice_kernel : str, optional
-        ``"lanes"`` (default) runs each replaced particle as one loop over
-        its whole slice chain (:func:`lane_update`);
-        ``"carry"`` runs the BlackJAX slice kernel with
-        :func:`stepping_out_carry`; ``"stock"`` runs the unchanged
-        ``blackjax.nss`` kernel.  All three give bitwise-equal samples.
-    progress_path : str, optional
-        JSON-lines file that receives one record per completed iteration:
-        the checkpoint ``progress`` fields plus ``iteration_s``,
-        ``dead_per_s`` and ``likelihood_calls_per_s`` (both cumulative over
-        ``elapsed_s``).  Written whether or not ``verbose`` is set, appended
-        and flushed per line so a killed run keeps its history.  Default None
-        writes nothing.
-    resume_from : str, optional
-        A periodic checkpoint (``ns_checkpoint_<pid>.pkl``) to continue from
-        instead of starting afresh.  The run continues with the saved live
-        points, dead points and rng key, so it reproduces the uninterrupted
-        run at the same key.  The checkpoint must come from the same model:
-        the settings, the parameter shapes and the log-likelihood of the
-        saved live points are checked before sampling resumes.
+    priors : dict[str, Prior] -- every free parameter needs a proper prior
+    num_inner_steps : int -- inner MCMC steps per iteration; default n_dims * 5
+    num_delete : int -- live points removed per iteration; default max(1, num_live // 5), must be < num_live
+    logZ_tol : float -- stop when ln(Z_live / Z) < logZ_tol; default -5
+    checkpoint_interval_s : float -- seconds between checkpoints; <= 0 disables
+    checkpoint_dir : str -- falls back to $CERIDWEN_CHECKPOINT_DIR, then $CERIDWEN_RESCUE_DIR, else off
+    checkpoint_frame_fn : callable -- receives a bounded equal-weight posterior sample and returns a
+        compact serialisable visualization payload; periodic and final frames are kept apart from
+        the overwritten recovery checkpoint (``ns_checkpoint_frame_<pid>_<iter>_<state>.pkl``)
+    checkpoint_frame_draws : int -- equal-weight draws per frame; default 128
+    checkpoint_frame_limit : int -- frames kept per process; default 64
+    checkpoint_frame_max_bytes : int -- largest serialised frame; default 2 MiB
+    iteration_callback : callable -- called after each step with ``(iteration, key, incoming,
+        outgoing, info, compiled_step, elapsed_seconds)``; for profiling, must not change the state
+    progress_path : str -- JSON-lines file with one record per iteration: the checkpoint
+        ``progress`` fields plus ``iteration_s``, ``dead_per_s`` and ``likelihood_calls_per_s``
+        (cumulative over ``elapsed_s``); appended and flushed per line; default None writes nothing
+    resume_from : str -- a periodic checkpoint (``ns_checkpoint_<pid>.pkl``) to continue from
+        instead of starting afresh.  The run continues with the saved live points, dead points
+        and rng key, so it reproduces the uninterrupted run at the same key.  The checkpoint
+        must come from the same model: the settings, the parameter shapes and the
+        log-likelihood of the saved live points are checked before sampling resumes.
+    slice_kernel : {"lanes", "stock", "carry"} -- inner slice kernel, default ``"lanes"``.
+        ``"stock"`` is the unchanged ``blackjax.nss``.  ``"carry"`` assembles the same kernel with
+        :func:`stepping_out_carry`, which evaluates each stepping-out edge once instead of
+        twice under ``vmap``; same random numbers and evaluations, so on CPU the samples,
+        evidence and call counts are bitwise equal to ``"stock"``.  ``"lanes"`` runs every
+        particle's chain of slice steps as one lane of a shared loop (:func:`lane_update`;
+        Dance et al. 2025): lanes do not wait for the slowest one inside each slice step,
+        candidates below the prior slice level skip the likelihood, and idle batch slots
+        evaluate look-ahead candidates.  Equal to ``"stock"`` on CPU (bitwise on Apple silicon,
+        to the last bits on x86, so long runs can separate there), except that a
+        particle whose moves were all rejected is born at the contour it replaced (blackjax
+        1.7's rule, which ``"stock"`` follows from 1.7 on; with 1.6 the births, weights and
+        ln Z of such chains differ); on GPU the
+        likelihood batches differ in composition, so float rounding can make the trajectories
+        separate after many iterations (statistically equivalent, not bitwise; GPU runs of
+        either kernel are not bit-reproducible between processes anyway).  The default since
+        it is the fastest: 3.5-3.8x faster sampling than ``"stock"`` on an A100 for the JADES
+        campaign model, and more on CPU.
     """
 
     #: format of the ``resume`` block written into periodic checkpoints
@@ -447,15 +437,18 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         verbose         : bool  = True,
         checkpoint_interval_s : float = 1200.0,
         checkpoint_dir        : Optional[str] = None,
+        resume_from           : Optional[str] = None,
+        slice_kernel          : str = "lanes",
         checkpoint_frame_fn   : Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         checkpoint_frame_draws: int = 128,
         checkpoint_frame_limit: int = 64,
         checkpoint_frame_max_bytes: int = 2 * 1024 * 1024,
-        iteration_callback: Optional[Callable] = None,
-        progress_path: Optional[str] = None,
-        slice_kernel: str = "lanes",
-        resume_from           : Optional[str] = None,
+        iteration_callback    : Optional[Callable] = None,
+        progress_path         : Optional[str] = None,
     ):
+        if slice_kernel not in SLICE_KERNELS:
+            raise ValueError(f"slice_kernel={slice_kernel!r}: choose one of {SLICE_KERNELS}")
+        self.slice_kernel    = slice_kernel
         self.priors          = dict(priors)
         self.num_live        = int(num_live)
         self._num_inner_steps = num_inner_steps
@@ -463,21 +456,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self.logZ_tol        = float(logZ_tol)
         self.verbose         = bool(verbose)
         self.iteration_callback = iteration_callback
-        self.progress_path = progress_path
-        if slice_kernel not in ("lanes", "carry", "stock"):
-            raise ValueError(f"unknown slice_kernel {slice_kernel!r}")
-        self.slice_kernel = slice_kernel
-        # Periodic checkpointing.  Every ``checkpoint_interval_s`` seconds
-        # (default 1200 = 20 min; <= 0 disables) the accumulated dead points
-        # are finalised against the current live ensemble and dumped to disk,
-        # so a run killed by the scheduler wall-time, a node failure, or any
-        # mid-run crash still yields a recoverable (partial) posterior --
-        # BlackJAX provides no native checkpointing.  The destination is
-        # resolved at run time from ``checkpoint_dir`` ->
-        # $CERIDWEN_CHECKPOINT_DIR -> $CERIDWEN_RESCUE_DIR; when none is set
-        # checkpointing is silently skipped (no surprise writes).  The same
-        # snapshot format is written once more at convergence as the rescue
-        # pickle, so :meth:`load_checkpoint` recovers either.
+        self.progress_path   = progress_path
         self.checkpoint_interval_s = float(checkpoint_interval_s)
         self._checkpoint_dir       = checkpoint_dir
         self.checkpoint_frame_fn   = checkpoint_frame_fn
@@ -487,10 +466,6 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         self.resume_from           = None if resume_from is None else str(resume_from)
         if self.resume_from is not None and not os.path.isfile(self.resume_from):
             raise FileNotFoundError(f"resume_from={self.resume_from!r}: no such checkpoint")
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _n_dims(self, theta_init: dict[str, Array]) -> int:
         """Total scalar degrees of freedom."""
@@ -508,8 +483,9 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 raise ValueError(
                     f"Parameter '{name}' has no prior.  "
                     f"Nested sampling requires a proper prior for every "
-                    f"free parameter.  Add '{name}' to the priors dict "
-                    f"passed to BlackJAXNestedSamplerAdapter."
+                    f"free parameter.  Give it one in SedModel(priors=...), or "
+                    f"fix it with a constant transform "
+                    f"(transforms={{'{name}': lambda th: jnp.array([value])}})."
                 )
             prior          = self.priors[name]
             rng_key, sub   = jax.random.split(rng_key)
@@ -623,15 +599,10 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
     def _dump_snapshot(self, ckpt_dir, live, dead_list, ns_utils, logZ,
                        *, tag, partial, progress, finalised=None, resume=None):
-        """Atomically pickle a finalised snapshot of the run so far.
-
-        Schema 2 adds progress metadata to the legacy recovery keys.  A
-        ``partial=True`` snapshot marks a run that had not converged.
-        ``resume`` (periodic checkpoints) adds the raw sampler state needed
-        by ``resume_from``.  Best-effort: never let a checkpoint break the
-        run.  Atomic via write-to-temp + os.replace so a kill mid-write
-        cannot corrupt an existing checkpoint.
-        """
+        """Atomically pickle a finalised snapshot; returns the path or None (never raises).
+        Schema 2 adds ``progress`` metadata to the recovery keys, and a compact visualization
+        frame is written next to it (:meth:`_dump_checkpoint_frame`).  ``resume`` (periodic
+        checkpoints) adds the raw sampler state needed by ``resume_from``."""
         try:
             import pickle as _pickle
             import numpy as _np
@@ -668,11 +639,59 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             return None
 
     def _run_config(self, theta_init, num_inner_steps, num_delete):
-        """What must match between a checkpoint and the run that resumes it."""
+        """What must match between a checkpoint and the run that resumes it.  ``slice_kernel``
+        is not part of it: the kernels make the same moves with the same random numbers, so a
+        checkpoint may be continued with any of them (see ``slice_kernel`` for how far their
+        trajectories agree)."""
         return {"num_live": self.num_live, "num_delete": int(num_delete),
                 "num_inner_steps": int(num_inner_steps),
                 "params": [(k, tuple(int(d) for d in jnp.shape(v)))
                            for k, v in theta_init.items()]}
+
+    def _build_nested_sampler(self, loglike_fn, logprior_fn, num_inner_steps, num_delete):
+        """The NSS transition kernel for ``self.slice_kernel``: ``"stock"`` is
+        ``blackjax.nss``; ``"carry"`` assembles the kernel as
+        ``blackjax.ns.nss.as_top_level_api`` does, with :func:`stepping_out_carry` as the
+        interval procedure; ``"lanes"`` replaces the inner update with :func:`lane_update`
+        (blackjax >= 1.6, whose ``ns`` package is that of commit f73e12956)."""
+        import blackjax
+        if self.slice_kernel == "stock":
+            return blackjax.nss(
+                logprior_fn      = logprior_fn,
+                loglikelihood_fn = loglike_fn,
+                num_delete       = num_delete,
+                num_inner_steps  = num_inner_steps,
+            )
+        from functools import partial
+        from blackjax.mcmc.slice import build_kernel as build_slice_kernel
+        from blackjax.ns import adaptive, base, from_mcmc, nss
+        init_state_fn = partial(base.init_state_strategy,
+                                logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn)
+        # the inner-kernel parameters the stock kernel of the installed blackjax uses: the
+        # Cholesky factor of the live covariance (1.7: live_covariance_factor) or the covariance
+        # itself (1.6), so a state (and a checkpoint) is the same for every slice kernel
+        live_params = getattr(nss, "live_covariance_factor", nss.live_covariance)
+        if self.slice_kernel == "lanes":
+            kernel = adaptive.build_kernel(
+                partial(base.delete_fn, num_delete=num_delete),
+                lane_update(logprior_fn, loglike_fn, num_inner_steps, num_delete),
+                update_inner_kernel_params_fn=live_params)
+        else:
+            constrained_step = nss.slice_constrained_step(
+                init_state_fn,
+                build_slice_kernel(interval=stepping_out_carry,
+                                   max_expansions=10, max_shrinkage=100),
+                nss.covariance_proposal)
+            kernel = from_mcmc.build_kernel(
+                constrained_step, num_inner_steps, live_params, num_delete)
+
+        def init_fn(position, rng_key=None):
+            return adaptive.init(
+                position, init_state_fn=jax.vmap(init_state_fn),
+                update_inner_kernel_params_fn=live_params,
+                rng_key=rng_key)
+
+        return blackjax.SamplingAlgorithm(init_fn, kernel)
 
     def _resume_block(self, live, dead_list, rng_key, n_iter, n_like_calls, elapsed, config):
         import numpy as _np
@@ -727,54 +746,6 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         with open(path, "rb") as fh:
             return _pickle.load(fh)
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
-    def _build_nested_sampler(self, loglike_fn, logprior_fn,
-                              num_inner_steps, num_delete):
-        """Construct the BlackJAX NSS transition kernel.
-
-        ``slice_kernel="carry"`` assembles the kernel as
-        ``blackjax.ns.nss.as_top_level_api`` does, with
-        :func:`stepping_out_carry` as the interval procedure.
-        ``"lanes"`` replaces the inner update with :func:`lane_update`.
-        """
-        import blackjax
-        if self.slice_kernel == "stock":
-            return blackjax.nss(
-                logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn,
-                num_delete=num_delete, num_inner_steps=num_inner_steps,
-            )
-        from functools import partial
-        from blackjax.mcmc.slice import build_kernel as build_slice_kernel
-        from blackjax.ns import adaptive, base, from_mcmc, nss
-        init_state_fn = partial(
-            base.init_state_strategy,
-            logprior_fn=logprior_fn, loglikelihood_fn=loglike_fn)
-        if self.slice_kernel == "lanes":
-            kernel = adaptive.build_kernel(
-                partial(base.delete_fn, num_delete=num_delete),
-                lane_update(logprior_fn, loglike_fn, num_inner_steps, num_delete),
-                update_inner_kernel_params_fn=nss.live_covariance)
-        else:
-            constrained_step = nss.slice_constrained_step(
-                init_state_fn,
-                build_slice_kernel(interval=stepping_out_carry,
-                                   max_expansions=10, max_shrinkage=100),
-                nss.covariance_proposal)
-            kernel = from_mcmc.build_kernel(
-                constrained_step, num_inner_steps, nss.live_covariance,
-                num_delete)
-
-        def init_fn(position, rng_key=None):
-            return adaptive.init(
-                position, init_state_fn=jax.vmap(init_state_fn),
-                update_inner_kernel_params_fn=nss.live_covariance,
-                rng_key=rng_key)
-
-        return blackjax.SamplingAlgorithm(init_fn, kernel)
-
     @staticmethod
     def _logical_likelihood_calls(info):
         """Per-particle evaluations for the pinned stepping-out slice kernel.
@@ -795,6 +766,11 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         rng_key     : Array,
     ) -> SamplingResult:
         """Run nested sampling and return a ``SamplingResult``; ``logprior_fn`` must be proper."""
+        import numpy as np
+        # seed of the ln Z error estimate (anesthetic draws it from numpy's global RNG): derived
+        # from rng_key, so the same key gives the same error, and the global RNG is restored
+        _err_seed = int(np.asarray(jax.random.randint(
+            jax.random.fold_in(rng_key, 0x5EED), (), 0, 2 ** 31 - 1)))
         try:
             import blackjax
             import blackjax.ns.utils as ns_utils
@@ -806,6 +782,15 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
         import tqdm
 
+        # a NaN ln L (an overflow in the forward model) would make logZ_live NaN, and the
+        # termination test then passes at iteration 0 with no likelihood call: treat it as -inf,
+        # a point outside the support (finite values pass through unchanged)
+        _loglike_raw = loglike_fn
+
+        def loglike_fn(theta):
+            lnl = _loglike_raw(theta)
+            return jnp.where(jnp.isnan(lnl), -jnp.inf, lnl)
+
         n_dims          = self._n_dims(theta_init)
         num_inner_steps = (self._num_inner_steps
                            if self._num_inner_steps is not None
@@ -816,7 +801,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
 
         if self.verbose:
             print(
-                f"BlackJAX NSS  |  n_dims={n_dims}  "
+                f"BlackJAX NSS ({self.slice_kernel})  |  n_dims={n_dims}  "
                 f"num_live={self.num_live}  "
                 f"num_inner_steps={num_inner_steps}  "
                 f"num_delete={num_delete}"
@@ -828,9 +813,6 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         if _resume is None:
             rng_key, prior_key = jax.random.split(rng_key)
 
-        # ── Build NSS kernel ──────────────────────────────────────────────
-        # loglike_fn / logprior_fn operate on a SINGLE particle (un-batched).
-        # The NSS step_fn vmaps internally over the live-point ensemble.
         nested_sampler = self._build_nested_sampler(
             loglike_fn, logprior_fn, num_inner_steps, num_delete)
         init_fn = jax.jit(nested_sampler.init)
@@ -882,9 +864,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
             lz, lzl = _logz(live)
             print(f"  [timing] init_fn and step compile done    ({_t1 - _t0:.1f} s)  "
                   f"logZ={lz:.4f}  logZ_live={lzl:.4f}", flush=True)
-            print(f"  (state type: {type(live).__name__})")
 
-        # ── NS run loop ───────────────────────────────────────────────────
         dead_list    = [] if _resume is None else list(_resume["dead"])
         n_like_calls = self.num_live if _resume is None else _resume["n_like_calls"]
         _elapsed0    = 0.0 if _resume is None else _resume["elapsed_s"]
@@ -920,29 +900,19 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         _progress_file = (open(self.progress_path, "a", encoding="utf-8")
                           if self.progress_path else None)
 
-        desc = "NS  (starting)"
-        try:
-            desc = f"NS  logZ={_get_logZ(live):.1f}"
-        except (AttributeError, NameError):
-            pass
-
-        with tqdm.tqdm(
-            desc=desc,
-            unit=" dead",
-            disable=not self.verbose,
-        ) as pbar:
+        logZ, logZ_live = _logz(live)
+        with tqdm.tqdm(desc=f"NS  logZ={logZ:.1f}", unit=" dead",
+                       disable=not self.verbose) as pbar:
             _iter = 0 if _resume is None else _resume["n_iter"]
-            # Reuse evidence reads for the stop condition and progress output.
-            # Slice counters are read separately for logical call accounting.
-            _logZ, _logZ_live = _logz(live)
-            while _logZ_live - _logZ >= self.logZ_tol:
+            while logZ_live - logZ >= self.logZ_tol:
                 rng_key, subkey = jax.random.split(rng_key)
+                if (_resume is not None and _iter == _resume["n_iter"]) and self.verbose:
+                    pbar.write("  [step_fn] compiling the step kernel (one-time JIT)")
                 _t_iter = time.perf_counter()
-
                 incoming = live
                 live, dead_info = step_fn(subkey, incoming)
                 _iter += 1
-                _logZ, _logZ_live = _logz(live)
+                logZ, logZ_live = _logz(live)
                 _dt_iter = time.perf_counter() - _t_iter
                 if self.iteration_callback is not None:
                     self.iteration_callback(
@@ -951,7 +921,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 if self.verbose:
                     print(
                         f"  [iter {_iter:>4d}]  {_dt_iter:6.1f} s  "
-                        f"logZ={_logZ:+.3f}  ΔlogZ={_logZ_live - _logZ:.3f}  "
+                        f"logZ={logZ:+.3f}  ΔlogZ={logZ_live - logZ:.3f}  "
                         f"dead={num_delete * _iter}",
                         flush=True,
                     )
@@ -959,24 +929,24 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 n_like_calls += int(self._logical_likelihood_calls(dead_info))
                 if _progress_file is not None:
                     _elapsed = _elapsed0 + time.perf_counter() - t_start
-                    _record = _progress_record(_logZ, _logZ_live, _elapsed)
+                    _record = _progress_record(logZ, logZ_live, _elapsed)
                     _record["iteration_s"] = _dt_iter
                     _record["dead_per_s"] = _record["n_discarded"] / _elapsed
                     _record["likelihood_calls_per_s"] = n_like_calls / _elapsed
                     _progress_file.write(json.dumps(_record) + "\n")
                     _progress_file.flush()
                 pbar.update(num_delete)
-                pbar.set_description(f"NS  logZ={_logZ:.2f}  dlogZ={_logZ_live - _logZ:.2f}",
+                pbar.set_description(f"NS  logZ={logZ:.2f}  dlogZ={logZ_live - logZ:.2f}",
                                      refresh=False)
                 pbar.set_postfix({"s/iter": f"{_dt_iter:.1f}"}, refresh=False)
 
                 if _ckpt_on and (time.perf_counter() - _last_ckpt
                                  >= self.checkpoint_interval_s):
                     _progress = _progress_record(
-                        _logZ, _logZ_live, _elapsed0 + time.perf_counter() - t_start)
+                        logZ, logZ_live, _elapsed0 + time.perf_counter() - t_start)
                     _p = self._dump_snapshot(
                         _ckpt_dir, live, dead_list, ns_utils,
-                        _logZ, tag="checkpoint", partial=True,
+                        logZ, tag="checkpoint", partial=True,
                         progress=_progress,
                         resume=self._resume_block(
                             live, dead_list, rng_key, _iter, n_like_calls,
@@ -989,10 +959,17 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         if _progress_file is not None:
             _progress_file.close()
         if self.verbose:
+            from ..precision import float_dtype
+            _units = ", in the sampler's rescaled units" if float_dtype() == jnp.float32 else ""
             print(
-                f"  Converged  (live-point logZ estimate {_get_logZ(live):.3f}; the final ln Z follows)  "
-                f"({wall_time:.1f} s,  {n_like_calls:,} likelihood calls)"
+                f"  Converged  (live-point logZ estimate {_get_logZ(live):.3f}{_units}; the final "
+                f"ln Z follows)  ({wall_time:.1f} s,  {n_like_calls:,} likelihood calls)"
             )
+        if _iter == 0 and _resume is None:
+            import warnings
+            warnings.warn("nested sampling stopped before its first iteration (only the live "
+                          "points' likelihood calls): the live points' ln L is not finite; check "
+                          "the model at the prior draws", stacklevel=2)
 
         _dead_positions, _dead_logl, _dead_logl_birth = self._finalise_dead(
             live, dead_list, ns_utils)
@@ -1028,7 +1005,12 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 logzero    = float("nan"),
             )
             log_Z     = float(_ns.logZ())
-            log_Z_err = float(_ns.logZ(12).std())
+            _state = np.random.get_state()
+            try:
+                np.random.seed(_err_seed)
+                log_Z_err = float(_ns.logZ(12).std())
+            finally:
+                np.random.set_state(_state)
         except Exception:
             pass
         if log_Z is None:

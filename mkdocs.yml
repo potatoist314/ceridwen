@@ -55,6 +55,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Installation: installation.md
+  - Apple GPU: mac_gpu.md
   - Quick start: quickstart.md
   - 'Tutorial: joint fit': tutorial.md
   - Samplers: samplers.md
@@ -64,6 +65,7 @@ nav:
   - Outlier mixture likelihood: outlier_model.md
   - Emission-line marginalisation: eline_marginalisation.md
   - '[α/Fe]': afe.md
+  - AGN: agn.md
   - Conventions & gotchas: conventions.md
   - Troubleshooting: troubleshooting.md
   - Development and verification: development.md

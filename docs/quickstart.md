@@ -1,12 +1,13 @@
 # Quick start
 
-This fits a mock galaxy (twelve photometric bands from GALEX to WISE and an optical spectrum)
-made with the same forward model, so you can compare the fit with the truth. Run the blocks
-in order in one Python session, after the [installation](installation.md).
+This example fits a mock galaxy observed in twelve bands from GALEX to WISE
+and an optical spectrum. The mock uses the same forward model as the fit,
+so the fitted parameters can be compared with their input values. After
+[installation](installation.md), run the blocks in order in one Python session.
 
-**1. Get an SSP grid.** The published MIST + MILES grid (Chabrier IMF) is downloaded once
-(67 MB) into `~/.ceridwen/grids` (or `$CERIDWEN_GRID_DIR`), and its SHA-256 is checked on
-every call. `available_grids()` lists the others.
+**1. Download an SSP grid.** The MIST + MILES grid uses a Chabrier IMF and is
+67 MB. `fetch_grid` caches it in `~/.ceridwen/grids` (or `$CERIDWEN_GRID_DIR`)
+and checks its SHA-256 on every call. Use `available_grids()` to list other grids.
 
 ```python
 from ceridwen import SSPData
@@ -16,9 +17,9 @@ ssp = SSPData.load(fetch_grid("mist_miles_chab"))
 ssp.display()                                      # library, IMF, grid coverage
 ```
 
-**2. Build the model.** `lookback_time` holds the SFH nodes in Gyr, increasing from 0
-(today). The SFH is sampled as `logsfr_ratios` and turned into a star formation rate per node
-by a transform. `logzsol` is log10(Z/Z_sun) of the grid.
+**2. Build the model.** `lookback_time` contains SFH nodes in Gyr, increasing
+from 0 at the present. A transform converts the sampled `logsfr_ratios` into
+an SFR at each node. `logzsol` is log10(Z/Z_sun) for the loaded grid.
 
 ```python
 import jax, jax.numpy as jnp
@@ -52,7 +53,7 @@ def build_model(observations):
             "logmass": Uniform(low=9.0, high=12.0),
             "diffuse_tau_kc": ClippedNormal(mean=0.3, sigma=1.0, low=0.0, high=4.0),
             "diffuse_dust_index": Uniform(low=-1.0, high=0.4),
-            "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=1.0),
+            "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=0.3),
         },
         transforms={"sfh": logsfr_to_sfh},
         free_param_init={"logsfr_ratios": jnp.zeros(5), "logmass": jnp.array([10.0])},
@@ -60,12 +61,13 @@ def build_model(observations):
     )
 ```
 
-`SedModel` also applies a galaxy velocity dispersion of 300 km/s by default. Pass
-`kinematics=Kinematics(sigma_gal=...)` to change it, or `Kinematics(sigma_gal="sigma_gal")`
-with a prior to fit it (see [Conventions](conventions.md)).
+By default, `SedModel` uses a galaxy velocity dispersion of 300 km/s. Change it
+with `kinematics=Kinematics(sigma_gal=...)`, or fit it by using
+`Kinematics(sigma_gal="sigma_gal")` and adding a prior. See
+[Conventions](conventions.md).
 
-**3. Make the mock data.** Push known parameters through the model and add noise
-(signal-to-noise 20 in the photometry, 25 in the spectrum).
+**3. Generate mock data.** Evaluate the model at known parameters and add noise,
+with signal-to-noise ratios of 20 for photometry and 25 for the spectrum.
 
 ```python
 TRUTH = {
@@ -89,10 +91,30 @@ spec = Spectrum(wavelength=SPEC_WAVE, instrument=LSF, name="spec", uncertainty=s
 model = build_model([phot, spec])
 ```
 
-**4. Fit with nested sampling.** These settings are sized for a laptop CPU: the fit took
-**21-29 min** (67 800 likelihood calls) in two runs on an 11-core Apple M3 Pro shared with
-other jobs. It prints its progress and writes `./my_fit/ceridwen_result.h5`. For production, raise `num_live` (fitSED's default
-is 500) and lower `logZ_tol`; for NUTS, see [Samplers](samplers.md).
+Before fitting, use `model.display()` to inspect the parameters, priors,
+transforms and observations. The figure also compares the data with the range
+of model predictions allowed by the priors. `model.latex()` returns a LaTeX
+table of free, derived and fixed parameters, with their priors or values.
+The table requires `\usepackage{booktabs,amsmath}`.
+
+```python
+fig, ax = model.display(return_fig=True)     # in a notebook, model.display() alone shows it
+fig.savefig("model.png", dpi=150)
+print(model.latex())
+```
+
+In a script, a bare `model.display()` opens a window and waits until you close it.
+
+**4. Fit with nested sampling.** These settings are intended for a laptop.
+On an Apple Silicon Mac with macOS 26 and Python 3.12, the fit uses the GPU
+in float32 and takes about five minutes. Float64 CPU runs take somewhat longer;
+set `JAX_PLATFORMS=cpu` to use that mode on a Mac.
+
+The example uses 60 inner slice steps. With the `fitSED` default of 30, the
+float32 GPU run gave a `logmass` posterior about 30% too narrow. The fit prints
+progress and saves `./my_fit/ceridwen_result.h5`. For scientific use, increase
+`num_live` from this example's value; the `fitSED` default is 500.
+See [Samplers](samplers.md) for NUTS.
 
 ```python
 from ceridwen import fitSED
@@ -100,15 +122,16 @@ from ceridwen import fitSED
 result = fitSED(
     model,
     sampler="nested",
-    sampler_kwargs={"num_live": 100, "num_delete": 20, "logZ_tol": -2.0},
+    sampler_kwargs={"num_live": 100, "num_delete": 20, "num_inner_steps": 60,
+                    "logZ_tol": -5.0},
     rng_key=jax.random.PRNGKey(42),
     output_dir="./my_fit",
 )
 print(f"log Z = {result.log_evidence:.2f} +/- {result.log_evidence_err:.2f}")
 ```
 
-**5. Inspect and post-process.** `PostProcess` resamples the draws to equal weight, pushes
-them through the fitted model, and computes derived quantities and predictions.
+**5. Inspect the result.** `PostProcess` resamples the posterior to equal weight,
+evaluates the fitted model for those draws and computes derived quantities.
 
 ```python
 from ceridwen import PostProcess
@@ -122,35 +145,48 @@ for p, t in truth.items():
     print(f"{p:>20}: true {t:+7.3f}   fit {med:+7.3f}  (-{med - lo:.3f}/+{hi - med:.3f})")
 
 print(np.percentile(out["extras"]["sfh"]["sfr100"], [16, 50, 84]))   # SFR over 100 Myr [Msun/yr]
-pp.figures("./my_fit/figures", title="mock galaxy", truths=truth)
+pp.figures("./my_fit/figures", title="mock galaxy",
+           truths={**truth, "logsfr_ratios": np.asarray(TRUTH["logsfr_ratios"])})
 pp.save("./my_fit/post.npz")
 ```
 
-The table compares the posterior median and 16-84% range with the truth. At these settings
-the recovered values can sit 2-3 sigma from the truth: with a five-ratio SFH, `logmass`
-trades against the SFH shape, and the MAP of this mock lies at logmass 10.44, not at 10.50
-(the data and the degeneracy, not the sampler). `figures` writes `summary.pdf` (SED with
-residuals, SFH, marginals), `corner.pdf` and `diagnostics.pdf` (the sampler's diagnostics).
-`post.npz` holds every draw's predictions and is about 100 MB; `load_postprocess` reads it back.
-Everything `PostProcess` returns is described in
-[Post-processing](postprocessing.md).
+The table compares each posterior median and 16–84% interval with the input.
+Some recovered values differ from the input by 2–3 sigma. In this example,
+`logmass` is degenerate with the five-ratio SFH: mass in the oldest bins adds
+little light. A flat SFH with `logmass=10.44` fits within 1 in ln L of the
+input, even without noise. The SFH prior favours that solution, giving a MAP
+of 10.44 rather than the input 10.50. On noise-free data with flat priors,
+the MAP is 10.498.
+
+The 100-live-point runs also underestimate uncertainty. On the Apple GPU,
+this seed gives `logmass=10.43` (−0.03/+0.03), and seed 0 gives 10.44
+(−0.03/+0.03). The float64 CPU run gives 10.44 (−0.02/+0.03). Increase
+`num_live` before using these intervals. The five SFH ratios are mostly
+prior-dominated, and one or two may fall outside their 95% intervals.
+
+`figures` writes `summary.pdf` (SED, residuals, SFH and marginals), `corner.pdf`
+and `diagnostics.pdf`. `post.npz` stores predictions for every draw and is
+about 100 MB; reload it with `load_postprocess`. See
+[Post-processing](postprocessing.md) for the output fields.
 
 
 ## Reloading a fit
 
-`load_result_h5("my_fit/ceridwen_result.h5")` (from `ceridwen`) returns the same result object
-in a later session. The model is not stored as code: rebuild it with the same grid, CSP,
-observations and transforms. `ceridwen.resultfile.rebuild_model(path, csp, observations,
-transforms=...)` takes the priors, free parameters, redshift and kinematics from the file and
-raises if the rebuilt model differs from the one recorded; `check_model_against_result(model,
-path)` lists every difference. `PostProcess(model, "my_fit/ceridwen_result.h5")` also accepts
-the file directly.
+`load_result_h5("my_fit/ceridwen_result.h5")`, imported from `ceridwen`, reloads
+the result in a later session. Reconstruct the model with the same grid, CSP,
+observations and transforms. `ceridwen.resultfile.rebuild_model(path, csp,
+observations, transforms=...)` reads the priors, free parameters, redshift and
+kinematics from the file and checks the reconstructed model against the saved
+configuration. `check_model_against_result(model, path)` lists differences.
+You can also pass the file path directly to
+`PostProcess(model, "my_fit/ceridwen_result.h5")`.
 
 ## Units
 
-`Photometry` predictions are AB maggies, `Spectrum` predictions are observed-frame F_nu in
-erg s⁻¹ cm⁻² Hz⁻¹ (multiply by 1e32 for nJy), and `Lines` predictions are integrated fluxes in
-erg s⁻¹ cm⁻². All three need `zred=` (or `lumdist_mpc=`) on the `SedModel`: at `zred = 0`
-without `lumdist_mpc` no flux factor is applied, and `SedModel` warns. See
-[Conventions](conventions.md) before fitting real data, and the [Tutorial](tutorial.md) for
-emission lines and nebular emission (`add_neb=True`).
+`Photometry` predictions use AB maggies. `Spectrum` predictions use observed-frame
+F_nu in erg s⁻¹ cm⁻² Hz⁻¹; multiply by 1e32 to convert to nJy. `Lines`
+predictions are integrated fluxes in erg s⁻¹ cm⁻². Set `zred=` or
+`lumdist_mpc=` on `SedModel` to obtain these fluxes. At `zred=0` without a
+luminosity distance, the model applies no flux factor and issues a warning.
+See [Conventions](conventions.md) for details and the [Tutorial](tutorial.md)
+for emission lines and nebular emission (`add_neb=True`).

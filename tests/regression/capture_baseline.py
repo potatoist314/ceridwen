@@ -58,7 +58,7 @@ import jax
 import jax.numpy as jnp
 from ceridwen.broadening import Instrument, Kinematics
 
-jax.config.update("jax_enable_x64", True)
+import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 
 HERE = pathlib.Path(__file__).resolve().parent
 BASELINE_DIR = HERE / "baselines"
@@ -94,7 +94,8 @@ def fixed_params() -> dict:
         diffuse_tau_kc=0.5,      # tau_v
         diffuse_dust_index=-0.1,  # delta
         tau_pow=0.3,
-        alpha=-1.0,
+        alpha_pow=-1.0,          # birth-cloud power-law slope (was the key "alpha", which
+                                 # CSPBasis ignored: the default, also -1.0, applied)
         gas_logu=-2.5,           # log_u
         gas_logz=0.0,            # log_zsol
         zred=2.0,
@@ -198,7 +199,7 @@ def compute_baselines() -> dict[str, dict[str, np.ndarray]]:
     theta["diffuse_tau_kc"] = jnp.array([p["diffuse_tau_kc"]])
     theta["diffuse_dust_index"] = jnp.array([p["diffuse_dust_index"]])
     theta["tau_pow"] = jnp.array([p["tau_pow"]])
-    theta["alpha"] = jnp.array([p["alpha"]])
+    theta["alpha_pow"] = jnp.array([p["alpha_pow"]])
     theta["gas_logz"] = jnp.array([p["gas_logz"]])
     theta["gas_logu"] = jnp.array([p["gas_logu"]])
     theta["duste_qpah"] = jnp.array([p["duste_qpah"]])
@@ -263,7 +264,9 @@ def compute_baselines() -> dict[str, dict[str, np.ndarray]]:
 
     # ----- Observations + predict ------------------------------------------
     phot = Photometry(filters=p["filters"], name="phot")
-    phot.setup_for_model(csp.wave)
+    # at the model's redshift, as a fit sets it up (before 1.0.14 this was z = 0 for a z = 2
+    # theta, and the static line basis put the lines (1 + z) too bright relative to it)
+    phot.setup_for_model(csp.wave, zred=float(p["zred"]))
     wave_spec = jnp.asarray(np.geomspace(p["spec_lo"], p["spec_hi"], p["spec_n"]))
     spec_obs = Spectrum(
         wavelength=wave_spec,
@@ -292,8 +295,8 @@ def compute_baselines() -> dict[str, dict[str, np.ndarray]]:
     k1, k2 = jax.random.split(key)
     mu_phot = predictions["phot"]
     mu_spec = predictions["spec"]
-    sig_phot = 0.05 * jnp.abs(mu_phot) + 1e-12
-    sig_spec = 0.05 * jnp.abs(mu_spec) + 1e-12
+    sig_phot = _sigma(mu_phot) + 1e-12
+    sig_spec = _sigma(mu_spec) + 1e-12
     y_phot = mu_phot + sig_phot * jax.random.normal(k1, mu_phot.shape)
     y_spec = mu_spec + sig_spec * jax.random.normal(k2, mu_spec.shape)
     mask_phot = jnp.ones(mu_phot.shape, dtype=bool)
@@ -356,6 +359,8 @@ def compute_baselines() -> dict[str, dict[str, np.ndarray]]:
     out.update(_stellar_mass_baseline(p))
     out["eline_marginal"] = _eline_marginal_baseline(p, ssp_data)
     out["lsf_scale"] = _lsf_scale_baseline(p, ssp_data)
+    out.update(_agn_baselines(ssp_data))
+    out.update(_agn2_baselines(ssp_data))
     return out
 
 
@@ -530,6 +535,13 @@ def _logzsol_baselines(p) -> dict:
     return out
 
 
+def _sigma(mu):
+    """The mock's 5 % error, 0.05 |mu|, in float64 whatever the prediction's dtype: in a fit the
+    error comes from the data (float64), and a float32 sigma at cgs scale (~1e-21) underflows
+    when squared, since (1e-21)^2 is below float32's smallest normal number."""
+    return 0.05 * jnp.abs(jnp.asarray(mu, dtype=jnp.float64))
+
+
 def _calibration_likelihood_baseline(wave, mu, mask, key) -> dict:
     """v1.0.7: the profiled polynomial calibration (Spectrum(polynomial_order > 0), Prospector's
     PolyOptCal) and a per-observation noise key.  Data = the "csp_spectrum" prediction times a
@@ -543,7 +555,7 @@ def _calibration_likelihood_baseline(wave, mu, mask, key) -> dict:
     from ceridwen.likelihood.poly_calibration import (PolynomialCalibration,
                                                       chebyshev_design_matrix)
     A = chebyshev_design_matrix(wave, np.asarray(mask), 3)
-    sig = 0.05 * jnp.abs(mu)
+    sig = _sigma(mu)
     y_cal = (mu * (1.0 + jnp.asarray(A) @ jnp.array([0.0, 0.05, -0.03, 0.01]))
              + sig * jax.random.normal(key, mu.shape))
     pc = PolynomialCalibration(A)
@@ -577,7 +589,7 @@ def _gp_likelihood_baseline(wave, mu, key) -> dict:
                                                    GP_JITTER)
     mu = jnp.asarray(mu, dtype=jnp.float64)
     n = mu.size
-    sig = 0.05 * jnp.abs(mu)
+    sig = _sigma(mu)
     D = gp_sqdist(wave)
     C = np.exp(-0.5 * np.asarray(D) / 100.0 ** 2) + (1.0 + GP_JITTER) * np.eye(n)
     y = mu + sig * (jnp.asarray(np.linalg.cholesky(C)) @ jax.random.normal(key, (n,)))
@@ -627,7 +639,7 @@ def _poly_marginal_baseline(wave, mu, mask, key) -> dict:
     from ceridwen.likelihood.poly_marginal import (PolyMarginalGaussianLikelihood,
                                                    PolynomialMarginal)
     A = chebyshev_design_matrix(wave, np.asarray(mask), 3)
-    sig = 0.05 * jnp.abs(mu)
+    sig = _sigma(mu)
     y = (mu * (1.0 + jnp.asarray(A) @ jnp.array([0.02, 0.05, -0.03, 0.01]))
          + sig * jax.random.normal(key, mu.shape))
     jit = 0.05 * float(jnp.median(jnp.abs(mu)))
@@ -849,6 +861,286 @@ def _lsf_scale_baseline(p, ssp_data) -> dict[str, np.ndarray]:
     np.testing.assert_allclose(spec(ms, lsf_scale=hi), spec(build(Instrument.R_fwhm(1500.0, scale=hi))),
                                rtol=1e-12, atol=0)
     return res
+
+
+_AGN_FILTERS = ["jwst_f090w", "jwst_f150w", "jwst_f277w", "jwst_f444w", "jwst_f770w",
+                "jwst_f1800w"]
+_NJY = 3.631e12                       # maggies -> nJy (so that rtol, not atol, decides)
+_REST = 1e20                          # rest-frame L_sun/Hz per M_formed -> x 10**10 M_sun x 1e10
+
+
+def _agn_csp(ssp_data, agn, **over):
+    from ceridwen import Cosmology
+    from ceridwen.csp.csp import CSPBasis
+    kw = dict(lookback_time=jnp.array([0.0, 0.01, 0.1, 0.3, 0.6]), cosmo=Cosmology.planck18(),
+              zh_const=True, sfh_interp="step", add_dust=False, add_diffuse_dust=True,
+              add_neb=False, add_igm=True, sps_home=SPS_HOME, verbose=False, agn=agn)
+    kw.update(over)
+    return CSPBasis(ssp_data, **kw)
+
+
+def _agn_theta(csp, **vals):
+    th = {k: jnp.atleast_1d(jnp.asarray(v)) for k, v in csp.theta_init.items()}
+    th.update(sfh=jnp.array([1.0, 0.8, 0.5, 0.3, 0.2]), logzsol=jnp.array([-0.3]),
+              logmass=jnp.array([10.0]), diffuse_tau_kc=jnp.array([0.5]),
+              diffuse_dust_index=jnp.array([-0.2]))
+    th.update({k: jnp.array([v]) for k, v in vals.items()})
+    # unit formed mass (sum of the SSP weights = 1), so 10**logmass is the formed mass
+    th["sfh"] = th["sfh"] / jnp.sum(csp.calculate_ssp_weights(theta=th))
+    return th
+
+
+def _agn_baselines(ssp_data) -> dict:
+    """AGN (``ceridwen.agn``, AGN_PLAN section 4 C), three categories:
+
+    agn_torus  torus alone, modes fsps / prospector / corrected: the rest-frame AGN term
+               (``_agn_rest`` x 10**logmass, L_sun/Hz) and JWST photometry [nJy] at z = 2 and 8
+               (IGM order per mode); corrected with DL07 energy balance and its dust mass.
+    agn_disk   Temple+21 disc + dust4 screen (fagn_bbb 1, dust4 0.5, dust4_index -1), prospector
+               and corrected, z = 0.5 and 6.
+    agn_lines  AGN narrow lines (agn_elum 1.7e-3, agn_eline_sigma 150) through Spectrum,
+               Photometry and Lines at z = 2 with the nebular model, prospector and corrected:
+               the AGN-only part of each prediction.
+
+    Justified independently, asserted here: corrected torus luminosity = fagn x L_bol to 1e-10
+    (B5; screen off); disc / galaxy at 5500 A = fagn_bbb to 1e-12 (Prospector's definition);
+    the Lines AGN H beta = agn_elum x 10**logmass x flux factor / (1 + z) (x the diffuse curve
+    at the line in corrected mode) to 1e-6.  The components match FSPS / Prospector in
+    tests/agn (A1 1.7e-8, A2-A5 <= 1.7e-14)."""
+    from ceridwen.agn import AGNConfig
+    from ceridwen.observation import Photometry, Spectrum, Lines
+    from ceridwen import SedModel
+    import warnings
+
+    def phot_of(csp, th):
+        ph = Photometry(filters=_AGN_FILTERS, flux=np.ones(6), uncertainty=np.ones(6), name="p")
+        ph.setup_for_model(csp.wave, zred=float(np.ravel(th["zred"])[0]))
+        return np.asarray(csp.predict(th, [ph])["p"], np.float64) * _NJY
+
+    torus = {}
+    for mode in ("fsps", "prospector", "corrected"):
+        csp = _agn_csp(ssp_data, AGNConfig(agn_mode=mode, disk=False, lines=False))
+        for z in (2.0, 8.0):
+            th = _agn_theta(csp, zred=z, fagn=0.4, agn_tau=25.0)
+            if z == 2.0:
+                torus[f"rest_{mode}"] = np.asarray(csp._agn_rest(th), np.float64) * _REST
+            torus[f"phot_{mode}_z{z:g}"] = phot_of(csp, th)
+    csp = _agn_csp(ssp_data, AGNConfig(agn_mode="corrected", disk=False, lines=False),
+                   add_diffuse_dust=False)
+    th = _agn_theta(csp, zred=2.0, fagn=0.4, agn_tau=25.0)
+    W = csp.calculate_ssp_weights(theta=th)
+    lbol = float(csp._agn_context(th, W).L_bol_star)
+    lt = float(np.asarray(csp._agn_rest(th)) @ np.asarray(csp._agn._w))
+    np.testing.assert_allclose(lt, 0.4 * lbol, rtol=1e-10)                   # B5
+    csp = _agn_csp(ssp_data, AGNConfig(agn_mode="corrected", disk=False, lines=False),
+                   add_dust=True, add_dust_emission=True)
+    th = _agn_theta(csp, zred=2.0, fagn=0.4, agn_tau=25.0)
+    parts = csp._agn_parts(th)
+    torus["rest_corrected_dem"] = np.asarray(parts["agn"], np.float64) * _REST
+    torus["mdust_corrected_dem"] = np.asarray([float(parts["mdust"]) * 1e10])
+    torus["phot_corrected_dem_z2"] = phot_of(csp, th)
+
+    disk = {}
+    for mode in ("prospector", "corrected"):
+        csp = _agn_csp(ssp_data, AGNConfig(agn_mode=mode, lines=False, dust4_type=1))
+        for z in (0.5, 6.0):
+            th = _agn_theta(csp, zred=z, fagn=0.0, fagn_bbb=1.0, dust4=0.5, dust4_index=-1.0)
+            if z == 0.5:
+                disk[f"rest_{mode}"] = np.asarray(csp._agn_rest(th), np.float64) * _REST
+                W = csp.calculate_ssp_weights(theta=th)
+                ctx = csp._agn_context(th, W)
+                comp = csp._agn.model.components["disk"]
+                d = np.asarray(comp.rest_spectrum(csp._agn.filled(th), ctx))
+                g = np.asarray(ctx.gal_nodust_young_old)
+                np.testing.assert_allclose(np.median(d[comp.win_idx] / g[comp.win_idx]), 1.0,
+                                           rtol=1e-12)                       # fagn_bbb
+            disk[f"phot_{mode}_z{z:g}"] = phot_of(csp, th)
+
+    lines = {}
+    for mode in ("prospector", "corrected"):
+        csp = _agn_csp(ssp_data, AGNConfig(agn_mode=mode, disk=False), add_neb=True,
+                       add_igm=False, init_neb_params={"cloudy_dust": True})
+        z = 2.0
+        wave = np.exp(np.arange(np.log(4700 * (1 + z)), np.log(6800 * (1 + z)),
+                                1 / (2.3548 * 1000) / 2.5))
+        lw = [4862.763, 5008.314, 6564.723]
+        rows = [int(np.argmin(np.abs(np.asarray(csp.neb.nebem_line_pos) - w))) for w in lw]
+        obs = [Spectrum(wavelength=wave, instrument=Instrument.R_fwhm(1000.0), name="spec"),
+               Photometry(filters=["jwst_f150w", "jwst_f200w"], name="phot"),
+               Lines(line_ind=rows, wavelength=lw, name="lines")]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            m = SedModel(csp, obs, zred=z, free_param_init={"logmass": jnp.array([10.0])},
+                         kinematics=Kinematics(sigma_gal=150.0, sigma_gas=90.0))
+        base = _agn_theta(csp, fagn=0.0, agn_elum=0.0, agn_eline_sigma=150.0)
+        base = {k: v for k, v in base.items() if k != "zred"}
+        on = dict(base, agn_elum=jnp.array([1.7e-3]))
+        p0, p1 = m.predict(base), m.predict(on)
+        for k in p0:
+            d = np.asarray(p1[k], np.float64) - np.asarray(p0[k], np.float64)
+            lines[f"{k}_{mode}"] = d * {"phot": _NJY, "spec": 1e29, "lines": 1e17}[k]
+        mt = dict(on, zred=jnp.array([z]))
+        F = 1.7e-3 * 1e10 * float(csp._flux_factor(mt)) / (1 + z)            # Hbeta, ratio 1
+        if mode == "corrected":
+            tau = np.asarray(csp.diff_dust.compute_attenuation(csp.wave, mt), np.float64)
+            F *= float(np.interp(4862.763, np.asarray(csp.wave), np.exp(-tau)))
+        np.testing.assert_allclose(lines[f"lines_{mode}"][0] / 1e17, F, rtol=1e-6)
+    return {"agn_torus": torus, "agn_disk": disk, "agn_lines": lines}
+
+
+def _agn2_data_missing() -> list:
+    """The converted AGN2 tables this machine lacks (``$CERIDWEN_AGN_DATA``); [] when all present."""
+    from ceridwen.agn.skirtor import default_skirtor_path
+    from ceridwen.agn.nlr import NLR_FILE_NAME
+    out = []
+    root = pathlib.Path(default_skirtor_path()).parent         # $CERIDWEN_AGN_DATA or ~/.ceridwen/agn
+    for name in ("skirtor2016.h5", NLR_FILE_NAME):
+        if not (root / name).exists():
+            out.append(name)
+    return out
+
+
+def _agn2_lines_model(csp, z):
+    """(SedModel, rows) with a grating Spectrum, two NIRCam bands and Lines at H beta,
+    [O III] 5007 and H alpha (the agn_lines set-up, z = ``z``)."""
+    from ceridwen.observation import Photometry, Spectrum, Lines
+    from ceridwen import SedModel
+    import warnings
+    wave = np.exp(np.arange(np.log(4700 * (1 + z)), np.log(6800 * (1 + z)),
+                            1 / (2.3548 * 1000) / 2.5))
+    lw = [4862.763, 5008.314, 6564.723]
+    rows = [int(np.argmin(np.abs(np.asarray(csp.neb.nebem_line_pos) - w))) for w in lw]
+    obs = [Spectrum(wavelength=wave, instrument=Instrument.R_fwhm(1000.0), name="spec"),
+           Photometry(filters=["jwst_f150w", "jwst_f200w"], name="phot"),
+           Lines(line_ind=rows, wavelength=lw, name="lines")]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = SedModel(csp, obs, zred=z, free_param_init={"logmass": jnp.array([10.0])},
+                     kinematics=Kinematics(sigma_gal=150.0, sigma_gas=90.0))
+    return m
+
+
+def _agn2_baselines(ssp_data) -> dict:
+    """AGN2 (SKIRTOR + polar dust, Feltre+16 NLR, BLR), four categories, each built only when
+    its data exist (SKIRTOR and the NLR need ``$CERIDWEN_AGN_DATA``; the BLR table ships):
+
+    agn_skirtor  SKIRTOR torus (+ its disc), "cigale" and "corrected": rest-frame AGN term and
+                 JWST photometry [nJy] at z = 2 and 8, at a grid node and between nodes.
+    agn_polar    the same with polar dust (SMC and Gaskell), type-1 (i 30) and type-2 (i 70).
+    agn_nlr      Feltre+16 NLR lines (agn_elum 1.7e-3, agn_eline_sigma 150, a node and an
+                 off-node theta) through Spectrum, Photometry and Lines at z = 2: the AGN part.
+    agn_blr      broad lines (blr_lum 0.5, blr_sigma 1500), same observations.
+
+    Justified independently, asserted before capture: "corrected" torus + polar IR luminosity =
+    fagn x L_bol,* to the model grid's quadrature, rtol 1e-5 (measured 0.9e-6 .. 5.5e-6 on the
+    test grid); polar_ebv = 0 equals no polar dust in "cigale" mode to rtol 1e-12 (CIGALE's
+    renormalisation is 1 + l with l = 0); the Lines AGN H beta = agn_elum x 10**logmass x flux
+    factor / (1 + z) x T_gal(H beta) and the BLR H alpha = blr_lum x the same x T_gal(H alpha),
+    rtol 1e-6 (the definitions of agn_elum and blr_lum). Parity with CIGALE / Feltre+16 /
+    Case B is tests/agn2 (L1 1.6e-14, L3 1.7e-12, L4 4.4e-16 dex, L5 exact)."""
+    from ceridwen.agn import AGNConfig
+    from ceridwen.observation import Photometry
+    import warnings
+
+    def phot_of(csp, th):
+        ph = Photometry(filters=_AGN_FILTERS, flux=np.ones(6), uncertainty=np.ones(6), name="p")
+        ph.setup_for_model(csp.wave, zred=float(np.ravel(th["zred"])[0]))
+        return np.asarray(csp.predict(th, [ph])["p"], np.float64) * _NJY
+
+    def lbol_check(cfg, vals):
+        csp = _agn_csp(ssp_data, AGNConfig(**cfg), add_diffuse_dust=False)
+        th = _agn_theta(csp, zred=2.0, fagn=0.4, **vals)
+        W = csp.calculate_ssp_weights(theta=th)
+        ctx = csp._agn_context(th, W)
+        p = csp._agn.nuclear_parts(csp._agn.filled(th), ctx)
+        L = float(np.asarray(p["dust"] + p["polar_ir"]) @ np.asarray(csp._agn._w))
+        np.testing.assert_allclose(L, 0.4 * float(ctx.L_bol_star), rtol=1e-5)
+
+    out = {}
+    missing = _agn2_data_missing()
+    node = dict(skirtor_t=7.0, skirtor_pl=1.0, skirtor_q=1.0, skirtor_oa=40.0, skirtor_i=30.0)
+    off = dict(skirtor_t=6.0, skirtor_pl=0.75, skirtor_q=1.2, skirtor_oa=35.0, skirtor_i=45.0)
+    if "skirtor2016.h5" not in missing:
+        sk = {}
+        for mode in ("cigale", "corrected"):
+            cfg = dict(agn_mode=mode, torus_model="skirtor16", lines=False)
+            csp = _agn_csp(ssp_data, AGNConfig(**cfg))
+            for tag, vals in (("node", node), ("off", off)):
+                for z in (2.0, 8.0):
+                    th = _agn_theta(csp, zred=z, fagn=0.4, **vals)
+                    if z == 2.0:
+                        sk[f"rest_{mode}_{tag}"] = np.asarray(csp._agn_rest(th), np.float64) * _REST
+                    sk[f"phot_{mode}_{tag}_z{z:g}"] = phot_of(csp, th)
+        for vals in (node, off):
+            lbol_check(dict(agn_mode="corrected", torus_model="skirtor16", lines=False), vals)
+        out["agn_skirtor"] = sk
+
+        po = {}
+        for mode in ("cigale", "corrected"):
+            for law in ("smc", "gaskell"):
+                cfg = dict(agn_mode=mode, torus_model="skirtor16", lines=False, polar_dust=True,
+                           polar_law=law)
+                csp = _agn_csp(ssp_data, AGNConfig(**cfg))
+                for i in (30.0, 70.0):
+                    th = _agn_theta(csp, zred=2.0, fagn=0.4, **dict(node, skirtor_i=i),
+                                    polar_ebv=0.3, polar_temp=120.0, polar_emis=1.6)
+                    po[f"rest_{mode}_{law}_i{i:g}"] = (np.asarray(csp._agn_rest(th), np.float64)
+                                                      * _REST)
+                    po[f"phot_{mode}_{law}_i{i:g}_z2"] = phot_of(csp, th)
+        lbol_check(dict(agn_mode="corrected", torus_model="skirtor16", lines=False,
+                        polar_dust=True), dict(off, polar_ebv=0.3))
+        cfg0 = dict(agn_mode="cigale", torus_model="skirtor16", lines=False)
+        a = _agn_csp(ssp_data, AGNConfig(**cfg0))
+        b = _agn_csp(ssp_data, AGNConfig(**cfg0, polar_dust=True))
+        ra = np.asarray(a._agn_rest(_agn_theta(a, zred=2.0, fagn=0.4, **node)))
+        rb = np.asarray(b._agn_rest(_agn_theta(b, zred=2.0, fagn=0.4, **node, polar_ebv=0.0)))
+        np.testing.assert_allclose(rb, ra, rtol=1e-12, atol=1e-12 * np.abs(ra).max())
+        out["agn_polar"] = po
+
+    def line_set(cfg_extra, on_vals, base_vals, line_index, amp_key, modes):
+        res = {}
+        for mode in modes:
+            csp = _agn_csp(ssp_data, AGNConfig(agn_mode=mode, torus=False, disk=False,
+                                               **cfg_extra),
+                           add_neb=True, add_igm=False, init_neb_params={"cloudy_dust": True})
+            m = _agn2_lines_model(csp, 2.0)
+            base = _agn_theta(csp, **base_vals)
+            base = {k: v for k, v in base.items() if k != "zred"}
+            for tag, vals in on_vals.items():
+                on = dict(base, **{k: jnp.array([v]) for k, v in vals.items()})
+                p0, p1 = m.predict(base), m.predict(on)
+                for k in p0:
+                    d = np.asarray(p1[k], np.float64) - np.asarray(p0[k], np.float64)
+                    res[f"{k}_{mode}_{tag}"] = d * {"phot": _NJY, "spec": 1e29, "lines": 1e17}[k]
+                mt = dict(on, zred=jnp.array([2.0]))
+                F = vals[amp_key] * 1e10 * float(csp._flux_factor(mt)) / 3.0
+                lam = [4862.763, 5008.314, 6564.723][line_index]
+                if mode == "corrected":
+                    tau = np.asarray(csp.diff_dust.compute_attenuation(csp.wave, mt), np.float64)
+                    F *= float(np.interp(lam, np.asarray(csp.wave), np.exp(-tau)))
+                np.testing.assert_allclose(res[f"lines_{mode}_{tag}"][line_index] / 1e17, F,
+                                           rtol=1e-6)
+        return res
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if "nlr_feltre16.h5" not in missing:
+            out["agn_nlr"] = line_set(
+                dict(nlr_model="feltre16"),
+                {"node": dict(agn_elum=1.7e-3, agn_eline_sigma=150.0, nlr_logu=-2.5,
+                              nlr_logz=float(np.log10(0.017 / 0.01524)), nlr_alpha=-1.7,
+                              nlr_xid=0.3, nlr_lognh=3.0),
+                 "off": dict(agn_elum=1.7e-3, agn_eline_sigma=150.0, nlr_logu=-2.2,
+                             nlr_logz=-0.4, nlr_alpha=-1.5, nlr_xid=0.4, nlr_lognh=2.5)},
+                dict(fagn=0.0, agn_elum=0.0, agn_eline_sigma=150.0), 0, "agn_elum",
+                ("cigale", "corrected"))
+        out["agn_blr"] = line_set(
+            dict(lines=False, blr=True),
+            {"s1500": dict(blr_lum=0.5, blr_sigma=1500.0),
+             "s600": dict(blr_lum=0.2, blr_sigma=600.0)},
+            dict(fagn=0.0, blr_lum=0.0, blr_sigma=1500.0), 2, "blr_lum",
+            ("cigale", "corrected"))
+    return out
 
 
 # --------------------------------------------------------------------------- #

@@ -12,7 +12,8 @@ The recipe:
     2. a fixed random seed, so the test is reproducible,
     3. a recovered-vs-true table with pulls ((fit - true)/sigma) at the end.
 
-Needs an SSP grid (built via FSPS on first run) and ~10 min on a laptop CPU.
+Uses examples/ssp_data.h5 if present, else the published grid (fetch_grid); about 2.5 min on an
+Apple GPU.
 
     conda activate <your-env>
     python examples/demo_1_mock_test.py
@@ -59,13 +60,14 @@ TRUTH = {
 def main() -> None:
     rng = np.random.default_rng(SEED)
 
-    # ── SSP grid: load the cache, or build it once with FSPS ─────────────
+    # ── SSP grid: examples/ssp_data.h5 if you built one, else the published grid ──
     if SSP_FILE.is_file():
         print(f"[grid] loading cached SSP grid: {SSP_FILE}")
         ssp = SSPData.load(str(SSP_FILE))
     else:
-        print("[grid] no cache found, building with FSPS (a few minutes) ...")
-        ssp = SSPData.from_fsps(imf_type=1, save_to=str(SSP_FILE))
+        from ceridwen.ssps import fetch_grid             # the published grid (Zenodo, cached)
+        print("[grid] no examples/ssp_data.h5: using the published grid mist_miles_chab")
+        ssp = SSPData.load(str(fetch_grid("mist_miles_chab")))
 
     csp = CSPBasis(
         ssp,
@@ -87,7 +89,7 @@ def main() -> None:
                 "diffuse_tau_kc": ClippedNormal(mean=0.3, sigma=1.0,
                                                 low=0.0, high=4.0),
                 "diffuse_dust_index": Uniform(low=-1.0, high=0.4),
-                "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=1.0),
+                "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=0.3),
             },
             transforms={"sfh": lambda th, _t=sfh_times_yr:
                         logsfr_ratios_to_sfh(th["logsfr_ratios"],
@@ -113,7 +115,7 @@ def main() -> None:
     result = fitSED(
         model,
         sampler="ns",
-        sampler_kwargs={"num_live": 300},  # num_delete/logZ_tol: library defaults
+        sampler_kwargs={"num_live": 300, "num_inner_steps": 30},  # num_delete/logZ_tol: library defaults
         rng_key=jax.random.PRNGKey(SEED),
         output_dir="./demo_1_output",
     )

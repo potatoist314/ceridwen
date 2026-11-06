@@ -2,22 +2,59 @@
 Broadband photometric observation container (AB maggies).
 """
 
+import os
+
 import jax.numpy as jnp
 import numpy as np
-from ceridwen.observation.filters import FilterSet
+from ceridwen.observation.filters import FILTER_DIR_ENV, FilterSet, resolve_filter_file
 from .base import Observation
 
 _FILTERSET_CACHE = {}
 
 
+def _filter_directory(directory):
+    return None if directory is None else os.path.abspath(os.path.expanduser(os.fspath(directory)))
+
+
 def _filterset(filternames, directory=None):
-    """One ``FilterSet`` per distinct (filter-name tuple, directory), shared by every Photometry that uses it."""
-    key = (tuple(filternames), directory)
+    """One ``FilterSet`` per distinct (filter names, directory, ``$CERIDWEN_FILTER_DIR``),
+    shared by every Photometry that uses it: the same names read from two directories are
+    two filter sets."""
+    names = tuple(filternames)
+    directory = _filter_directory(directory)
+    key = (names, directory, os.environ.get(FILTER_DIR_ENV) or None)
     fs = _FILTERSET_CACHE.get(key)
     if fs is None:
-        fs = FilterSet(list(key[0]), **({} if directory is None else {"directory": directory}))
+        fs = FilterSet(list(names)) if directory is None else FilterSet(list(names), directory=directory)
         _FILTERSET_CACHE[key] = fs
     return fs
+
+
+def _filter_name(f, directory):
+    """The name of a filter given as a string or a ``Filter``.  A ``Filter`` is reloaded by
+    name, so it must be the file that name resolves to; anything else would be replaced."""
+    if isinstance(f, (str, os.PathLike)):
+        return os.fspath(f)
+    name = getattr(f, "name", None)
+    if not isinstance(name, str):
+        raise TypeError(f"Photometry filters must be filter names or Filter objects, got {f!r}")
+    src = getattr(f, "filename", None)
+    if src is None:
+        raise ValueError(
+            f"Filter '{name}' was built from data= arrays, which Photometry cannot use: it loads "
+            f"each filter by name.  Write the curve to '<dir>/{name}.par' (two columns: "
+            f"wavelength [A], transmission) and pass Photometry(filter_directory=<dir>).")
+    try:
+        want = resolve_filter_file(name, directory, warn=False)
+    except FileNotFoundError:
+        want = None
+    if want is None or os.path.abspath(src) != os.path.abspath(want):
+        raise ValueError(
+            f"Filter '{name}' was loaded from {src}, but Photometry loads filters by name and "
+            + (f"would read {want}" if want else "finds no file of that name")
+            + f".  Pass the name and Photometry(filter_directory="
+            f"'{os.path.dirname(os.path.abspath(src))}') instead.")
+    return name
 
 
 class Photometry(Observation):
@@ -25,8 +62,10 @@ class Photometry(Observation):
 
     Parameters
     ----------
-    filters : list of str or Filter -- names are resolved in the filter library
-    filter_directory : str -- directory of the ``<name>.par`` curves; None = the package library
+    filters : list of str or Filter -- names are looked up in ``filter_directory`` when it is given,
+        otherwise in ``$CERIDWEN_FILTER_DIR`` and then the bundled library; a ``Filter`` must
+        come from the file its name resolves to (else ``ValueError``)
+    filter_directory : str or path, optional -- directory of ``<name>.par`` files; only it is searched
     upper_limit : bool array (n_filters,) -- True = one-sided (model > data only) chi-squared penalty
 
     Attributes
@@ -43,10 +82,10 @@ class Photometry(Observation):
         filters     = "filters",
         phot_mask   = "mask",
     )
-    _meta = ("kind", "name", "filternames")
+    _meta = ("kind", "name", "filternames", "filterfiles")
 
     def __init__(self, filters=[], name=None, upper_limit=None, filter_directory=None, **kwargs):
-        self.filter_directory = filter_directory
+        self.filter_directory = _filter_directory(filter_directory)
         self.set_filters(filters)
         self.upper_limit = (
             None if upper_limit is None
@@ -55,20 +94,21 @@ class Photometry(Observation):
         super().__init__(name=name, **kwargs)
 
     def set_filters(self, filters):
-        """Set the filter list from filter-name strings or ``Filter`` objects."""
+        """Set the filter list from filter-name strings or ``Filter`` objects (read from
+        ``self.filter_directory`` when set)."""
+        directory = getattr(self, "filter_directory", None)
         if not filters:
             self.filters     = []
             self.filternames = []
+            self.filterfiles = []
             self.filterset   = None
             return
 
-        try:
-            self.filternames = [f.name for f in filters]
-        except (AttributeError, TypeError):
-            self.filternames = list(filters)
+        self.filternames = [_filter_name(f, directory) for f in filters]
 
-        self.filterset = _filterset(self.filternames, getattr(self, "filter_directory", None))
+        self.filterset = _filterset(self.filternames, directory)
         self.filters   = list(self.filterset.filters)
+        self.filterfiles = [os.path.abspath(p) for p in self.filterset.filterfiles]
         self.wave_eff = [f.wave_effective for f in self.filters]
         self._wavelength = jnp.asarray([f.wave_effective for f in self.filters])
 
@@ -93,6 +133,7 @@ class Photometry(Observation):
         """Precompute the ``(n_filters, n_wave)`` float32 projection matrix ``_T`` (F_nu -> maggies)
         for the rest-frame grid ``wave_model`` [Å] observed at fixed ``zred``; required before ``predict``."""
         wm_rest = np.asarray(wave_model, dtype=np.float64)
+        self._setup_zred = float(zred)
         opz = 1.0 + float(zred)
         wm = opz * wm_rest
         n_wave = len(wm)
@@ -100,39 +141,57 @@ class Photometry(Observation):
 
         fnu_to_flam = _c / wm**2
 
-        lam_filt = np.asarray(self.filterset.lam, dtype=np.float64)
-        n_lam = len(lam_filt)
+        # the exact integral over the model pixels (FilterSet.flux_weights): flux-conserving
+        # for lines narrower than the filter grid
+        T = self.filterset.flux_weights(wm, xp=np) * fnu_to_flam[None, :]
+        # static window lengths for predict_at_redshift (a sampled redshift up to
+        # filters.FLUX_WINDOW_ZMAX), on this rest-frame grid
+        self._flux_windows = self.filterset.flux_window_widths(wm_rest)
+        self._flux_windows_n = int(wm_rest.size)
 
-        idx = np.searchsorted(wm, lam_filt, side="right") - 1
-        idx = np.clip(idx, 0, n_wave - 2)
-        frac = (lam_filt - wm[idx]) / (wm[idx + 1] - wm[idx])
-        frac = np.clip(frac, 0.0, 1.0)
-
-        outside = (lam_filt < wm[0]) | (lam_filt > wm[-1])
-        frac[outside] = 0.0
-
-        trans = np.asarray(self.filterset.trans, dtype=np.float64)  # (n_filt, n_lam)
-        inside = ~outside
-        TH = np.zeros((trans.shape[0], n_wave), dtype=np.float64)
-        np.add.at(TH.T, idx[inside],     (trans[:, inside] * (1.0 - frac[inside])).T)
-        np.add.at(TH.T, idx[inside] + 1, (trans[:, inside] * frac[inside]).T)
-        T  = TH * fnu_to_flam[None, :]
-
-        self._T = jnp.array(T.astype(np.float32))
+        T32 = T.astype(np.float32)
+        self._T = jnp.array(T32)
         self._has_precomputed_T = True
-        columns = np.flatnonzero(np.any(np.asarray(self._T) != 0, axis=0))
-        self.model_support = (int(columns[0]), int(columns[-1]) + 1)
         self._broadener = None
-        self._line_basis = None
+        self._line_photometry = None
+        cols = np.flatnonzero(np.any(T32 != 0.0, axis=0))
+        self._T_support = (int(cols[0]), int(cols[-1]) + 1) if cols.size else (0, 0)
+
+    @property
+    def model_support(self):
+        """``(lo, hi)``: the model-grid indices ``predict`` reads at the fixed redshift of
+        ``setup_for_model`` (the non-zero columns of ``_T``, joined with the sigma_gal
+        broadener's window when there is one); None before setup.  A Photometry projected at
+        a sampled redshift reads the whole grid (``CSPBasis._support_for`` checks ``free_z``)."""
+        s = getattr(self, "_T_support", None)
+        if s is None:
+            return None
+        b = getattr(self, "_broadener", None)
+        if b is not None:
+            idx = np.asarray(b.window.grid.idx)
+            w = (int(idx[0]), int(idx[-1]) + 1)
+            s = w if s[1] <= s[0] else (min(s[0], w[0]), max(s[1], w[1]))
+        return s
 
     def setup_broadening(self, wave_model, zred, kinematics, *, free_z=False, neb=None):
         """Build the sigma_gal broadener over the rest range the filters cover (the
-        whole 912-25000 A window when ``free_z``) and, when ``neb`` is given and
-        sigma_gas is fixed, the static line basis at that width.  Both are None
-        for ``Kinematics.none()``; call after ``setup_for_model``."""
+        whole 912-25000 A window when ``free_z``; None for ``Kinematics.none()`` or no
+        ``kinematics``) and, when ``neb`` is given, the line term ``_line_photometry``
+        (``observation.line_photometry.LinePhotometry``): each nebular line's flux through
+        each filter, without painting it, as a delta line without ``kinematics``
+        (``broaden_photometry=False``) and as a Gaussian of the gas width with it.  Call after
+        ``setup_for_model``."""
         from ..broadening import PhotometricBroadener
+        from .line_photometry import LinePhotometry
         self._broadener = None
-        self._line_basis = None
+        self._line_photometry = None
+        if neb is not None and self.filterset is not None:
+            gas = None if kinematics is None else kinematics.effective_sigma_gas
+            self._line_photometry = LinePhotometry(
+                self.filterset, np.asarray(neb.nebem_line_pos, dtype=np.float64),
+                zred=zred, free_z=free_z,
+                sigma="sampled" if isinstance(gas, str) else gas,
+                sigma_max_kms=None if kinematics is None else kinematics.sigma_max)
         if kinematics is None:
             return
         wm = np.asarray(wave_model, dtype=np.float64)
@@ -149,9 +208,6 @@ class Photometry(Observation):
                 wmax = min(lam.max() / opz, wm[-1])
             if wmin < wmax:
                 self._broadener = PhotometricBroadener.build(kinematics, wm, wmin, wmax)
-        gas = kinematics.effective_sigma_gas
-        if neb is not None and not isinstance(gas, str) and float(gas) > 0.0:
-            self._line_basis = np.asarray(neb.line_profiles(float(gas)), dtype=np.float32)
 
     def predict(self, spectrum, wave_model):
         """Synthetic AB maggies, shape (n_filters,), as ``_T @ spectrum`` (F_nu on ``wave_model``)."""
@@ -170,6 +226,10 @@ class Photometry(Observation):
             raise ValueError("No FilterSet configured; call set_filters() first.")
         wave_obs = (1.0 + jnp.asarray(zred)) * jnp.asarray(wave_rest)
         flux_flam = spectrum_fnu_observed * (2.998e18 / (wave_obs * wave_obs))
+        widths = getattr(self, "_flux_windows", None)
+        if widths is not None and jnp.shape(wave_rest)[0] == self._flux_windows_n:
+            # each filter's window of model pixels only (static lengths from setup_for_model)
+            return self.filterset.windowed_maggies(flux_flam, wave_obs, widths)
         return self.filterset.get_sed_maggies(flux_flam, sourcewave=wave_obs)
 
     def chi_sq(self, model_maggies):

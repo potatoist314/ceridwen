@@ -26,7 +26,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 import numpy as np
+import jax
 import jax.numpy as jnp
+from .precision import float_dtype
 
 __all__ = [
     "CKMS", "C_AA_S", "FWHM_TO_SIGMA", "BAND_NSIGMA",
@@ -35,12 +37,16 @@ __all__ = [
     "ScaledResponse", "check_scale_range",
     "make_line_painter_free_z",
     "make_line_painter", "SpectralProjector", "PhotometricBroadener",
+    "agn_line_profiles_on_grid", "make_agn_line_painter_prospector",
 ]
 
 CKMS = 2.99792458e5
 C_AA_S = 2.99792458e18
 FWHM_TO_SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 BAND_NSIGMA = 5.0
+# Half-width of a line window in units of the line's largest sigma: exp(-x^2 / 2) is exactly
+# 0 in float64 beyond |x| = 38.60 (37.64 on XLA CPU, which flushes subnormals to zero).
+_LINE_WINDOW_NSIGMA = 40.0
 
 
 def check_scale_range(rng, what="scale_range") -> tuple:
@@ -374,6 +380,32 @@ class LogGrid:
         return int(self.wave.size)
 
 
+def _pow2_scale(x):
+    """``(s, nonzero)``: ``s`` the power of two with max|x| <= s < 2 max|x| (1 when x is all
+    zero), from frexp, under stop_gradient. Dividing and multiplying by ``s`` is exact in binary
+    floating point (barring under/overflow), so scaling by it changes no mantissa."""
+    m = jax.lax.stop_gradient(jnp.max(jnp.abs(x)))
+    nonzero = m > 0
+    _, e = jnp.frexp(m)
+    s = jnp.where(nonzero, jnp.ldexp(jnp.ones((), float_dtype()), e), 1.0)
+    return s, nonzero
+
+
+def _scaled_to_float64(f, x):
+    """``f(x)`` for an ``f`` LINEAR in ``x`` that works in float32, as ``s * f(x / s)`` with ``s``
+    a stop-gradient power of two near max|x| and the final multiply in float64.
+
+    Same values bit for bit (the scaling is exact) and the same gradient, but the backward pass
+    reaches the float32 work as ``s * cotangent``: the likelihood's cotangent |r| / sigma^2 is
+    ~1e35 .. 1e41 at cgs scale (sigma ~ 1e-31) for a model far from the data, past float32's
+    maximum 3.4e38, and cast to float32 unscaled it becomes inf and the gradient NaN. The result
+    is float64. An all-zero ``x`` returns 0 through a second where (no cotangent reaches ``f``),
+    so value and gradient stay finite. Plain JAX (no custom_vjp): jax.hessian still works."""
+    s, nonzero = _pow2_scale(x)
+    y = f(x / s.astype(x.dtype))
+    return jnp.where(nonzero, y.astype(float_dtype()) * s, jnp.zeros(y.shape, float_dtype()))
+
+
 def make_gaussian_fft(grid: LogGrid) -> Callable:
     """f(spec_log, sigma_kms): Gaussian on the log grid; FFT buffer continues the edge values."""
     n, M, dv = grid.n, grid.n_pad, grid.dv
@@ -383,12 +415,26 @@ def make_gaussian_fft(grid: LogGrid) -> Callable:
 
     def smooth(spec_log, sigma_kms):
         sigma_px = sigma_kms / dv
+        # float32: smooth spec / m and multiply back, m the power of two near max|spec|
+        # (_pow2_scale: exact, so the values are those of the unscaled smoothing, and the
+        # gradient is the same). Both passes then run on numbers of order one: unscaled, the
+        # backward pass sums cotangents of ~1e35 (residual / sigma^2 times the photometry
+        # matrix, at cgs scale) over ~1e4 FFT points, past float32's maximum 3.4e38, and returns
+        # NaN gradients; scaled, the FFT sees m * cotangent. An all-zero window returns 0
+        # through a second where, so no cotangent reaches the FFT. Float64 is untouched.
+        scaled = spec_log.dtype == jnp.float32
+        if scaled:
+            m, nonzero = _pow2_scale(spec_log)
+            m = m.astype(spec_log.dtype)
+            spec_log = spec_log / m
         pad_r = jnp.full((n_right,), 0.0, spec_log.dtype) + spec_log[-1]
         pad_l = jnp.full((n_left,), 0.0, spec_log.dtype) + spec_log[0]
         padded = jnp.concatenate([spec_log, pad_r, pad_l])
-        taper = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_px ** 2 * nu ** 2)
-        out = jnp.fft.irfft(jnp.fft.rfft(padded) * taper, n=M)
-        return out[:n].astype(spec_log.dtype)
+        # the taper in the spectrum's dtype, so a float32 spectrum is smoothed in float32 (a
+        # float64 taper would promote the FFT to complex128)
+        taper = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_px ** 2 * nu ** 2).astype(spec_log.dtype)
+        out = jnp.fft.irfft(jnp.fft.rfft(padded) * taper, n=M)[:n].astype(spec_log.dtype)
+        return jnp.where(nonzero, out * m, jnp.zeros_like(out)) if scaled else out
 
     return smooth
 
@@ -413,10 +459,12 @@ class WindowSmoother:
         """Model window interpolated onto the log grid; ``scale`` (traced) reads it at
         ``wave_log * scale`` instead, i.e. the rest-frame model seen at another redshift."""
         x = self._wave_log if scale is None else self._wave_log * scale
-        return jnp.interp(x, self._wave_win, spec_rest[self.idx])
+        # positions in float64, values back in the spectrum's dtype (float32 from the CSP):
+        # float64 wavelength grids would otherwise promote the whole projector to float64
+        return jnp.interp(x, self._wave_win, spec_rest[self.idx]).astype(spec_rest.dtype)
 
     def from_log(self, spec_log):
-        return jnp.interp(self._wave_win, self._wave_log, spec_log)
+        return jnp.interp(self._wave_win, self._wave_log, spec_log).astype(spec_log.dtype)
 
 
 def build_response(grid: LogGrid, lnw_obs_rest, sigma_fix_kms, band_nsigma=BAND_NSIGMA):
@@ -452,7 +500,7 @@ def build_response(grid: LogGrid, lnw_obs_rest, sigma_fix_kms, band_nsigma=BAND_
 
 
 def apply_response(J, W, spec_log):
-    return jnp.sum(W * spec_log[J], axis=1)
+    return jnp.sum(W.astype(spec_log.dtype) * spec_log[J], axis=1)
 
 
 class ScaledResponse:
@@ -539,12 +587,15 @@ class ScaledResponse:
         return int(np.sum((px(lo) < 0.5) & (px(hi) >= 0.5)))
 
 
-def make_line_painter(wave_obs, line_wave_obs, sigma_inst_lines_kms) -> Callable:
+def make_line_painter(wave_obs, line_wave_obs, sigma_inst_lines_kms,
+                      dtype=jnp.float32) -> Callable:
     """paint(line_flux, sigma_gas_kms, inst_scale=None) -> f_nu on wave_obs.
 
     line_flux: observed-frame integrated flux [spectrum unit x Hz].
     f_nu = F phi(ln lambda) lambda / c_AA, phi unit-area in ln lambda with
     sigma = sqrt(sigma_gas^2 + (inst_scale sigma_inst)^2) / c (inst_scale None = 1).
+    ``dtype``: of the profile and its product (float32, as the spectrum; float64 only to test
+    the profile's arithmetic against a float64 reference).
     """
     wave_obs = np.asarray(wave_obs, dtype=np.float64)
     lnw = jnp.asarray(np.log(wave_obs))
@@ -555,18 +606,23 @@ def make_line_painter(wave_obs, line_wave_obs, sigma_inst_lines_kms) -> Callable
     def paint(line_flux, sigma_gas_kms, inst_scale=None):
         si = s_inst if inst_scale is None else s_inst * inst_scale
         s = jnp.sqrt(sigma_gas_kms ** 2 + si ** 2) / CKMS
-        x = (lnw[:, None] - lnl[None, :]) / s[None, :]
-        phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
-        return (phi @ line_flux) * lam_over_c
+        # ln-lambda offsets in float64; the (n_pix, n_lines) profile and its product in float32,
+        # as the spectrum it is added to (the line fluxes themselves stay float64: a handful of
+        # numbers, docs/conventions.md "Precision")
+        dt = dtype
+        x = ((lnw[:, None] - lnl[None, :]) / s[None, :]).astype(dt)
+        phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :]).astype(dt)
+        return (phi @ jnp.asarray(line_flux).astype(dt)) * lam_over_c.astype(dt)
 
     return paint
 
 
-def make_line_painter_free_z(wave_obs, line_wave_rest, sigma_inst_table_kms) -> Callable:
+def make_line_painter_free_z(wave_obs, line_wave_rest, sigma_inst_table_kms,
+                             dtype=jnp.float32) -> Callable:
     """paint(line_flux, sigma_gas_kms, opz, inst_scale=None) -> f_nu on wave_obs for a
     traced 1 + z: lines at line_wave_rest * opz, instrument width interpolated from the
     per-pixel table ``sigma_inst_table_kms`` (on wave_obs) at those positions, times
-    ``inst_scale`` when given."""
+    ``inst_scale`` when given. ``dtype`` as in :func:`make_line_painter`."""
     wave_obs = np.asarray(wave_obs, dtype=np.float64)
     lnw = jnp.asarray(np.log(wave_obs))
     wo = jnp.asarray(wave_obs)
@@ -581,9 +637,134 @@ def make_line_painter_free_z(wave_obs, line_wave_rest, sigma_inst_table_kms) -> 
         if inst_scale is not None:
             s_inst = s_inst * inst_scale
         s = jnp.sqrt(sigma_gas_kms ** 2 + s_inst ** 2) / CKMS
-        x = (lnw[:, None] - lnl[None, :]) / s[None, :]
-        phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
-        return (phi @ line_flux) * lam_over_c
+        # ln-lambda offsets in float64; the (n_pix, n_lines) profile and its product in float32,
+        # as the spectrum it is added to (the line fluxes themselves stay float64: a handful of
+        # numbers, docs/conventions.md "Precision")
+        dt = dtype
+        x = ((lnw[:, None] - lnl[None, :]) / s[None, :]).astype(dt)
+        phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :]).astype(dt)
+        return (phi @ jnp.asarray(line_flux).astype(dt)) * lam_over_c.astype(dt)
+
+    return paint
+
+
+def _line_windows(wave_obs, line_wave_rest, sigma_inst_table_kms, sigma_gas_max_kms,
+                 opz_lo, opz_hi, inst_scale_max=1.0, nsigma=_LINE_WINDOW_NSIGMA):
+    """Static pixel windows holding every nonzero value of each line profile (NumPy, setup).
+
+    For every line centre ``line_wave_rest * opz`` with ``opz`` in [opz_lo, opz_hi], every
+    gas dispersion up to ``sigma_gas_max_kms`` and every instrument scale up to
+    ``inst_scale_max``, the profile of :meth:`SpectralProjector.line_basis` is exactly 0 in
+    float64 on the pixels more than ``nsigma`` of its largest sigma from the centre.  Returns
+    ``(start, width)``: line ``j`` is nonzero only on pixels ``start[j] .. start[j] + width - 1``
+    (one width for all lines, the largest, so the window array has a static shape), or None
+    when that width covers the whole spectrum (nothing to gain).
+    """
+    wave_obs = np.asarray(wave_obs, dtype=np.float64)
+    lam = np.asarray(line_wave_rest, dtype=np.float64)
+    tab = np.asarray(sigma_inst_table_kms, dtype=np.float64)
+    lo_c, hi_c = lam * opz_lo, lam * opz_hi
+    # the largest instrument width the traced jnp.interp can return for a centre in
+    # [lo_c, hi_c]: the larger end value, or a table node in between (piecewise linear)
+    s_inst = np.maximum(np.interp(lo_c, wave_obs, tab), np.interp(hi_c, wave_obs, tab))
+    for j in range(lam.size):
+        inner = tab[(wave_obs > lo_c[j]) & (wave_obs < hi_c[j])]
+        if inner.size:
+            s_inst[j] = max(s_inst[j], float(inner.max()))
+    s_max = np.sqrt(float(sigma_gas_max_kms) ** 2 + (float(inst_scale_max) * s_inst) ** 2) / CKMS
+    lnw = np.log(wave_obs)
+    lo = np.searchsorted(lnw, np.log(lo_c) - nsigma * s_max, side="left")
+    hi = np.searchsorted(lnw, np.log(hi_c) + nsigma * s_max, side="right")
+    width = int(np.max(hi - lo)) if lam.size else 0
+    if width >= wave_obs.size:
+        return None
+    return np.clip(lo, 0, wave_obs.size - width).astype(np.int64), width
+
+
+# --- AGN narrow lines (ceridwen.agn.lines) -----------------------------------------------
+# Prospector's constants (prospect.sources.constants), used only by its painter below, so that
+# the "prospector" mode reproduces AGNSpecModel to rounding.
+PROSPECT_CKMS = 2.998e5
+PROSPECT_LIGHTSPEED = 2.998e18
+_PROSPECT_NU_NUMER = 3e18          # SpecModel.get_eline_gaussians: trapezoid(g, 3e18 / warr)
+
+
+def agn_line_profiles_on_grid(wave, line_wave, sigma_kms, res_floor_fwhm_px=2.0):
+    """(n_wave, n_lines) L_nu profiles of unit-luminosity lines on the rest model grid ``wave``
+    for a traced width ``sigma_kms``: ``NebularModel.line_profiles(sigma_kms)`` with its default
+    settings (a Gaussian in lambda of width sqrt(floor^2 + (pos sigma / c)^2), floor =
+    ``res_floor_fwhm_px`` x the local pixel width / 2.355, times pos^2 / c), the nebular convention, so the
+    AGN lines reach the photometry exactly as the nebular lines do."""
+    from .neb.NebularGridModel import CLIGHT_AA_S, SQRT_2PI, FWHM_PER_SIGMA
+    lam = np.asarray(wave, dtype=np.float64)
+    pos = np.asarray(line_wave, dtype=np.float64)
+    idx = np.clip(np.searchsorted(lam, pos, side="right") - 1, 1, lam.size - 2)
+    floor = jnp.asarray((lam[idx + 1] - lam[idx]) * float(res_floor_fwhm_px) / FWHM_PER_SIGMA)
+    posj = jnp.asarray(pos)
+    dl = jnp.sqrt(floor ** 2 + (posj * sigma_kms / CLIGHT_AA_S * 1.0e13) ** 2)
+    prof = jnp.exp(-0.5 * ((jnp.asarray(lam)[:, None] - posj[None, :]) / dl[None, :]) ** 2)
+    return prof / (SQRT_2PI * dl[None, :]) * (posj[None, :] ** 2 / CLIGHT_AA_S)
+
+
+def make_agn_line_painter_prospector(wave_obs, agn_line_wave_rest, sf_line_wave_rest,
+                                     agn_sf_rows, pixel_mask=None) -> Callable:
+    """paint(line_flux, sigma_agn_kms, sigma_sf_kms, eline_sigma_kms, opz) -> f_nu on wave_obs,
+    Prospector's ``AGNSpecModel.predict_spec`` AGN-line term with static shapes.
+
+    Prospector (``cache_eline_parameters(nsigma=...)`` then ``predict_aline_spec``): with
+    ``nsigma = 5 agn_eline_sigma / eline_sigma`` a pixel is used when it lies within
+    ``nsigma * lambda_obs / c * sigma_sf`` of a nebular line (``sigma_sf_kms`` (n_sf,): the
+    nebular line widths, ``sf_line_wave_rest`` (n_sf,) their rest wavelengths) and is unmasked
+    (``pixel_mask``, the Spectrum's mask; None = all); a nebular line with no such pixel is not
+    valid. AGN line ``l`` (rest ``agn_line_wave_rest[l]``, the nebular line ``agn_sf_rows[l]``)
+    is painted only when that nebular line is valid, as a Gaussian in velocity of dispersion
+    ``sigma_agn_kms`` alone (no instrument), times dv/dnu, divided by minus its trapezoid in
+    ``nu = 3e18 / lambda`` over the used pixels in order (gaps included, as ``np.trapezoid`` over
+    the compressed array does), and only on the used pixels. ``line_flux`` (n_agn,) observed
+    integrated fluxes; centres at ``rest * opz`` (``opz`` = 1 + zred + eline_delta_zred).
+    Prospector's ``ckms`` / ``lightspeed`` (2.998e5, 2.998e18) are used here."""
+    from jax import lax
+    wo = np.asarray(wave_obs, dtype=np.float64)
+    n = wo.size
+    w = jnp.asarray(wo)
+    nu = jnp.asarray(_PROSPECT_NU_NUMER / wo)
+    lam_a = jnp.asarray(np.asarray(agn_line_wave_rest, dtype=np.float64))
+    lam_sf = jnp.asarray(np.asarray(sf_line_wave_rest, dtype=np.float64))
+    rows = np.asarray(agn_sf_rows, dtype=np.int64)
+    if rows.shape != (int(lam_a.shape[0]),) or rows.min() < 0 or rows.max() >= lam_sf.shape[0]:
+        raise ValueError("agn_sf_rows must give, for every AGN line, its row in sf_line_wave_rest")
+    rows = jnp.asarray(rows)
+    om = None if pixel_mask is None else jnp.asarray(np.asarray(pixel_mask, dtype=bool))
+    if om is not None and om.shape != (n,):
+        raise ValueError(f"pixel_mask must have one entry per pixel ({n}), got {om.shape}")
+    idx = jnp.arange(n)
+
+    def paint(line_flux, sigma_agn_kms, sigma_sf_kms, eline_sigma_kms, opz):
+        ew_sf = lam_sf * opz
+        nsigma = 5 * (sigma_agn_kms / eline_sigma_kms)
+        linewidth = nsigma * ew_sf / PROSPECT_CKMS * sigma_sf_kms
+        pm = jnp.abs(w[None, :] - ew_sf[:, None]) < linewidth[:, None]
+        if om is not None:
+            pm = pm & om[None, :]
+        valid = pm.any(axis=1)
+        emask = pm.any(axis=0)
+        on = valid[rows]
+        mu = (lam_a * opz)[None, :]
+        sigma = sigma_agn_kms
+        dv = PROSPECT_CKMS * (w[:, None] / mu - 1)
+        dv_dnu = PROSPECT_CKMS * w[:, None] ** 2 / (PROSPECT_LIGHTSPEED * mu)
+        g = 1. / (sigma * jnp.sqrt(jnp.pi * 2)) * jnp.exp(-dv ** 2 / (2 * sigma ** 2))
+        g = g * dv_dnu
+        # trapezoid over the used pixels in order: each used pixel pairs with the next used one
+        nxt_ge = lax.cummin(jnp.where(emask, idx, n), reverse=True)
+        nxt = jnp.concatenate([nxt_ge[1:], jnp.full((1,), n, dtype=nxt_ge.dtype)])
+        has = emask & (nxt < n)
+        j = jnp.minimum(nxt, n - 1)
+        d = jnp.where(has, nu[j] - nu, 0.0)
+        norm = -jnp.sum(d[:, None] * (g[j, :] + g) / 2.0, axis=0)
+        use = on & (norm != 0.0)
+        flux = jnp.where(use, line_flux, 0.0) / jnp.where(use, norm, 1.0)
+        return jnp.where(emask, g @ flux, 0.0)
 
     return paint
 
@@ -625,6 +806,7 @@ class SpectralProjector:
     inst_scale_key: Optional[str] = None
     inst_scale_range: Optional[tuple] = None
     scaled: Optional[ScaledResponse] = None
+    line_window: Optional[tuple] = None
     _line_idx_j: jnp.ndarray = field(init=False)
 
     def __post_init__(self):
@@ -653,6 +835,32 @@ class SpectralProjector:
                            "which is not in theta")
         lo, hi = self.inst_scale_range
         return jnp.clip(jnp.ravel(jnp.asarray(theta[k]))[0], lo, hi)
+
+    def enable_line_windows(self) -> Optional[tuple]:
+        """Opt in to the windowed line basis in :meth:`predict_with_line_basis` (off by default:
+        on CPU it measured slower than the dense one; it targets GPUs).  Each line profile is
+        then evaluated on a static window of +-40 of its largest sigma only; the values are
+        bitwise those of the dense :meth:`line_basis` (gradients agree to 1-2 ulp: the reverse
+        pass sums over the window): the bounds are ``Kinematics.sigma_max`` for a sampled
+        sigma_gas (``Kinematics.resolve`` clips to it), the top of ``inst_scale_range`` and the
+        line centres over ``zred_range``.  A sampled redshift outside ``zred_range`` (beyond the
+        projector's support) truncates the lines; ``eline_delta_zred`` in theta always takes the
+        dense path.  Call before the first trace: the setting is read when jit traces; a rebuilt
+        projector (``SedModel.setup_observations``, ``fitSED(observations=...)``) starts with it
+        off again.  Sets and returns ``line_window`` ((start, width), or None when a window would
+        cover the whole spectrum)."""
+        if self.line_wave_rest is None or self.line_idx.size == 0:
+            self.line_window = None
+            return None
+        b = self.kinematics
+        gas = b.effective_sigma_gas
+        opz_lo, opz_hi = ((self.opz_ref, self.opz_ref) if self.zred_range is None
+                          else (1.0 + self.zred_range[0], 1.0 + self.zred_range[1]))
+        self.line_window = _line_windows(
+            self.wave_obs, self.line_wave_rest, self.line_sigma_table_kms,
+            b.sigma_max if isinstance(gas, str) else float(gas), opz_lo, opz_hi,
+            1.0 if self.inst_scale_range is None else self.inst_scale_range[1])
+        return self.line_window
 
     @classmethod
     def build(cls, kinematics: Kinematics, instrument: Optional[Instrument],
@@ -817,25 +1025,33 @@ class SpectralProjector:
         callable ``T(rest wavelengths)`` (the IGM) applied after the sigma_gal kernel and before
         the instrument, on the log grid; ``spec_rest`` is then the spectrum before the IGM."""
         scale = None if opz is None else self.opz_ref / opz
-        spec_log = self.window.smooth(self.window.to_log(spec_rest, scale), sigma_gal_kms)
-        if transmission is not None:
-            w_log = self.window._wave_log if scale is None else self.window._wave_log * scale
-            spec_log = spec_log * transmission(w_log).astype(spec_log.dtype)
-        if inst_scale is None:
-            return apply_response(self.J, self.W, spec_log)
-        return apply_response(self.scaled.J, self.scaled.weights(inst_scale), spec_log)
+
+        def project(x):                       # linear in x; float32 for a float32 spectrum
+            spec_log = self.window.smooth(self.window.to_log(x, scale), sigma_gal_kms)
+            if transmission is not None:
+                w_log = self.window._wave_log if scale is None else self.window._wave_log * scale
+                spec_log = spec_log * transmission(w_log).astype(spec_log.dtype)
+            if inst_scale is None:
+                return apply_response(self.J, self.W, spec_log)
+            return apply_response(self.scaled.J, self.scaled.weights(inst_scale), spec_log)
+        # float64 out, the float32 work scaled (the likelihood's cotangent must not enter
+        # float32 unscaled: _scaled_to_float64)
+        return _scaled_to_float64(project, spec_rest)
 
     def lines(self, line_flux_obs_all, sigma_gas_kms, opz=None, inst_scale=None):
         if self.paint is None:
             return 0.0
         flux = line_flux_obs_all[self._line_idx_j]
-        if self.free_z:
+
+        def paint(f):                         # linear in the line fluxes; float32 profiles
+            if self.free_z:
+                if inst_scale is None:
+                    return self.paint(f, sigma_gas_kms, opz)
+                return self.paint(f, sigma_gas_kms, opz, inst_scale)
             if inst_scale is None:
-                return self.paint(flux, sigma_gas_kms, opz)
-            return self.paint(flux, sigma_gas_kms, opz, inst_scale)
-        if inst_scale is None:
-            return self.paint(flux, sigma_gas_kms)
-        return self.paint(flux, sigma_gas_kms, inst_scale)
+                return self.paint(f, sigma_gas_kms)
+            return self.paint(f, sigma_gas_kms, inst_scale)
+        return _scaled_to_float64(paint, flux)        # float64 out (see continuum)
 
     def predict(self, spec_rest, line_flux_obs_all, theta, transmission=None):
         s_gal, s_gas = self.kinematics.resolve(theta)
@@ -867,6 +1083,30 @@ class SpectralProjector:
         phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
         return phi * jnp.asarray(wo / C_AA_S)[:, None]
 
+    def _line_basis_windowed(self, sigma_gas_kms, opz_line, inst_scale=None):
+        """:meth:`line_basis` (bitwise values) with the exponentials evaluated on the static windows
+        of ``line_window`` only; valid for ``sigma_gas_kms`` and ``inst_scale`` within the
+        bounds the windows were built for and ``opz_line`` in the projector's redshift range."""
+        start, width = self.line_window
+        wo = np.asarray(self.wave_obs, dtype=np.float64)
+        rows = start[None, :] + np.arange(width)[:, None]            # (width, n_kept), static
+        lam = jnp.asarray(np.asarray(self.line_wave_rest, dtype=np.float64))
+        lnl = jnp.log(lam) + jnp.log(opz_line)
+        s_inst = jnp.interp(lam * opz_line, jnp.asarray(wo),
+                            jnp.asarray(np.asarray(self.line_sigma_table_kms, dtype=np.float64)))
+        if inst_scale is not None:
+            s_inst = s_inst * inst_scale
+        s = jnp.sqrt(sigma_gas_kms ** 2 + s_inst ** 2) / CKMS
+        x = (jnp.asarray(np.log(wo)[rows]) - lnl[None, :]) / s[None, :]
+        phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
+        win = phi * jnp.asarray((wo / C_AA_S)[rows])
+        # each pixel takes its line's window value, or 0 outside the window (one gather + select)
+        offset = np.arange(wo.size)[:, None] - start[None, :]
+        inside = (offset >= 0) & (offset < width)
+        basis = jnp.where(inside, win[np.clip(offset, 0, width - 1),
+                                      np.arange(start.size)[None, :]], 0.0)
+        return basis
+
     def predict_with_line_basis(self, spec_rest, line_flux_obs_all, theta, fit_pos=None,
                                 basis=None, transmission=None):
         """``(prediction, A)``: continuum plus the lines of ``line_flux_obs_all`` painted with
@@ -886,14 +1126,117 @@ class SpectralProjector:
         if basis is None:   # a precomputed basis is only passed for fixed z, widths, dz = 0
             opz_line = self.opz_ref if opz is None else opz
             if "eline_delta_zred" in theta:
+                # unbounded shift: the static windows do not hold, the dense basis does
                 opz_line = opz_line + jnp.ravel(jnp.asarray(theta["eline_delta_zred"]))[0]
-            basis = self.line_basis(s_gas, opz_line, s_ins)
+                basis = self.line_basis(s_gas, opz_line, s_ins)
+            elif self.line_window is not None:
+                basis = self._line_basis_windowed(s_gas, opz_line, s_ins)
+            else:
+                basis = self.line_basis(s_gas, opz_line, s_ins)
         else:
             basis = jnp.asarray(basis)
         if line_flux_obs_all is not None:
-            out = out + basis @ line_flux_obs_all[self._line_idx_j]
+            out = out + (basis @ line_flux_obs_all[self._line_idx_j]).astype(out.dtype)
+        # A stays float64 (the likelihood's linear algebra): the line marginal solves normal
+        # equations in it whose condition number may reach COND_MAX = 1e10
+        # (likelihood/eline_marginal.py), where float32 columns would leave few correct digits
         A = None if fit_pos is None else basis[:, np.asarray(fit_pos, dtype=np.int64)]
         return out, A
+
+    # AGN narrow lines (ceridwen.agn.lines): a separate static painter, built by
+    # setup_agn_lines; None until then (the nebular path never reads it). Further AGN line sets
+    # (AGN2: the broad lines) get their own painter in _agn_sets, keyed by the set's name.
+    _agn = None
+    _agn_sets = None
+
+    def has_agn_lines(self, key="nlr") -> bool:
+        """True when the painter of AGN line set ``key`` has been built."""
+        if key == "nlr":
+            return self._agn is not None
+        return self._agn_sets is not None and key in self._agn_sets
+
+    def setup_agn_lines(self, agn_line_wave_rest, *, mode, sf_line_wave_rest=None,
+                        agn_sf_rows=None, pixel_mask=None, key="nlr"):
+        """Build the AGN-line painter for this projector (setup time, NumPy).
+
+        ``key``: the line set ("nlr", the default, is stored where it always was; any other
+        set, e.g. "blr", only with ``mode="corrected"``, the nebular painter's profile with the
+        set's own width).
+
+        ``mode`` "corrected": the nebular painter's profile (Gaussian in ln lambda, unit area,
+        width sqrt(agn_eline_sigma^2 + sigma_inst^2) with the instrument at the line, times the
+        sampled instrument scale). "prospector" / "fsps": Prospector's ``AGNSpecModel`` painter
+        (:func:`make_agn_line_painter_prospector`), which needs every nebular line
+        (``sf_line_wave_rest``, rest A), the nebular row of each AGN line (``agn_sf_rows``) and
+        the Spectrum's ``pixel_mask``."""
+        lam = np.asarray(agn_line_wave_rest, dtype=np.float64)
+        if self.instrument is None:
+            s_table = 0.5 * CKMS * np.gradient(np.log(self.wave_obs))
+        else:
+            s_table = np.asarray(self.sigma_inst_kms, dtype=np.float64)
+        if mode == "corrected":
+            paint = make_line_painter_free_z(self.wave_obs, lam, s_table)
+            if key == "nlr":
+                self._agn = {"mode": mode, "paint": paint}
+            else:
+                if self._agn_sets is None:
+                    self._agn_sets = {}
+                self._agn_sets[key] = {"mode": mode, "paint": paint}
+            return
+        if key != "nlr":
+            raise ValueError(f"setup_agn_lines(key={key!r}, mode={mode!r}): only the narrow "
+                             "lines have Prospector's painter; other line sets use 'corrected'")
+        if mode not in ("prospector", "fsps"):
+            raise ValueError(f"setup_agn_lines(mode={mode!r}): 'corrected', 'prospector' or 'fsps'")
+        if sf_line_wave_rest is None or agn_sf_rows is None:
+            raise ValueError(
+                "the Prospector AGN-line painter selects its pixels from the nebular lines "
+                "(AGNSpecModel asserts 'must add agn and nebular lines'): pass "
+                "sf_line_wave_rest and agn_sf_rows (a CSP with add_neb=True)")
+        sf = np.asarray(sf_line_wave_rest, dtype=np.float64)
+        # library width of each nebular line at its rest wavelength (Prospector interpolates the
+        # library resolution at the rest line wavelength); sigma_lib_kms is on wave_obs at opz_ref
+        lib = np.interp(sf * self.opz_ref, self.wave_obs,
+                        np.asarray(self.sigma_lib_kms, dtype=np.float64))
+        self._agn = {
+            "mode": mode,
+            "paint": make_agn_line_painter_prospector(self.wave_obs, lam, sf, agn_sf_rows,
+                                                      pixel_mask),
+            "sf_rest": jnp.asarray(sf), "lib": jnp.asarray(lib),
+            "inst": None if self.instrument is None else jnp.asarray(s_table),
+        }
+
+    def agn_lines(self, line_flux_obs, sigma_agn_kms, theta, key="nlr"):
+        """f_nu of the AGN lines on the observed pixels (add to :meth:`predict`):
+        ``line_flux_obs`` (n_agn,) observed integrated fluxes, ``sigma_agn_kms`` the set's width
+        (``agn_eline_sigma``, ``blr_sigma``); centres at rest x (1 + zred +
+        ``eline_delta_zred``). ``key``: the line set (see :meth:`setup_agn_lines`)."""
+        if not self.has_agn_lines(key):
+            raise RuntimeError(f"SpectralProjector.agn_lines(key={key!r}) before setup_agn_lines")
+        s_gal, s_gas = self.kinematics.resolve(theta)
+        opz = self.opz_ref
+        if self.free_z:
+            if "zred" not in theta:
+                raise KeyError("projector built with zred_range needs theta['zred']")
+            opz = 1.0 + jnp.ravel(jnp.asarray(theta["zred"]))[0]
+        if "eline_delta_zred" in theta:
+            opz = opz + jnp.ravel(jnp.asarray(theta["eline_delta_zred"]))[0]
+        s_ins = self.inst_scale(theta)
+        a = self._agn if key == "nlr" else self._agn_sets[key]
+        if a["mode"] == "corrected":                  # float32 profiles: float64 out, scaled
+            return _scaled_to_float64(
+                lambda f: a["paint"](f, sigma_agn_kms, opz, s_ins), line_flux_obs)
+        # Prospector's nebular widths (cache_eline_parameters): hypot(eline_sigma, lib), then
+        # hypot with sqrt(inst^2 - lib^2) (0 where negative) when the spectrum has a resolution
+        lib = a["lib"]
+        e = jnp.hypot(s_gas, lib)
+        if a["inst"] is not None:
+            inst = jnp.interp(a["sf_rest"] * opz, jnp.asarray(self.wave_obs), a["inst"])
+            if s_ins is not None:
+                inst = inst * s_ins
+            d2 = inst ** 2 - lib ** 2
+            e = jnp.hypot(e, jnp.where(d2 > 0.0, jnp.sqrt(jnp.where(d2 > 0.0, d2, 1.0)), 0.0))
+        return a["paint"](line_flux_obs, sigma_agn_kms, e, s_gas, opz)
 
     def summary(self) -> str:
         b = self.kinematics

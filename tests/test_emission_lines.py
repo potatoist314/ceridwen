@@ -23,7 +23,7 @@ import warnings
 
 import numpy as np
 import jax
-jax.config.update("jax_enable_x64", True)
+import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 import jax.numpy as jnp
 import pytest
 
@@ -36,6 +36,7 @@ from ceridwen.broadening import (                                          # noq
 )
 from ceridwen.observation import Photometry, Spectrum, Lines              # noqa: E402
 from ceridwen.model.transforms import logsfr_ratios_to_sfh               # noqa: E402
+from _f32bounds import B8   # noqa: E402,F401  (float32 bounds)
 
 ZRED = 0.3
 SIGMA_GAS = 80.0
@@ -90,7 +91,7 @@ def test_painter_is_linear_in_flux():
     a, b = jnp.array([1.0, 0.0]), jnp.array([0.0, 1.0])
     np.testing.assert_allclose(np.asarray(paint(2.0 * a + 3.0 * b, 80.0)),
                                2.0 * np.asarray(paint(a, 80.0)) + 3.0 * np.asarray(paint(b, 80.0)),
-                               rtol=1e-12, atol=0.0)
+                               rtol=B8, atol=0.0)      # float32 profiles (was rtol=1e-12)
 
 
 def test_free_z_painter_equals_fixed_painter_at_every_redshift():
@@ -111,9 +112,15 @@ def test_free_z_painter_is_differentiable_in_redshift():
     wave = np.exp(np.linspace(np.log(8000.0), np.log(9500.0), 4000))
     free = make_line_painter_free_z(wave, np.array([6564.72]), np.full(wave.size, 50.0))
 
+    # the centroid relative to the line's ln-lambda at opz = 1.3: summing f * ln(lambda) with
+    # ln(lambda) ~ 9.1 and differentiating cancels to ~3e-4 of it (sum df ~ 0 across a shifted
+    # profile), which amplified the float32 profile's rounding ~3e4 x (1.6e-5 measured);
+    # subtracting a constant does not change the derivative (was sum f ln(lambda) / sum f)
+    l0 = np.log(6564.72 * 1.3)
+
     def centre(opz):
         f = free(jnp.array([1.0]), 90.0, opz)
-        return jnp.sum(f * jnp.log(wave) / wave) / jnp.sum(f / wave)
+        return jnp.sum(f * (jnp.log(wave) - l0) / wave) / jnp.sum(f / wave) + l0
 
     g = float(jax.grad(centre)(1.3))
     assert np.isfinite(g)
@@ -334,22 +341,46 @@ def test_lines_observation_reads_grid_rows_and_sums_blends(built, csp):
     assert np.all(got > 0)
 
 
-def test_photometry_static_line_basis_matches_painted_lines(csp):
-    """Fixed sigma_gas: the static line-to-band basis gives the same photometry as painting
-    the lines onto the model grid (the A/B switch _force_paint_lines)."""
+def test_photometry_lines_are_their_flux_through_the_filters(csp):
+    """Each line enters the photometry as its observed flux through each filter
+    (Photometry._line_photometry): with broaden_photometry the exact integral of a Gaussian of
+    sigma_gas against the piecewise-linear filter.  Reference: every line a Gaussian on a
+    sigma/50 grid through the exact filter integral (FilterSet.flux_weights)."""
     spec, phot, lines = _obs()
     model = _model(csp, (spec, phot, lines))
     th = _theta(model)
-    static = np.asarray(model.predict(th)["phot"], dtype=np.float64)
-    csp._force_paint_lines = True
+    obs = model.obs_dict["phot"]
+    F = np.asarray(csp.predict_line_fluxes(_csp_theta(model, th), for_spectrum=True), float)
+    got = np.asarray(obs._line_photometry(F), dtype=np.float64)
+    pos = np.asarray(csp.neb.nebem_line_pos, dtype=np.float64) * (1.0 + ZRED)
+    lam = np.asarray(obs.filterset.lam)
+    ref = np.zeros(len(FILTERS))
+    for p, f in zip(pos, F):
+        sig = p * SIGMA_GAS / CKMS
+        if f <= 0.0 or p + 10 * sig < lam[0] or p - 10 * sig > lam[-1]:
+            continue
+        x = np.arange(p - 10 * sig, p + 10 * sig, sig / 50.0)
+        g = f * np.exp(-0.5 * ((x - p) / sig) ** 2) / (np.sqrt(2.0 * np.pi) * sig)
+        ref += obs.filterset.flux_weights(x, xp=np) @ g
+    np.testing.assert_allclose(got, ref, rtol=1e-6)
+    # and model.predict adds exactly this to the continuum photometry
+    full = np.asarray(model.predict(th)["phot"], dtype=np.float64)
+
+    class _NoLines:                     # the line term set to zero (None would be rebuilt)
+        free_z = sampled = False
+
+        def __call__(self, line_flux, opz=None, sigma_kms=None):
+            return jnp.zeros(len(FILTERS))
+
+    saved, obs._line_photometry = obs._line_photometry, _NoLines()
     try:
-        painted = np.asarray(model.predict(th)["phot"], dtype=np.float64)
+        model.__dict__.pop("_predict_jit_fn", None)
+        cont = np.asarray(model.predict(th)["phot"], dtype=np.float64)
     finally:
-        csp._force_paint_lines = False
-    np.testing.assert_allclose(static, painted, rtol=2e-4)
-    # and the lines matter: dropping them changes the band containing H-alpha (sdss_i0)
-    th0 = dict(th, frac_obrun=jnp.array([1.0]))
-    assert abs(static[2] / float(model.predict(th0)["phot"][2]) - 1.0) > 1e-3
+        obs._line_photometry = saved
+    np.testing.assert_allclose(full - cont, got, rtol=2e-5, atol=1e-7 * full.max())
+    # and the lines are a measurable part of the photometry
+    assert np.max(got / full) > 1e-3
 
 
 def test_eline_scaling_acts_on_lines_observation_only(csp):

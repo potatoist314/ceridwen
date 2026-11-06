@@ -5,6 +5,7 @@ imports and data paths repointed at ``ceridwen``.
 """
 import numpy as np
 import os
+import warnings
 import jax
 import jax.numpy as jnp
 from typing import  List, Optional, Tuple
@@ -24,6 +25,65 @@ from pathlib import Path
 _PKGDIR = Path(__file__).resolve().parent.parent   # the ceridwen package root
 
 lightspeed = 2.998e18  # AA/s
+
+# A directory of user ``.par`` files searched before the bundled library; read each time a
+# filter name is resolved (not at import), so it can be set inside a running session.
+FILTER_DIR_ENV = "CERIDWEN_FILTER_DIR"
+
+
+def library_filter_dir() -> str:
+    """The directory of the bundled filter library (``ceridwen/data/filters``)."""
+    try:
+        from importlib.resources import files
+        return str(files("ceridwen").joinpath("data", "filters"))
+    except Exception:
+        return os.path.join(str(_PKGDIR), "data", "filters")
+
+
+def _library_filter_file(kname: str) -> str:
+    try:
+        from importlib.resources import files
+        return str(files("ceridwen").joinpath("data", "filters", f"{kname}.par"))
+    except Exception:
+        # Fall back to the data directory relative to this file
+        _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(_pkg_dir, "data", "filters", f"{kname}.par")
+
+
+def resolve_filter_file(kname: str, directory: Optional[str] = None, *, warn: bool = True) -> str:
+    """The ``.par`` file of filter ``kname``.
+
+    With ``directory`` only ``<directory>/<kname>.par`` is tried.  Otherwise the order is
+    ``$CERIDWEN_FILTER_DIR`` (when set), then the bundled library; a name found in both is
+    taken from ``$CERIDWEN_FILTER_DIR`` with a ``UserWarning`` naming both files.  A name
+    found nowhere raises ``FileNotFoundError`` listing every file tried.
+    """
+    if directory is not None:
+        path = os.path.abspath(os.path.join(os.path.expanduser(os.fspath(directory)), f"{kname}.par"))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Filter transmission file '{path}' does not exist (directory= was given, so "
+                f"no other location is searched).")
+        return path
+    lib = _library_filter_file(kname)
+    env = os.environ.get(FILTER_DIR_ENV) or None
+    searched = []
+    if env is not None:
+        path = os.path.abspath(os.path.join(os.path.expanduser(env), f"{kname}.par"))
+        searched.append(f"{path} (${FILTER_DIR_ENV})")
+        if os.path.isfile(path):
+            if warn and os.path.isfile(lib):
+                warnings.warn(
+                    f"Filter '{kname}' is in ${FILTER_DIR_ENV} and in the bundled library; "
+                    f"using {path}, not {lib}.", UserWarning, stacklevel=3)
+            return path
+    searched.append(f"{lib} (bundled library)")
+    if os.path.isfile(lib):
+        return lib
+    raise FileNotFoundError(
+        f"Filter transmission file for '{kname}' does not exist; searched: "
+        + "; ".join(searched)
+        + f". Pass directory= (Photometry: filter_directory=) or set ${FILTER_DIR_ENV}.")
 
 
 
@@ -50,6 +110,7 @@ class Filter:
         wmin: float = 1e2,
         min_trans: float = 1e-5,
         data: Optional[Tuple] = None,
+        _path: Optional[str] = None,
         **extras
     ):
         """
@@ -64,7 +125,9 @@ class Filter:
             A short nickname for the filter (defaults to kname).
 
         directory : str, optional
-            Directory from which to load the filter file.
+            Directory from which to load the filter file (only that directory is tried).
+            Without it the name is looked up in ``$CERIDWEN_FILTER_DIR``, then in the
+            bundled library (:func:`resolve_filter_file`).
 
         dlnlam : float, optional
             If provided, resample the transmission to a log-lambda grid.
@@ -83,7 +146,13 @@ class Filter:
         self.min_trans = min_trans
 
         # Determine where to load the filter from
-        self.filename = self._resolve_filename(kname, directory) if data is None else None
+        # (_path: a file FilterSet has already resolved, so the lookup and its warning run once)
+        if data is not None:
+            self.filename = None
+        elif _path is not None:
+            self.filename = _path
+        else:
+            self.filename = resolve_filter_file(kname, directory)
 
         if data is not None:
             wave, trans = data
@@ -129,17 +198,8 @@ class Filter:
             return f"Filter: {self.nick}\n" + "\n".join(rows)
 
     def _resolve_filename(self, kname: str, directory: Optional[str]) -> str:
-        if directory is not None:
-            return os.path.join(directory, f"{kname}.par")
+        return resolve_filter_file(kname, directory)
 
-        try:
-            from importlib.resources import files
-            return str(files("ceridwen").joinpath("data", "filters", f"{kname}.par"))
-        except Exception:
-            # Fall back to the data directory relative to this file
-            _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            return os.path.join(_pkg_dir, "data", "filters", f"{kname}.par")
-        
     @property
     def transmission(self):
         return self._transmission
@@ -356,6 +416,33 @@ class Filter:
 
 
 
+#: the highest redshift the static windows of FilterSet.windowed_maggies cover
+FLUX_WINDOW_ZMAX = 30.0
+
+
+def _log_uniform_knots(wavelength):
+    """A filter's knots as float64 NumPy.  A float32 grid (float32 mode: ``gridify_transmission``
+    runs in the working precision) that is log-uniform up to float32 rounding is rebuilt in
+    float64 from its end points and length, so that :meth:`FilterSet._flux_tables` recognises
+    it; each knot moves by at most that rounding (~0.01 A at 4.4 um).  Float64 grids, and grids
+    that are not log-uniform, are returned unchanged."""
+    w = np.asarray(wavelength)
+    lam = w.astype(np.float64)
+    if w.dtype != np.float32 or lam.size < 3:
+        return lam
+    ln = np.log(lam)
+    d = np.diff(ln)
+    m = float(d.mean())
+    dev = float(np.abs(d - m).max())
+    # ln(lam) carries the rounding of a float32 ln (one ulp of |ln lam|) and of a float32 lam
+    # (eps): a step moves by at most twice their sum; 8x that leaves room for a GPU exp.  A grid
+    # that is not log-uniform deviates by a sizeable part of a step, not by rounding.
+    tol = 8.0 * (float(np.spacing(np.float32(np.abs(ln).max()))) + float(np.finfo(np.float32).eps))
+    if dev <= 1e-9 * m or not 0.0 < m or dev > tol or dev > 0.1 * m:
+        return lam
+    return np.exp(np.linspace(ln[0], ln[-1], lam.size))
+
+
 class FilterSet:
     """
     A collection of filters that share a common wavelength grid, enabling
@@ -398,9 +485,14 @@ class FilterSet:
             Logarithmic spacing for the shared wavelength grid. If None, inferred.
 
         loading_kwargs : dict
-            Additional keyword arguments passed to the filter loader.
+            Additional keyword arguments passed to the filter loader; ``directory=`` is where
+            the ``.par`` files are read (:func:`resolve_filter_file`).
         """
         self.filternames = filterlist
+        directory = loading_kwargs.pop("directory", None)
+        # each name resolved once: the files both loads below read, recorded as provenance
+        self.filterfiles = [resolve_filter_file(n, directory) for n in self.filternames]
+        loading_kwargs["_paths"] = self.filterfiles
 
         # Load the native filters (may have different wavelength grids initially)
         native = load_filters(self.filternames, **loading_kwargs)
@@ -508,6 +600,115 @@ class FilterSet:
         self.trans_list = [jnp.asarray(rows[i, starts[i]:stops[i]]) for i in range(n_filters)]
         self.frange = jnp.asarray(np.stack([starts, stops], axis=1))
 
+    def _flux_tables(self):
+        """Float64 NumPy tables of :meth:`flux_weights`, built once per filter on the filter's own
+        grid ``f.wavelength`` (the grid of its ``ab_zero_counts``): the knots, ``g = R lambda /
+        ab_zero_counts`` (linear between knots, zero outside), its slopes, the filter's mean
+        wavelength ``c``, and the cumulative integrals ``G0 = int g`` and
+        ``G1 = int (lambda - c) g``, exact at the knots, plus ``ln lam[0]`` and the grid's
+        step in ln lambda (0 when the grid is not log-uniform)."""
+        t = getattr(self, "_flux_tables_np", None)
+        if t is not None:
+            return t
+        tables = []
+        for f in self.filters:
+            lam = _log_uniform_knots(f.wavelength)
+            g = np.asarray(f.transmission, dtype=np.float64) * lam / float(f.ab_zero_counts)
+            h = np.diff(lam)
+            s = np.diff(g) / h
+            c = float((g * lam).sum() / g.sum())
+            u = lam - c
+            seg0 = h * (g[:-1] + g[1:]) / 2
+            seg1 = h * (u[:-1] * (2 * g[:-1] + g[1:]) + u[1:] * (g[:-1] + 2 * g[1:])) / 6
+            G0 = np.concatenate([[0.0], np.cumsum(seg0)])
+            G1 = np.concatenate([[0.0], np.cumsum(seg1)])
+            # the filter grids are log-uniform (_set_filters): the segment of a wavelength is
+            # then arithmetic, which is much faster than a search for a traced grid
+            dln = np.diff(np.log(lam))
+            uniform = float(np.abs(dln - dln.mean()).max()) <= 1e-9 * float(dln.mean())
+            tables.append((lam, g, s, c, G0, G1, np.log(lam[0]),
+                           float(dln.mean()) if uniform else 0.0))
+        self._flux_tables_np = tables
+        return tables
+
+    def flux_weights(self, wave, xp=jnp):
+        """(n_filters, n_wave) weights ``W`` with maggies = ``W @ f_lambda`` for an f_lambda
+        [erg/s/cm^2/A] on the ascending grid ``wave`` [A]: the exact integral of
+        R lambda f_lambda / ab_zero_counts, with f_lambda linear between the points of ``wave``
+        and R lambda linear between those of the filter's own grid.  It conserves the flux of a
+        feature of any width (a line narrower than the filter grid included), which sampling
+        f_lambda at the filter grid (:meth:`interp_source`) does not.  ``xp``: ``numpy`` at setup
+        (float64), ``jax.numpy`` for a traced ``wave`` (sampled redshift)."""
+        tables = self._flux_tables() if xp is np else self._flux_tables_traced()
+        x = xp.asarray(wave)
+        lnx = xp.log(x)
+        return xp.stack([self._row_weights(x, lnx, t, xp) for t in tables])
+
+    def _flux_tables_traced(self):
+        """:meth:`_flux_tables` as JAX arrays in the working float dtype (cached)."""
+        t = getattr(self, "_flux_tables_jnp", None)
+        if t is None:
+            from ceridwen.precision import float_dtype
+            t = self._flux_tables_jnp = [
+                tuple(jnp.asarray(a, dtype=float_dtype()) for a in row[:7]) + (row[7],)
+                for row in self._flux_tables()]
+        return t
+
+    @staticmethod
+    def _row_weights(x, lnx, table, xp):
+        """One filter's row of :meth:`flux_weights` on the grid ``x`` (``lnx = log x``)."""
+        lam, g, s, c, G0, G1, ln0, dln = table
+        n = lam.shape[0]
+        if dln > 0.0:
+            k = xp.clip(xp.floor((lnx - ln0) / dln).astype(xp.int32), 0, n - 2)
+            k = xp.clip(k - (x < lam[k]) + (x >= lam[xp.minimum(k + 1, n - 1)]), 0, n - 2)
+        else:
+            k = xp.clip(xp.searchsorted(lam, x, side="right") - 1, 0, n - 2)
+        dx = xp.clip(x, lam[0], lam[-1]) - lam[k]          # 0 below the filter, the last
+        gk, sk, uk = g[k], s[k], lam[k] - c                 # step above it
+        G0x = G0[k] + gk * dx + sk * dx ** 2 / 2
+        G1x = G1[k] + uk * gk * dx + (gk + uk * sk) * dx ** 2 / 2 + sk * dx ** 3 / 3
+        d0, d1 = G0x[1:] - G0x[:-1], G1x[1:] - G1x[:-1]
+        a, b = x[:-1] - c, x[1:] - c
+        h = x[1:] - x[:-1]
+        w_lo = (b * d0 - d1) / h                    # int (x_{i+1} - lambda) g / h: weight of f_i
+        w_hi = (d1 - a * d0) / h                    # int (lambda - x_i) g / h: weight of f_{i+1}
+        zero = xp.zeros((1,), dtype=w_lo.dtype)
+        return xp.concatenate([w_lo, zero]) + xp.concatenate([zero, w_hi])
+
+    def flux_window_widths(self, wave_rest, zmax=FLUX_WINDOW_ZMAX, nz=6001):
+        """Static window lengths for :meth:`windowed_maggies`: per filter, the most points of
+        ``(1 + z) wave_rest`` inside the filter for 0 <= z <= ``zmax``, plus one on each side and
+        a margin of 2 (the maximum is taken on ``nz`` redshifts); at most ``len(wave_rest)``."""
+        w = np.asarray(wave_rest, dtype=np.float64)
+        opz = 1.0 + np.linspace(0.0, float(zmax), int(nz))
+        out = []
+        for lam, *_ in self._flux_tables():
+            lo = np.searchsorted(w, lam[0] / opz, side="left")
+            hi = np.searchsorted(w, lam[-1] / opz, side="right")
+            out.append(int(min(w.size, (hi - lo).max() + 4)))
+        return out
+
+    def windowed_maggies(self, flam, wave, widths):
+        """Maggies (n_filters,) of one f_lambda on the traced grid ``wave`` [A]: the
+        :meth:`flux_weights` integral evaluated only on each filter's window of ``widths[j]``
+        points (static, from :meth:`flux_window_widths`), which holds every point with a
+        non-zero weight while ``wave`` is ``(1 + z) wave_rest`` with z <= the zmax of the widths.
+        The same numbers as ``flux_weights(wave) @ flam`` at a fraction of the cost."""
+        from jax import lax
+        x = jnp.asarray(wave)
+        f = jnp.asarray(flam)
+        n = x.shape[0]
+        out = []
+        for t, m in zip(self._flux_tables_traced(), widths):
+            if m >= n:
+                out.append(self._row_weights(x, jnp.log(x), t, jnp) @ f)
+                continue
+            start = jnp.clip(jnp.searchsorted(x, t[0][0], side="left") - 1, 0, n - m)
+            xs = lax.dynamic_slice(x, (start,), (m,))
+            out.append(self._row_weights(xs, jnp.log(xs), t, jnp) @ lax.dynamic_slice(f, (start,), (m,)))
+        return jnp.stack(out)
+
     def interp_source(self, inwave, sourceflux):
         """
         Interpolate input source SEDs onto the FilterSet's wavelength grid.
@@ -545,7 +746,9 @@ class FilterSet:
         sourceflux = jnp.atleast_2d(sourceflux)  # ensure (N_source, N_pix)
 
         if sourcewave is not None:
-            interp_flux = self.interp_source(sourcewave, sourceflux)  # (N_source, N_lam)
+            # the exact, flux-conserving integral over the source pixels (flux_weights)
+            maggies = jnp.dot(sourceflux, self.flux_weights(sourcewave).T)
+            return maggies.squeeze()
         else:
             assert sourceflux.shape[1] == self.lam.shape[0], \
                 "Input flux must be on the same wavelength grid as FilterSet.lam"
@@ -718,7 +921,10 @@ def load_filters(filternamelist, **kwargs):
     filterlist : list of Filter() instances
         A list of filter objects.
     """
-    return [Filter(f, **kwargs) for f in filternamelist]
+    paths = kwargs.pop("_paths", None)
+    if paths is None:
+        return [Filter(f, **kwargs) for f in filternamelist]
+    return [Filter(f, _path=p, **kwargs) for f, p in zip(filternamelist, paths)]
 
 def getSED(sourcewave, sourceflux, filterset=None, filterlist = None, linear_flux=False, **kwargs):
     """
@@ -767,7 +973,7 @@ def getSED(sourcewave, sourceflux, filterset=None, filterlist = None, linear_flu
     else:
         return sed
     
-def list_available_filters(startswith=None):
+def list_available_filters(startswith=None, directory=None):
     """
     Return a sorted list of available filter names.
 
@@ -775,6 +981,11 @@ def list_available_filters(startswith=None):
     ----------
     startswith : str, optional
         If given, only return filters whose names start with this string.
+
+    directory : str, optional
+        List the ``.par`` files in this directory only.  Without it, the names a filter
+        can be loaded by without ``directory=``: the bundled library together with
+        ``$CERIDWEN_FILTER_DIR`` when that is set.
 
     Returns
     -------
@@ -784,11 +995,17 @@ def list_available_filters(startswith=None):
     import os
     from importlib.resources import files
 
-    try:
-        filter_dir = files("ceridwen").joinpath("data/filters")
-        names = [f.name for f in filter_dir.iterdir() if f.name.endswith(".par")]
-    except Exception:
-        names = os.listdir(os.path.join(_PKGDIR, "data", "filters"))
+    if directory is not None:
+        names = os.listdir(os.path.expanduser(os.fspath(directory)))
+    else:
+        try:
+            filter_dir = files("ceridwen").joinpath("data/filters")
+            names = [f.name for f in filter_dir.iterdir() if f.name.endswith(".par")]
+        except Exception:
+            names = os.listdir(os.path.join(_PKGDIR, "data", "filters"))
+        env = os.environ.get(FILTER_DIR_ENV) or None
+        if env is not None and os.path.isdir(os.path.expanduser(env)):
+            names = sorted(set(names) | set(os.listdir(os.path.expanduser(env))))
 
     parfiles = sorted(n[:-4] for n in names if n.endswith(".par"))
 

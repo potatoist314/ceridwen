@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+import math
+from typing import Any, Callable, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+
+from ..precision import is_x64
 
 from .calibration import PolynomialCalibration as MarginalCalibration
 from .emission_lines import EmissionLineColumns
@@ -68,7 +72,8 @@ def finite_data(y: Array, sigma: Array) -> tuple[Array, Array]:
 def observation_data(obs) -> tuple:
     """``(y - sky, sigma, mask, calibration, upper_limit)`` of ``obs`` as the sampled
     likelihood uses them (``upper_limit`` None unless some datum is flagged), through
-    :func:`finite_data`."""
+    :func:`finite_data`.  In float32 mode ``y``, ``sigma`` and ``calibration`` (then never
+    None) are multiplied by :func:`observation_scale` (``docs/mac_gpu.md``)."""
     y = obs.flux
     sky = getattr(obs, "sky", None)
     if sky is not None:
@@ -76,7 +81,80 @@ def observation_data(obs) -> tuple:
     y, sigma = finite_data(y, obs.uncertainty)
     ul = getattr(obs, "upper_limit", None)
     ul = None if ul is None or not bool(jnp.any(ul)) else jnp.asarray(ul, dtype=bool)
-    return (y, sigma, obs.mask, getattr(obs, "calibration", None), ul)
+    calib = getattr(obs, "calibration", None)
+    scale = observation_scale(obs)                     # None under float64: nothing changes
+    if scale is not None:
+        y, sigma = y * scale, sigma * scale
+        calib = jnp.asarray(scale, dtype=y.dtype) if calib is None else jnp.asarray(calib) * scale
+    return (y, sigma, obs.mask, calib, ul)
+
+
+# ---------------------------------------------------------------------------
+# float32 mode (Apple GPU, docs/mac_gpu.md): data rescaling at the observation layer
+# ---------------------------------------------------------------------------
+# A spectrum in cgs F_nu has sigma ~ 1e-31, whose square underflows float32 (smallest normal
+# 1.2e-38), so every kernel that forms sigma_eff^2, 1/sigma_eff^2 or A^T W A would be wrong.
+# Under float32 each observation's data, uncertainties and calibration vector are multiplied
+# by one power of two that brings its used sigma to order unity (exact: no rounding), the
+# jitter theta key (data units) is shifted by ln(scale), and the kernels run in those units.
+# Their ln L is then the true ln L minus ndof * ln(scale), a constant of the observation; the
+# sampler is left in those units (adding ~1e6 inside a float32 kernel would quantise ln L),
+# and run_sampler / map_fit add the constant back to the reported ln Z and ln L on the host in
+# float64.  Under float64 (the default) every function here is a no-op and no trace changes.
+
+class Float32Rescaling(NamedTuple):
+    """How one observation was rescaled for the float32 kernels (``float32_rescaling``)."""
+    scale: float              #: power of two that multiplied y, sigma and the calibration vector
+    offset: float             #: ndof * ln(scale): true ln L = kernel ln L + offset
+    jitter_key: Optional[str] #: theta key of the noise model's jitter (data units), or None
+
+
+def observation_scale(obs) -> Optional[float]:
+    """float32 mode only: the power of two that brings the used uncertainties of ``obs`` to
+    order unity (``2 ** -floor(log2(median sigma))``); None under float64 or when no datum is
+    used, meaning no rescaling."""
+    if is_x64():
+        return None
+    sig = np.asarray(obs.uncertainty, dtype=np.float64)
+    used = np.asarray(obs.mask, dtype=bool) & np.isfinite(sig) & (sig > 0.0)
+    if not np.any(used):
+        return None
+    return float(2.0 ** -np.floor(np.log2(np.median(sig[used]))))
+
+
+def float32_rescaling(obs, likelihood) -> Optional[Float32Rescaling]:
+    """The :class:`Float32Rescaling` of ``obs`` under ``likelihood`` (None under float64):
+    its scale, the ln L offset, and the jitter key to shift.  A fixed numeric jitter (data
+    units) cannot be rescaled with the data and is refused."""
+    scale = observation_scale(obs)
+    if scale is None:
+        return None
+    nm = getattr(likelihood, "noise_model", None)
+    jitter_key = None
+    if nm is not None and getattr(nm, "use_jitter", False):
+        key = getattr(nm, "jitter_key", None)
+        if not isinstance(key, str):
+            raise ValueError(
+                f"float32 mode: the noise model of {getattr(obs, 'name', obs)!r} has a fixed "
+                f"jitter {key!r} in data units, which cannot be rescaled with the data.  Sample "
+                "it (jitter_key=<theta key>) or run in float64 (JAX_PLATFORMS=cpu; docs/mac_gpu.md)")
+        jitter_key = key
+    ndof = int(np.sum(np.asarray(obs.mask, dtype=bool)))
+    return Float32Rescaling(scale, ndof * math.log(scale), jitter_key)
+
+
+def rescaled_params(theta, rescaling: Optional[Float32Rescaling]):
+    """``theta`` with the jitter key shifted by ln(scale); ``theta`` itself when nothing is
+    rescaled (no trace change under float64)."""
+    if rescaling is None or rescaling.jitter_key is None or rescaling.jitter_key not in theta:
+        return theta
+    return {**theta, rescaling.jitter_key: theta[rescaling.jitter_key] + math.log(rescaling.scale)}
+
+
+def loglike_offset(rescalings) -> float:
+    """Sum of the ln L offsets of ``rescalings`` (an iterable of :class:`Float32Rescaling` or
+    None): what to add to a kernel's ln L, ln Z or MAP ln posterior to report true values."""
+    return float(sum(r.offset for r in rescalings if r is not None))
 
 
 def single_observation_data(observations, what: str, upper_limits: bool = False) -> tuple:
@@ -444,6 +522,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
         calibrate         = self._calibrated
         calibration       = self.calibration
         emission_lines    = self.emission_lines
+        rescaling         = float32_rescaling(observations, self)   # None under float64
 
         if getattr(noise_model, "use_outlier", False):
             if calibration is not None or emission_lines is not None:
@@ -453,10 +532,11 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
 
             @jax.jit
             def lnprobfn_outlier(theta: dict[str, Array]) -> Array:
+                th = rescaled_params(theta, rescaling)
                 mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
-                               theta)
-                noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
-                f, nsigma = noise_model.outlier_params(theta)
+                               th)
+                noise_out = noise_model.compute(sigma_obs, mu, mask, th, data=y)
+                f, nsigma = noise_model.outlier_params(th)
                 lnl, _    = lnlike_diag_outlier(
                     y, mu, noise_out.inv_var, noise_out.log_det, mask, f, nsigma
                 )
@@ -466,9 +546,10 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
 
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
+            th = rescaled_params(theta, rescaling)
             mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
-                               theta)
-            noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
+                               th)
+            noise_out = noise_model.compute(sigma_obs, mu, mask, th, data=y)
             lnl = jnp.zeros(())
             if emission_lines is not None:
                 mu, _, _, ln_extra = calibration.calibrate_with_lines(
@@ -575,14 +656,16 @@ class DiagonalGaussianLikelihoodWithUpperLimits(LikelihoodBase):
             is_ul = jnp.asarray(is_ul, dtype=bool)
         noise_model = self.noise_model
         calibrate   = self._calibrated
+        rescaling   = float32_rescaling(observations, self)   # None under float64
 
         if getattr(noise_model, "use_outlier", False):
             @jax.jit
             def lnprobfn_outlier(theta: dict[str, Array]) -> Array:
+                th = rescaled_params(theta, rescaling)
                 mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
-                               theta)
-                noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
-                f, nsigma = noise_model.outlier_params(theta)
+                               th)
+                noise_out = noise_model.compute(sigma_obs, mu, mask, th, data=y)
+                f, nsigma = noise_model.outlier_params(th)
                 lnl, _    = lnlike_diag_outlier_with_upper_limits(
                     y, mu, noise_out.inv_var, noise_out.log_det, mask, is_ul, f, nsigma,
                 )
@@ -592,9 +675,10 @@ class DiagonalGaussianLikelihoodWithUpperLimits(LikelihoodBase):
 
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
+            th = rescaled_params(theta, rescaling)
             mu = calibrate(y, calibrated_mu(model.predict(theta), calib), sigma_obs, mask,
-                               theta)
-            noise_out = noise_model.compute(sigma_obs, mu, mask, theta, data=y)
+                               th)
+            noise_out = noise_model.compute(sigma_obs, mu, mask, th, data=y)
             lnl, _    = lnlike_diag_gaussian_with_upper_limits(
                 y, mu, noise_out.inv_var, noise_out.log_det, mask, is_ul,
             )
@@ -658,14 +742,15 @@ class MultiObservationLikelihood(LikelihoodBase):
             aux[key]     = aux_i
         return lnl_total, aux
 
-    def loglike(self, data, predictions, theta) -> Array:
+    def loglike(self, data, predictions, theta, rescalings=None) -> Array:
         """Total log-likelihood, the sum over observations.
 
         ``data[key] = observation_data(obs)`` (``(y, sigma, mask, calibration, upper_limit)``),
         ``predictions[key] = mu``.  A spectrum whose emission lines are shared with a
         Photometry (``emission_lines.photometry_key``) is evaluated together with it by
         :meth:`DiagonalGaussianLikelihood.with_photometry`; that Photometry's own term is
-        then skipped."""
+        then skipped.  ``rescalings[key]`` (:func:`float32_rescaling`, float32 mode) shifts
+        each observation's jitter key; None (float64) leaves ``theta`` unchanged."""
         by_key = dict(zip(self.keys, self.likelihoods))
         shared = {getattr(getattr(lh, "emission_lines", None), "photometry_key", None): key
                   for key, lh in by_key.items()}
@@ -675,6 +760,7 @@ class MultiObservationLikelihood(LikelihoodBase):
             if key in shared:
                 continue
             y_k, sig_k, mask_k, calib_k, ul_k = data[key]
+            th = theta if rescalings is None else rescaled_params(theta, rescalings[key])
             mu_k = calibrated_mu(predictions[key], calib_k)
             phot_key = getattr(getattr(lhood, "emission_lines", None), "photometry_key", None)
             if phot_key is not None:
@@ -683,13 +769,13 @@ class MultiObservationLikelihood(LikelihoodBase):
                     raise ValueError(
                         "emission lines shared with a Photometry that flags upper limits")
                 lnl_k = lhood.with_photometry(
-                    y_k, mu_k, sig_k, mask_k, theta,
+                    y_k, mu_k, sig_k, mask_k, th,
                     (y_p, calibrated_mu(predictions[phot_key], calib_p), sig_p, mask_p,
                      by_key[phot_key].noise_model))
             elif ul_k is not None:
-                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta, is_upper_limit=ul_k)
+                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=th, is_upper_limit=ul_k)
             else:
-                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=theta)
+                lnl_k, _ = lhood(y_k, mu_k, sig_k, mask_k, params=th)
             lnl = lnl + lnl_k
         return lnl
 
@@ -701,10 +787,13 @@ class MultiObservationLikelihood(LikelihoodBase):
     ) -> Callable[[dict[str, Array]], Array]:
         """Return a jitted log-posterior; ``observations`` and ``model.predict(theta)`` are dicts keyed
         like ``self.keys``.  Each observation's ``sky``, ``calibration`` and ``upper_limit`` are honoured
-        as in ``ceridwen.sampler.runner.run_sampler``."""
+        as in ``ceridwen.sampler.runner.run_sampler``.  In float32 mode the value is offset by
+        ``-loglike_offset(...)`` (a constant of the observations, see :func:`float32_rescaling`)."""
         static_data = {key: observation_data(observations[key]) for key in self.keys}
         keys        = self.keys
         likelihoods = self.likelihoods
+        rescalings  = {key: float32_rescaling(observations[key], lh)      # None under float64
+                       for key, lh in zip(keys, likelihoods)}
 
         if getattr(model, "_eline_system", None) is not None:
             from .eline_marginal import joint_loglike
@@ -718,7 +807,7 @@ class MultiObservationLikelihood(LikelihoodBase):
 
         @jax.jit
         def lnprobfn(theta: dict[str, Array]) -> Array:
-            lnl = self.loglike(static_data, model.predict(theta), theta)
+            lnl = self.loglike(static_data, model.predict(theta), theta, rescalings)
             lnp = prior.log_prob(theta)
             return lnl + lnp
 

@@ -23,12 +23,13 @@ from ceridwen.broadening import (                                   # noqa: E402
     Instrument, Kinematics, TIED, DEFAULT_KINEMATICS, LogGrid, make_gaussian_fft, build_response,
     apply_response, make_line_painter, make_line_painter_free_z, SpectralProjector,
     PhotometricBroadener, FWHM_TO_SIGMA)
+from _f32bounds import B8, lnl_bound, fft_atol   # noqa: E402,F401  (float32 bounds)
 
 FAKE = getattr(jax, "__fake__", False)
 needs_jax = pytest.mark.skipif(FAKE, reason="needs a real JAX")
 
 if not FAKE:
-    jax.config.update("jax_enable_x64", True)
+    import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 
 
 def model_grid(dv_fine=8.0, dv_coarse=40.0):
@@ -159,6 +160,63 @@ def test_stage_a_conserves_sum(wm):
     assert np.isclose(out.sum(), y.sum(), rtol=1e-10)
 
 
+def test_float32_smoothing_finite_at_cgs_scale(wm):
+    """A float32 spectrum at cgs scale (F_nu ~ 1e-29) under cotangents of ~1e36 per pixel
+    (residual / sigma^2 times a photometry matrix, as in a fit): value and gradient finite and
+    equal to the float64 smoothing to float32 precision. Unscaled, the FFT's backward pass sums
+    the cotangents past float32's maximum (3.4e38) and returns NaN. An all-zero spectrum stays
+    finite too: the double where returns 0 and sends no cotangent into the FFT (its gradient is
+    0, where the float64 path gives S^T w; the window adds nothing to the prediction)."""
+    g = LogGrid.build(wm, 3600., 7000., sigma_max_kms=500.)
+    smooth = make_gaussian_fft(g)
+    rng = np.random.default_rng(3)
+    y = 1e-29 * (1.0 + 0.5 * np.sin(np.arange(g.n) / 50.0))
+    w = 1e36 * rng.uniform(0.5, 1.5, g.n)
+
+    def loss(x, dt):
+        return jnp.sum(jnp.asarray(w, dt) * smooth(x, jnp.asarray(300.0, dt)))
+
+    for x0 in (y, np.zeros(g.n)):
+        v32, g32 = jax.value_and_grad(loss)(jnp.asarray(x0, jnp.float32), jnp.float32)
+        v64, g64 = jax.value_and_grad(loss)(jnp.asarray(x0, jnp.float64), jnp.float64)
+        assert np.isfinite(float(v32)) and np.all(np.isfinite(np.asarray(g32)))
+        if not np.any(x0):
+            assert float(v32) == 0.0
+            continue
+        # the edge pixels' gradients collect the padded buffer (the edge value is continued
+        # over n_pad - n points): a float32 sum of K terms is good to K * eps
+        k_eps = (g.n_pad - g.n) * 2.0 ** -24
+        np.testing.assert_allclose(np.asarray(g32), np.asarray(g64), rtol=k_eps)
+        np.testing.assert_allclose(np.asarray(g32)[1:-1], np.asarray(g64)[1:-1], rtol=1e-5)
+        assert float(v32) == pytest.approx(float(v64), rel=1e-5)
+
+
+def test_projection_gradient_finite_far_from_data(wm, wo):
+    """A float32 model spectrum at ~1e-22 (10 Jy) with lines, against data 0 +- 1e-31 (10 nJy):
+    the likelihood's cotangent |r| / sigma^2 ~ 1e40 at the projector's output exceeds float32's
+    maximum (3.4e38). Value and gradient in the float64 parameters (line fluxes, sampled
+    sigma_gal and sigma_gas) must be finite: the projector returns float64 and scales its float32
+    work by a power of two (broadening._scaled_to_float64); without that they are NaN. (The
+    spectrum itself is held fixed: in a model its cotangent is diluted by the resampling onto
+    the ~25x finer model grid; a float32 leaf at cgs scale cannot hold a gradient of 1e40.)"""
+    line_rest = np.array([4861.3, 5006.8])
+    kin = Kinematics(sigma_gal="sigma_gal", sigma_gas="sigma_gas", sigma_max=600.0)
+    proj = SpectralProjector.build(kin, Instrument.R_fwhm(1000.), wm, wo, Z,
+                                   line_wave_rest=line_rest)
+    x0 = jnp.asarray(1e-22 * (1.0 + 0.1 * np.sin(np.arange(wm.size) / 30.0)), jnp.float32)
+    f0 = jnp.asarray([3e-12, 9e-12])
+
+    def lnl(x, flux, sg, sgas):
+        mu = proj.predict(x, flux, {"sigma_gal": sg, "sigma_gas": sgas})
+        return -0.5 * jnp.sum((mu / 1e-31) ** 2)
+
+    val, grads = jax.value_and_grad(lnl, argnums=(1, 2, 3))(
+        x0, f0, jnp.array([150.0]), jnp.array([80.0]))
+    assert np.isfinite(float(val))
+    for g in grads:
+        assert np.all(np.isfinite(np.asarray(g)))
+
+
 @pytest.mark.parametrize("sigma_gal,inst", [
     (0.0, Instrument.R_fwhm(3000.)),
     (120.0, Instrument.R_fwhm(3000.)),
@@ -244,7 +302,9 @@ def test_line_painter_flux_and_profile(wo):
         out = np.asarray(paint(jnp.asarray(flux), jnp.asarray(s_gas)))
         s_tot = np.sqrt(s_gas ** 2 + s_inst ** 2)
         ref = sum(analytic_line_fnu(wo, l0, f, s) for l0, f, s in zip(lines, flux, s_tot))
-        assert np.allclose(out, ref, rtol=1e-10, atol=1e-12 * ref.max())
+        # the profile is float32 (one exp, one divide, one product): B8 of the peak
+        # (was rtol=1e-10, atol=1e-12 * peak)
+        assert np.allclose(out, ref, rtol=0.0, atol=B8 * ref.max())
         assert np.isclose(integrate_fnu_dnu(wo, out), flux.sum(), rtol=2e-3)
     paint2 = make_line_painter(wo, np.array([6562.8 * (1 + Z)]), np.array([80.]))
     out2 = np.asarray(paint2(jnp.asarray([1.0]), jnp.asarray(50.0)))
@@ -341,7 +401,8 @@ def test_free_z_projector_matches_fixed_z(wm, wo):
         assert np.max(np.abs(a - b)) < 1e-4, z
         la = np.asarray(free.lines(F, jnp.asarray(80.0), 1.0 + z))
         lb = np.asarray(fixed.lines(F, jnp.asarray(80.0)))
-        assert np.max(np.abs(la - lb)) < 1e-8 * lb.max(), z
+        # summation order differs between jax versions: 4.9e-8 of the peak on jax 0.11.2 (arm64)
+        assert np.max(np.abs(la - lb)) < 1e-6 * lb.max(), z
     # the free-z window keeps every line that enters the observed range for some z
     assert set(free.line_idx.tolist()) >= set(
         SpectralProjector.build(kin, inst, wm, wo, 0.35, line_wave_rest=LINES_REST).line_idx.tolist())

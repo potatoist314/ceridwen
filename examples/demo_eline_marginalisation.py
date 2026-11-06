@@ -54,8 +54,12 @@ def main() -> None:
     if not os.environ.get("SPS_HOME"):
         sys.exit("add_neb=True reads the CLOUDY grids from $SPS_HOME, which is unset.")
     rng = np.random.default_rng(SEED)
-    ssp = (SSPData.load(str(SSP_FILE)) if SSP_FILE.is_file()
-           else SSPData.from_fsps(imf_type=1, save_to=str(SSP_FILE)))
+    if SSP_FILE.is_file():
+        ssp = SSPData.load(str(SSP_FILE))
+    else:
+        from ceridwen.ssps import fetch_grid             # the published grid (Zenodo, cached)
+        print("[grid] no examples/ssp_data.h5: using the published grid mist_miles_chab")
+        ssp = SSPData.load(str(fetch_grid("mist_miles_chab")))
     cosmo = Cosmology.planck18()
     csp = CSPBasis(ssp, lookback_time=jnp.linspace(0.0, float(cosmo.age(ZRED)), N_TIME),
                    zh_const=True, sfh_interp="step", add_dust=False, add_diffuse_dust=True,
@@ -95,7 +99,8 @@ def main() -> None:
                   phot_true + phot_unc * rng.standard_normal(phot_true.size), phot_unc)
     print(model.summary())
 
-    result = fitSED(model, output_dir=OUT, rng_key=jax.random.PRNGKey(SEED))
+    result = fitSED(model, output_dir=OUT, sampler_kwargs={"num_inner_steps": 30},
+                    rng_key=jax.random.PRNGKey(SEED))
     el = read_result_h5(OUT / "ceridwen_result.h5")["elines"]
     w = np.exp(np.asarray(result.log_weights) - np.max(result.log_weights))
     w /= w.sum()

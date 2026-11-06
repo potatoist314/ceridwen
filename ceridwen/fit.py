@@ -122,18 +122,34 @@ def fitSED(
         "%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(_file_handler)
 
+    from .update_check import notify_if_outdated
+    notify_if_outdated()                       # once a day at most; silent offline
+
     try:
+        from .precision import is_x64, precision_name
         _devices = jax.devices()
         _backend = jax.default_backend().upper()
         _device_str = ", ".join(str(d) for d in _devices)
+        _apple_gpu = _backend in ("MTL", "MPS")       # jax-graft (mtl) / jax-mps: float32 only
+        if _apple_gpu and is_x64():
+            raise ValueError(
+                f"fitSED on the {_backend} backend ({_device_str}) with float64 on: an Apple GPU "
+                "has no float64.  Unset CERIDWEN_X64 (float32 mode on the GPU, docs/mac_gpu.md) or "
+                "keep this fit on the CPU with JAX_PLATFORMS=cpu")
 
         logger.info("ceridwen.fitSED")
         logger.info(f"  Device      : {_backend}  ({_device_str})")
+        logger.info(f"  Precision   : {precision_name()}"
+                    + ("" if is_x64() else
+                       "  (float32 mode, docs/mac_gpu.md: ln Z and gradients are float32, not "
+                       "comparable bit for bit with a float64 fit)"))
         if _backend == "CPU":
             logger.info(
                 "                ^ running on CPU — for GPU check that a "
                 "CUDA-enabled jaxlib is installed and JAX_PLATFORMS is unset"
             )
+        elif _apple_gpu:
+            logger.info("                ^ Apple GPU (float32)")
         logger.info(f"  Sampler     : {sampler}")
         logger.info(f"  Cosmology   : {model.cosmo.describe()}")
         logger.info(f"  Redshift    : {model._redshift_line()}")
@@ -679,8 +695,10 @@ def _describe_adapter(adapter, model) -> str:
         n_dims = sum(int(jnp.size(v)) for v in model.theta_init.values())
         inner = adapter._num_inner_steps if adapter._num_inner_steps is not None else n_dims * 5
         ndel = adapter._num_delete if adapter._num_delete is not None else max(1, adapter.num_live // 5)
+        kernel = getattr(adapter, "slice_kernel", "stock")
         return (f"nested: num_live={adapter.num_live}, num_inner_steps={inner}, "
-                f"num_delete={ndel}, logZ_tol={adapter.logZ_tol:g}")
+                f"num_delete={ndel}, logZ_tol={adapter.logZ_tol:g}"
+                + ("" if kernel == "stock" else f", slice_kernel={kernel}"))
     keys = ("num_warmup", "num_samples", "num_chains", "target_acceptance")
     return cls + ": " + ", ".join(f"{k}={getattr(adapter, k)}" for k in keys if hasattr(adapter, k))
 
@@ -725,7 +743,8 @@ def write_result_h5(
             mask           (n_data,)  bool
             sky, calibration, upper_limit   (n_data,)  when the observation has them
             attrs: type, name, noise_floor, [instrument_kind, instrument_scale,
-                   instrument_scale_range, subtract_library, filternames, ...],
+                   instrument_scale_range, subtract_library, filternames,
+                   filterfiles (JSON: the absolute .par path of each filter), ...],
                    likelihood_json (with ``likelihood``: kernel class and noise-model settings)
 
         /provenance/        attrs: ceridwen_version, ceridwen_githash (build stamp),
@@ -812,8 +831,8 @@ def write_result_h5(
                     og.attrs["zred_ref"] = float(proj.opz_ref - 1.0)
             if hasattr(obs, "filternames"):
                 og.attrs["filternames"] = json.dumps(obs.filternames)
-            if getattr(obs, "filter_directory", None) is not None:
-                og.attrs["filter_directory"] = str(obs.filter_directory)
+            if getattr(obs, "filterfiles", None) is not None:
+                og.attrs["filterfiles"] = json.dumps(list(obs.filterfiles))
             if hasattr(obs, "line_names") and obs.line_names is not None:
                 og.attrs["line_names"] = json.dumps(list(obs.line_names))
             if hasattr(obs, "line_ind") and obs.line_ind is not None:
@@ -1026,6 +1045,11 @@ def adapter_settings(adapter, model=None) -> dict:
                                else max(1, adapter.num_live // 5)),
                    logZ_tol=adapter.logZ_tol,
                    checkpoint_interval_s=adapter.checkpoint_interval_s)
+        # the inner slice kernel (default "lanes"); absent means "stock", as in every file
+        # written before slice_kernel= existed, so those files still read correctly
+        kernel = getattr(adapter, "slice_kernel", "stock")
+        if kernel != "stock":
+            out["slice_kernel"] = kernel
         return out
     for k in ("num_warmup", "num_samples", "num_chains", "target_acceptance",
               "initial_step_size", "max_num_doublings", "dense_mass", "bounds"):
@@ -1053,6 +1077,10 @@ def _write_run_provenance(f, adapter, rng_key, model=None) -> None:
     if dirty is not None:
         g.attrs["git_dirty"] = bool(dirty)
     g.attrs["jax_version"] = str(jax.__version__)
+    from .precision import precision_name
+    cfg = f.create_group("config")
+    cfg.attrs["precision"] = precision_name()               # "float64" | "float32" (CERIDWEN_X64=0)
+    cfg.attrs["platform"] = str(jax.default_backend())      # "cpu" | "gpu" | "mtl" | ...
     from importlib.metadata import version, PackageNotFoundError
     for dist in ("blackjax", "numpy"):
         try:
@@ -1087,10 +1115,13 @@ def _provenance_from_group(g) -> dict:
 
 def _write_csp_config(mod_grp, model) -> None:
     """The CSP choices a rebuilt model is checked against (``ceridwen.resultfile``)."""
+    from .csp.csp import spectrum_model_name as _spectrum_model_name
     csp = model.csp
     igm = getattr(csp, "igm", None)
     cfg = {"class": type(csp).__name__,
-           "spectrum_model": getattr(getattr(csp, "get_spectrum", None), "__name__", None),
+           # with agn= the kernel is a bound method, whose __name__ is its function's, so the
+           # "<kernel>_agn" name comes from csp.spectrum_model_name (csp._agn_base_name)
+           "spectrum_model": _spectrum_model_name(csp, None),
            "sfh_interp": getattr(csp, "sfh_interp", None),
            "zh_const": getattr(csp, "zh_const", None),
            "track_zred_age": getattr(csp, "track_zred_age", None),
@@ -1101,6 +1132,12 @@ def _write_csp_config(mod_grp, model) -> None:
            "igm_factor": getattr(csp, "igm_factor", None),
            "isoc_type": getattr(csp, "_ssp_isoc_type", None),
            "spec_library": getattr(csp, "_ssp_spec_library", None)}
+    if getattr(csp, "_wave_support", False):   # opt-in; absent when off, so earlier files compare
+        cfg["wavelength_support"] = True
+    if getattr(csp, "_agn", None) is not None:  # CSPBasis(agn=...); absent without AGN
+        cfg["agn"] = csp._agn.provenance()
+    if getattr(csp, "fixed", None):             # CSPBasis(fixed=...); absent when none
+        cfg["fixed"] = {k: np.asarray(v, dtype=float).tolist() for k, v in csp.fixed.items()}
     mod_grp.attrs["csp_config"] = json.dumps(cfg, default=str)
     if hasattr(csp, "sfh_times"):
         mod_grp.create_dataset("sfh_times_yr", data=np.asarray(csp.sfh_times))
@@ -1334,9 +1371,11 @@ def load_result_h5(path: str | Path):
         param_names = list(f["model"]["param_names"].asstr()[()])
 
         samples = {p: jnp.asarray(np.array(samp[p])) for p in param_names}
-        log_likelihoods = jnp.asarray(np.array(samp["log_likelihoods"]))
-        log_weights     = jnp.asarray(np.array(samp["log_weights"]))
-        llb = (jnp.asarray(np.array(samp["log_likelihoods_birth"]))
+        # ln L and the weights stay float64 on the host, as run_sampler returns them in float32
+        # mode (runner._with_loglike_offset): float32 resolves ln L ~ 4e4 only to 4e-3
+        log_likelihoods = np.asarray(samp["log_likelihoods"], dtype=np.float64)
+        log_weights     = np.asarray(samp["log_weights"], dtype=np.float64)
+        llb = (np.asarray(samp["log_likelihoods_birth"], dtype=np.float64)
                if "log_likelihoods_birth" in samp else None)
 
         raw = {}
@@ -1392,7 +1431,8 @@ def read_derived_h5(path: str | Path) -> dict:
 
 def read_result_h5(path: str | Path) -> dict:
     """Read a result HDF5 file into a nested dict with keys ``'obs'``, ``'model'``,
-    ``'samples'``, ``'provenance'``, ``'elines'``
+    ``'samples'``, ``'provenance'``, ``'config'`` (``precision``: float64 / float32,
+    ``platform``: the JAX backend the fit ran on), ``'elines'``
     (when the fit marginalised the emission lines), ``'map'`` (when it ran with
     ``optimize=True``) and ``'derived'`` (``read_derived_h5``; when fitSED wrote
     ``/derived/mfrac``)."""
@@ -1443,6 +1483,8 @@ def read_result_h5(path: str | Path) -> dict:
 
         if "provenance" in f:
             out["provenance"] = _provenance_from_group(f["provenance"])
+        if "config" in f:
+            out["config"] = dict(f["config"].attrs)
 
         if "elines" in f:
             g = f["elines"]

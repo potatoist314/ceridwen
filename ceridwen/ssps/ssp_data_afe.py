@@ -75,7 +75,8 @@ class SSPDataAfe(SSPData):
     ssp_afe : jnp.ndarray (n_afe,), keyword-only -- [alpha/Fe] grid, strictly increasing
     ssp_lg_age_gyr : jnp.ndarray (n_ages,) -- log10(age / Gyr)
     ssp_wave : jnp.ndarray (n_wave,) -- Angstrom
-    ssp_flux : jnp.ndarray (n_afe, n_met, n_ages, n_wave) -- Lsun / Hz per Msun formed
+    ssp_flux : np.ndarray (n_afe, n_met, n_ages, n_wave) -- Lsun / Hz per Msun formed; host NumPy,
+        read-only, as in ``SSPData``
     ssp_resolution : np.ndarray (n_wave,) or None -- sigma_v(lambda) [km/s] on ``ssp_wave``; required by save/load
     ssp_stellar_mass : np.ndarray (n_afe, n_met, n_ages) or None -- surviving mass per M_sun formed (optional)
     """
@@ -85,10 +86,6 @@ class SSPDataAfe(SSPData):
     _display_title = "SSPDataAfe"
     _schema_label = "SSPDataAfe schema 3.1"
     _extra_datasets = ("ssp_afe",)
-    # Host NumPy flux, deliberately: under x64 a jnp array puts the full float64
-    # cube (611 MB for the published grid) on the device, where nothing reads it --
-    # CSPBasis_afe keeps only a float32 copy. save() round-trips float64 unchanged.
-    _flux_on_host = True
 
     @classmethod
     def _schema_version(cls) -> str:
@@ -301,7 +298,7 @@ class SSPDataAfe(SSPData):
                 )
 
         ssp_wave = jnp.array(_wave)
-        ssp_flux = jnp.array(np.stack(planes, axis=0))
+        ssp_flux = np.stack(planes, axis=0)                # host NumPy (SSPData keeps it there)
 
         meta = _read_fsps_provenance(ssp, kwargs, ssp_wave, ssp_lgmet)
         meta['schema_version'] = SSP_AFE_SCHEMA_VERSION

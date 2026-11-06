@@ -81,8 +81,9 @@ def main() -> None:
     if SSP_FILE.is_file():
         ssp = SSPData.load(str(SSP_FILE))
     else:
-        print("[grid] building SSP grid with FSPS (a few minutes) ...")
-        ssp = SSPData.from_fsps(imf_type=1, save_to=str(SSP_FILE))
+        from ceridwen.ssps import fetch_grid             # the published grid (Zenodo, cached)
+        print("[grid] no examples/ssp_data.h5: using the published grid mist_miles_chab")
+        ssp = SSPData.load(str(fetch_grid("mist_miles_chab")))
 
     csp = CSPBasis(
         ssp,
@@ -122,7 +123,7 @@ def main() -> None:
                 "diffuse_tau_kc": ClippedNormal(mean=0.3, sigma=1.0,
                                                 low=0.0, high=4.0),
                 "diffuse_dust_index": Uniform(low=-1.0, high=0.4),
-                "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=1.0),
+                "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=0.3),
                 # the fitted stellar velocity dispersion (upper bound must
                 # stay below Kinematics.sigma_max, 2000 km/s by default)
                 "sigma_gal": Uniform(low=50.0, high=400.0),

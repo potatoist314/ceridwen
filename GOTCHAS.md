@@ -115,7 +115,16 @@ prefer `predict`/`get_spectrum_components`.
 - **Non-finite flux or non-finite / non-positive uncertainties** are masked at
   construction, with a warning when your mask did not already exclude them; the
   likelihood never sees them (not in the value, not in the gradient).
-- **Unknown filter name** → `FileNotFoundError` naming the missing `.par` file.
+- **Unknown filter name** → `FileNotFoundError` listing every `.par` file tried.
+  Lookup order: `Photometry(filter_directory=...)` alone when given (no
+  fallback); otherwise `$CERIDWEN_FILTER_DIR`, then the bundled library.
+- **A filter name in both `$CERIDWEN_FILTER_DIR` and the library** → the
+  `$CERIDWEN_FILTER_DIR` file is used, with a `UserWarning` naming both paths.
+  A stale variable in your shell changes every fit that uses that name.
+- **`Filter` objects in `Photometry(filters=...)`** are reloaded by name. One
+  built with `data=`, or read from a file other than the one its name resolves
+  to, raises `ValueError` (it used to be replaced by the library file
+  silently); pass the name and `filter_directory=` instead.
 - `SedModel` calls `setup_for_model` for every observation at construction, so
   you never call it yourself there. If you replace `model.observations`
   afterwards, call `model.setup_observations()` (it also drops the cached
@@ -189,13 +198,26 @@ prefer `predict`/`get_spectrum_components`.
   state; constructing a second `StellarPopulation` corrupts the first. CERIDWEN makes them
   only when it builds grids (`SSPData.from_fsps`, `SSPDataAfe`, `SSPBasis`, and the AGB-dust
   shell, which makes two); fitting reads grid *files*, and the nebular model reads files too.
-- **Apple Metal / GPU float32:** x64 is unsupported on Metal. The package enables
-  `jax_enable_x64=True`; on Metal force `JAX_PLATFORMS=cpu` for float64 parity.
+- **Apple GPU = float32, automatically.** With jax-graft installed (part of `pip install
+  ceridwen` on macOS 26 / Apple Silicon / Python >= 3.12) the Apple GPU is JAX's default
+  backend and `import ceridwen` turns `jax_enable_x64` OFF for the process, with one warning.
+  Everything then runs in float32: `ceridwen.precision.float_dtype()` is the dtype to use for
+  device arrays, never a literal `jnp.float64`. The observation layer rescales each
+  observation's data by a power of two so cgs fluxes (sigma ~ 1e-31) survive float32, and the
+  reported ln L / ln Z have the constant added back (`likelihood.float32_rescaling`).
+  `marginalize_elines=True` is refused in float32. `JAX_PLATFORMS=cpu` gives a float64 fit on
+  the CPU; `CERIDWEN_X64=1` on the GPU is refused at import. See `docs/mac_gpu.md`.
+- **Evidences are comparable only at equal precision and sampler settings.** A float32 fit's
+  ln Z is 1-2 nats below the float64 value of the same data at the same settings, and doubling
+  `num_inner_steps` moves it by as much (`docs/mac_gpu.md`, "Speed"). Compare ln Z, and form
+  Bayes factors, only between fits with the same precision, `num_live`, `num_delete` and
+  `num_inner_steps`; the result file records them (`config/precision`, the sampler attrs).
 - **`jax>=0.9.0`** (as `pyproject.toml` pins it).
 - **Two environment switches change the numerics of every fit** and warn at import:
-  `CERIDWEN_X64=0` turns float64 off (never for a real fit), and
-  `CERIDWEN_MATMUL_PRECISION=<value>` sets JAX's default matmul precision (e.g. `high`:
-  TF32 on GPU). Check your shell does not carry them over.
+  `CERIDWEN_X64=0` turns float64 off anywhere (the float32 mode of the bullet above, on a
+  CPU or CUDA device: a test of that mode, not a precision to fit in when float64 is
+  available), and `CERIDWEN_MATMUL_PRECISION=<value>` sets JAX's default matmul precision
+  (e.g. `high`: TF32 on GPU). Check your shell does not carry them over.
 
 ## 7. Broadening: where the widths come from
 
@@ -226,15 +248,32 @@ prefer `predict`/`get_spectrum_components`.
   (`SedModel(broaden_photometry=True)`); < 5e-4 mag for broad bands at
   300 km/s, per-cent level for a narrow band with a line on its edge. With
   `broaden_photometry=False` nothing in the photometry is broadened: the
-  continuum enters the filters at model-grid resolution and the lines at the
-  grid's pixel-floor width, so `sigma_gas` plays no role there. A mock made
+  continuum enters the filters at model-grid resolution and the lines as delta
+  lines, so `sigma_gas` plays no role there. A mock made
   with one setting must be fitted with the same setting
   (`examples/quickstart.py` sets it False for that reason).
-- Lines in the photometry: with a **fixed** `sigma_gas` they enter through a
-  static line-to-band basis built at that width (no painting on the model
-  grid, the fast path); with a **sampled** `sigma_gas` they are painted onto
-  the grid and broadened at runtime (slower, chosen automatically). Free-z
-  photometry always paints. `csp._force_paint_lines = True` forces painting.
+- **Lines in the photometry are not painted.** Each line adds its observed flux
+  times the filter's response to it (`ceridwen.observation.line_photometry`): a
+  delta line, `T(lambda_obs)`, without `broaden_photometry` (Prospector's choice),
+  and with it the exact integral of a Gaussian of `sigma_gas` against the filter,
+  which keeps the smoothing of a filter edge (the two differ only for a line within a
+  few sigma of an edge, by about sigma^2 T''/2). Both conserve the
+  line flux for any width. At a fixed redshift and `sigma_gas` this is one exact
+  matrix; at a sampled redshift or `sigma_gas` a table of the exact integral (exact
+  for delta lines; a sampled width to <= 1.3e-5 of a band's response, for a line on a
+  filter edge, 1e-7 typical). `csp._force_paint_lines = True` instead paints the lines on
+  the model grid at the pixel floor (a reference path; on coarse infrared pixels it
+  gets a line's flux to ~1e-4).
+- **Photometry integrates the model pixels.** The filter integral is exact for a
+  spectrum linear between the model pixels and a filter linear between its own points
+  (`FilterSet.flux_weights`), so a feature narrower than the filter grid keeps its flux.
+  Before 1.0.14 the spectrum was sampled at the filter grid: a line at the old pixel floor
+  lost or gained 0.4 % of its flux through a band (median; up to 4.9 %), and continua were
+  0.8-2.5e-4 high.
+- **Line width floor.** On the model grid a line is at least `res_floor_fwhm_px`
+  pixels wide as a FWHM (`NebularModel`, default 2, sigma = 2 px / 2.355, as FSPS).
+  The old `res_floor_factor` (pixels per sigma) raises with the conversion
+  (`res_floor_fwhm_px = res_floor_factor x 2.355`).
 - `add_neb=False` + a `Lines` observation is refused at `predict` in every
   basis (`ValueError`), not answered with zeros.
 - `Lines` (integrated fluxes) never see a width: they are read directly from
@@ -302,6 +341,16 @@ prefer `predict`/`get_spectrum_components`.
   `NestedSamples.logZ()` when anesthetic is installed (it is a core
   dependency); without it, `log_evidence = logsumexp(log_weights)` and the
   error is NaN. Either way `log_weights` are the aligned per-point weights.
+  anesthetic draws the error from numpy's global RNG; the adapter seeds it from `rng_key` and
+  restores the global state afterwards, so the same key gives the same error bar.
+- **Same `rng_key` reproduces a run byte for byte on CPU, not on GPU.** The default slice
+  kernel is `"lanes"`; on CPU it gives exactly the dead points of `slice_kernel="stock"`
+  (`blackjax.nss`). On a GPU, two runs with the same key, even with the same kernel on two
+  GPUs of one node, differ in the last bits (already in setup-time reductions such as the filter
+  effective wavelengths), and a late slice decision can then send the run along a different
+  but statistically equivalent path (seen once in four `"lanes"` runs: ln Z changed by 2e-5,
+  quoted error 0.24). Compare GPU runs by their posteriors and ln Z within errors, never with
+  `tobytes()`.
 
 ## 11. Sampled redshift, noise terms and fit-time checks
 
@@ -337,7 +386,9 @@ prefer `predict`/`get_spectrum_components`.
   sampled parameters without a prior; `free_param_init` is applied without
   transforms too; prior constructors reject unknown/missing arguments.
 - `CSPBasis(verbose=False)` is silent; `SSPData.load(..., flux_dtype="float32")`
-  halves the grid memory.
+  halves the grid's host memory. `SSPData.ssp_flux` is a read-only host NumPy array (a JAX
+  array passed in is copied to the host); the device holds only the CSP's float32 copy
+  (`csp.flux`).
 - `pp.figures(dir)` writes the summary / corner / diagnostics figures
   (`ceridwen.plotting`).
 
@@ -361,7 +412,8 @@ prefer `predict`/`get_spectrum_components`.
   still has to be fixed.
 - **The nebular model must not be sampled** (`gas_logu`, `gas_logz`): with free
   line fluxes the lines cannot constrain it. CERIDWEN samples every CSP key
-  unless a transform derives it, so fix them with constant transforms
+  unless it is fixed or a transform derives it, so fix them on the CSP,
+  `CSPBasis(..., fixed={"gas_logu": -2.5, "gas_logz": -0.3})`, or with constant transforms
   (`transforms={"gas_logu": lambda th: jnp.array([-2.5]), ...}`); a sampled one
   raises at construction.
 - **Line names** are FSPS's (`"[O III] 5007"`, `"Ba-alpha 6563"`); a near miss
@@ -405,7 +457,8 @@ switch on Prospector's outlier mixture for the `Spectrum` / `Photometry` / `Line
   ln 2 pi and drops n ln 2 pi (`noise_model.py:90`); CERIDWEN equals Prospector's outlier
   branch for f > 0 and the correct Gaussian at f = 0.
 - **Fixed means a constant transform**, `transforms={"f_outlier_phot": lambda th:
-  jnp.array([0.05])}`; a transform that depends on sampled parameters raises. Fixed at
+  jnp.array([0.05])}` (an observation-level name: `CSPBasis(fixed=)` takes only CSP
+  parameters, section 28); a transform that depends on sampled parameters raises. Fixed at
   0.0 = off (the plain Gaussian).
 - **Upper limits** keep the one-sided penalty; the mixture acts on the detections.
 - **With `marginalize_elines`** the mixture is refused on the marginalised system (the
@@ -582,7 +635,9 @@ on your priors/bounds once before sampling instead.
   `num_inner_steps` and the parameter names/shapes must match, and the live points' saved
   `ln L` must equal this model's (rtol 1e-9); anything else raises before sampling. A resumed
   CPU run is byte-identical to the uninterrupted one. `logZ_tol` may differ (it is only the
-  stopping rule). The checkpoint file is named after the PID, so the resumed run writes a new one.
+  stopping rule), and so may `slice_kernel` (the kernels make the same moves; `"lanes"` agrees with
+  `"stock"` bitwise on Apple-silicon CPUs and to the last bits on x86; with blackjax 1.6 `"lanes"` births a chain whose moves were all rejected at the
+  contour, as blackjax 1.7 does, so those births differ from `"stock"`). The checkpoint file is named after the PID, so the resumed run writes a new one.
 - **A result file stores transforms by name only** (`"sfh <- my_function"`), and not the CSP or
   the observation objects. `rebuild_model` therefore needs them from you, and checks what the
   file does record (priors, free parameters and shapes, transform names, zred, kinematics,
@@ -646,13 +701,193 @@ the spectrum's whitened residuals, `K = I + a^2 exp(-dlambda^2 / 2 l^2) + 1e-6 I
 - **The dust-emission energy balance counts the lines.** The energy the dust absorbs from the
   nebular lines is re-emitted in the IR on every path, so `get_spectrum(include_lines=False)`
   (the continuum) already carries the re-emission of the lines; `include_lines` only adds the
-  attenuated lines themselves. Fixed-z photometry (static line basis) and free-z photometry
-  (painted lines) give the same IR fluxes.
+  attenuated lines themselves. Fixed-z and free-z photometry give the same IR fluxes.
 - **Line fluxes under the IGM** (`Lines`, and the lines a `Spectrum` paints) use the IGM
   transmission averaged over the line's profile on the model grid, the same as the painted
   path. At Ly-α the Madau forest starts inside the line, so its blue half is absorbed (the
-  line keeps 0.81 of its flux at z = 3, 0.49 at z = 6 on the BPASS grid); the value depends on how finely the model grid samples the line (2 Å pixels on BPASS:
-  1-3% below a continuous quadrature at z = 3-9).
+  line keeps 0.79 of its flux at z = 3, 0.44 at z = 6 on the BPASS grid, with the 2 px
+  FWHM floor; 0.81 and 0.49 with the pre-1.0.14 floor); the value depends on how finely the
+  model grid samples the line. The photometry uses the same line fluxes.
 - **The IGM acts after `σ_gal`** and before the instrument (`docs/conventions.md`,
   Broadening). A fixed `σ_gal = 0` keeps the IGM on the model grid.
 
+
+## 24. `CSPBasis(wavelength_support=True)`: only the pixels the observations read
+
+- **Off by default.** On, `predict` (and so every fit) synthesises only the contiguous range of
+  model pixels the observations read: each Photometry's non-zero filter columns and its
+  sigma_gal window, each Spectrum's projector window (the whole `zred_range` for a sampled
+  redshift); `Lines` read none. The rest is zero, filled after the mass, flux-factor and IGM
+  scaling. The IGM is still evaluated on the whole grid (Madau's optical depth is capped at its
+  peak, a whole-grid maximum) and then cut to the range.
+- **Not byte-identical to the default.** XLA's CPU reductions change their summation order
+  with the array length, so a prediction differs in the last float32 bit (measured: up to
+  1.6e-7 relative; the log-likelihood by about 1e-10 of its value). Compare fits made with
+  the same setting. The result file records it (`csp_config['wavelength_support']`, present
+  only when on), so `check_model_against_result` reports a rebuilt model with the other setting.
+- **Silently the whole grid** (no warning, same numbers as off) for dust emission (the energy
+  balance integrates over every pixel), lines painted on the model grid
+  (`_force_paint_lines`), a Photometry at a
+  sampled redshift, an observation class that declares no `model_support`, or a range that
+  is the whole grid.
+- `csp.get_spectrum(...)`, `get_spectrum_components`, `PostProcess` spectra and figures are
+  always on the whole grid: only the observation predictions use the range.
+
+## 25. AGN (`CSPBasis(agn=...)`, `docs/agn.md`)
+
+- **No `agn=`, no AGN.** `theta["fagn"]` on a CSP built without `agn=` is an unknown key: a
+  warning, and nothing else happens. Build the CSP with `agn=AGNConfig()` (or `agn=True`).
+- **Three modes, one default.** `AGNConfig()` is `agn_mode="corrected"`. `"fsps"` and
+  `"prospector"` reproduce those codes, defects included: use them to compare with an existing
+  FSPS / Prospector fit, not for new science.
+- **`agn_tau` outside [5, 150]** (the Nenkova+08 grid): clamped to the edge template in the fsps
+  and corrected modes, so the likelihood is flat there and a prior wider than [5, 150] piles up
+  posterior mass at the edge; extrapolated linearly in the prospector mode (the SED can go
+  negative), as Prospector does. `check_param_ranges` warns. Use a prior inside [5, 150].
+- **What `fagn` means.** `fagn` = L_torus / L_bol,\* with L_bol,\* the *dust-free stellar*
+  luminosity integrated over the model grid, BEFORE any screen. In the corrected mode the
+  torus carries exactly `fagn * L_bol,*` on any grid; the light the galaxy's dust absorbs from
+  it (and from the disc and the AGN lines) is re-emitted by DL07 when
+  `add_dust_emission=True`, and lost otherwise (as absorbed starlight is). L_bol,\* is not
+  FSPS's isochrone `log_lbol`: on the MIST/MILES grid the two differ by -0.1 % to +2.1 %
+  (`scripts/agn_lbol_check.py`), a definitional difference, so the same `fagn` is a slightly
+  different torus in CERIDWEN and FSPS.
+- **`fagn_bbb`** is F_nu,disc / F_nu,\* at rest 5500 A against the dust-free *stellar* young +
+  old spectrum (Prospector's definition; Prospector's galaxy also holds FSPS's nebular
+  continuum, small at 5500 A). It depends on the galaxy, so the disc moves when the stars do.
+- **AGN lines vs `marginalize_elines`.** A Spectrum with `marginalize_elines=True` together
+  with AGN lines is refused at setup (Prospector asserts the same): the marginalised fluxes would
+  absorb the AGN lines. Marginalise with `AGNConfig(lines=False)`, or keep the AGN lines and fit
+  the lines at their CLOUDY + AGN fluxes. In the reproduction modes the AGN lines are not
+  instrument-broadened, dust- or IGM-attenuated (Prospector's convention) and need
+  `add_neb=True`.
+- **Sampling `agn_eline_sigma`.** It is the AGN narrow-line dispersion [km/s]: a prior,
+  constant transform or fixed value must lie in (0, 2000] (raises at setup otherwise; broad-
+  line-region widths need a BLR component that does not exist yet). Only a Spectrum that
+  resolves the AGN lines constrains it: with no Spectrum, no unmasked pixel at an AGN line, or
+  an instrumental sigma above 3x the prior's upper edge at every AGN line, `SedModel` warns and
+  the posterior is the prior. A prism (R ~ 100, sigma_inst ~ 1270 km/s) with
+  `Uniform(50, 500)` does NOT trigger the warning but still returns a prior-dominated
+  posterior; fix it then (`transforms={"agn_eline_sigma": lambda th: jnp.array([100.0])}`).
+  The widths do not separate AGN from star formation, the line ratios do (`docs/agn.md`,
+  "Fitting the AGN line width").
+- **PostProcess.** `spectra_model` / `spectra_observed` include the AGN continuum,
+  `spectra_intrinsic` / `spectra_dustfree` do not: `A_V = 2.5 log10(dustfree / full)` and
+  `LUV`/`MUV` contain the AGN. The AGN alone is `prediction["spectra_agn"]`; `extras["agn"]`
+  holds `L_bol_star`, `L_absorbed`, and `mdust` with the energy balance.
+- **Reproduction-mode IGM.** fsps: the AGN gets no IGM (FSPS adds the torus after
+  `igm_absorb`); prospector: Prospector's own Madau (`fake_fsps.add_igm`, 1 % / 4 % off
+  CERIDWEN's madau1995 blueward of Ly-alpha at z = 2 / 6). With a galaxy kernel (sigma_gal
+  > 0) before the IGM, the AGN's IGM correction is added after the kernel, unsmoothed for
+  photometry (a residual of <= 2e-3 of the AGN signal near Ly-alpha).
+- **Prospector's double-counted torus** (python-fsps adds its own torus inside the galaxy
+  spectrum and `AGNSSPBasis` adds another) is NOT reproduced: the prospector mode has the torus
+  once. Real Prospector's AGN-only torus photometry is 1.39-1.90x CERIDWEN's prospector mode.
+- **The torus templates** are read from `$SPS_HOME/dust/Nenkova08_y010_torusg_n10_q2.0.dat`
+  (`python -m ceridwen.check` reports them); the result file records their sha256.
+- **Copying a CSP with `agn=`.** The AGN wrapper is a BOUND METHOD (`CSPBasis._with_agn`
+  returns `types.MethodType(...)`), so the shared-template recipe — `copy.copy`, re-bind every
+  bound method stored on the instance to the copy, then `initialize_model_structure` with new
+  age bins — gives a copy that evaluates its OWN stars and AGN
+  (`tests/agn/test_copy_rebind.py`). A driver that copies a template must re-bind the bound
+  methods stored on the instance (`get_spectrum`, `calculate_ssp_weights`, and `attenuate_dust`
+  with dust); a plain
+  `copy.copy` without re-binding still leaves the copy pointing at the template's kernels, as
+  it does without `agn=`. Until 2026-10-09 the wrapper was a closure, which no re-binding can
+  reach: such a copy silently returned the TEMPLATE's spectrum
+  (`explorer/reports/AGN_COPY_BUG.md`).
+
+## 26. AGN2: SKIRTOR, polar dust, Feltre+16 NLR, BLR (`docs/agn.md`, "AGN2")
+
+- **`fagn` means two different things.** With `torus_model="skirtor16"` in `agn_mode="cigale"`,
+  `fagn` is CIGALE's `fracAGN` = P / (P + L_dust,gal) (P = torus + polar-dust luminosity,
+  L_dust,gal = what the galaxy's dust absorbs): it must stay below 1, and a prior reaching 1
+  raises. In `"corrected"` it is P / L_bol,\*, can exceed 1, and is best sampled as `log_fagn`.
+  The same number in the two modes is a different AGN; compare fits through
+  `extras["agn"]["frac_agn_cigale"]`, which both modes report.
+- **`skirtor_oa` is measured from the equator** (Stalevski+16): the dust-free cone half-angle is
+  90 - oa, so a type-1 (unobscured) view needs `skirtor_i <= 90 - skirtor_oa`. Polar dust
+  extinguishes the disc only for such a view; its re-emission is added at every inclination.
+- **`blr_sigma` is a sigma, not a FWHM.** Papers quote broad-line FWHM: divide by 2.35482
+  (FWHM 1650 km/s is sigma 700). Its support is [400, 5000] km/s (a warning outside). Only a
+  resolved spectrum constrains it; fix it when fitting line fluxes or photometry.
+- **The broad and narrow H alpha are not separated by fluxes.** Both carry H alpha / H beta
+  ~ 2.85 (Case B), so with line FLUXES alone `blr_lum` trades with the nebular and NLR H alpha:
+  a catalogue H alpha flux is the total (narrow + broad), and only the line profile in a
+  spectrum splits it.
+- **Tabulated axes are clamped, and priors beyond them raise.** `skirtor_*` and `nlr_*` are
+  interpolated on their grids and clamped outside (flat likelihood). A fixed value outside warns
+  at setup; a prior whose support leaves the grid raises (`SedModel`), as for `gas_logz`.
+  `nlr_logz` is log10(Z / 0.01524) (Feltre+16's Z_sun), not the stellar grid's Z_sun.
+- **The SKIRTOR and NLR tables are not shipped.** Build them once with the converters of the
+  source repository into `$CERIDWEN_AGN_DATA` (default `~/.ceridwen/agn/`); without them the
+  CSP raises at construction and their tests skip with "MISSING ...: did NOT run" (a run with
+  those skips is not a pass).
+- **Polar dust needs CIGALE's extinction curves, which are not shipped** (CeCILL-2.0). Fetch them
+  once: `python -m ceridwen.agn.fetch --from /path/to/cigale` (no network) or
+  `python -m ceridwen.agn.fetch --download`; or copy `extFun_{SMC,MRN,Gaskel04}.dat` from
+  `pcigale/sed_modules/curves/` into `$CERIDWEN_AGN_DATA` yourself (`docs/agn.md`, "CIGALE
+  extinction curves"). They are sha256-checked at construction.
+- **Line profiles differ from CIGALE's at order sigma/c.** CERIDWEN paints every line as a
+  Gaussian in ln lambda; CIGALE's AGN lines are Gaussian in lambda (4.7e-4 of the peak at FWHM
+  800 km/s, 4.1e-3 at 7000 km/s; same area). `"cigale"` mode keeps CERIDWEN's painter.
+
+## 27. AGN2: what is fixed by design (`docs/agn.md`, "Fixed by design")
+
+- **`agn_elum` and `blr_lum` are luminosities per formed solar mass, and `fagn` does not scale
+  them.** The three line sets return `agn_elum * ratio` / `blr_lum * ratio_halpha`
+  (`ceridwen/agn/nlr.py:283`, `lines.py:154`, `blr.py:160`) and read no continuum quantity, so
+  **broad lines without an AGN continuum are a legal model** (`fagn = fagn_bbb = 0`,
+  `blr_lum > 0`). Only the lines constrain them WITHOUT the energy balance; with
+  `agn_energy_balance=True` the line light the galaxy's dust absorbs joins DL07
+  (`hook.py:293-304`, `blr_absorbed` at `hook.py:337-349`), so the IR constrains them too.
+  Judge a prior against the galaxy's own
+  nebular H beta, of order 1e-3 to 1 L_sun per M_sun formed: `agn_elum = 1` is an NLR H beta
+  comparable with the whole galaxy's.
+- **The NLR does not see the disc.** The ratios come from the tabulated Feltre+16 grid at its
+  own axes; `nlr_alpha` is that grid's disc UV slope, a free key, not the model's disc (which
+  has no slope: the Temple+21 disc's only parameter is `fagn_bbb`). Fitting `nlr_alpha` tells
+  you which Feltre grid point fits the lines, not what the continuum in the same fit looks like.
+- **The BLR is inclination-independent** — `blr_lum`, `blr_sigma`, and a polar-dust transmission
+  that depends only on `polar_ebv` (`polar.py:195-199`). The disc gets the polar screen only for
+  a type-1 view, the broad lines always: a type-2 geometry that should hide the broad lines is
+  not represented, so express that in the prior on `blr_lum`, not in `skirtor_i`.
+- **No X-ray or corona component** — nothing like CIGALE's `xray` module, nothing normalised
+  through `alpha_ox`: expect neither an X-ray prediction nor an X-ray constraint from a
+  CERIDWEN AGN fit. But do not read that as "nothing emits in the EUV": the Temple+21 disc
+  template ends at 91 A and `"corrected"` zeroes it blueward (`disk.py:98-100`), while the
+  SKIRTOR parametric disc is defined from 8 A (`skirtor.py:113-116`). What reaches a prediction
+  is set by the model grid's blue end and the IGM, not by the AGN model.
+
+## 28. Fixing CSP parameters: `CSPBasis(fixed=...)` or a constant transform
+
+- **Two ways, one model.** `CSPBasis(..., fixed={"gas_logu": -2.5})` and
+  `SedModel(..., transforms={"gas_logu": lambda th: jnp.array([-2.5])})` give the same model
+  byte for byte: `SedModel` turns each fixed entry into that constant transform
+  (`ceridwen.model.model.FixedValue`), so the range checks, `model.describe()` / `latex()`, the
+  fit-time resolution and the result file see a constant transform. Give priors only for what
+  you fit; a fixed name with a prior, a `free_param_init` entry or a transform raises.
+- **What the CSP reports.** A fixed name is not in `csp.param_names` (nor
+  `model.param_names`); its value is in `csp.theta_init` (so `csp.predict(csp.theta_init, ...)`
+  uses it) and in `csp.fixed`. Rebuilding the structure (`initialize_model_structure`, the
+  template-copy recipe of section 25) keeps the fixed values.
+- **Only CSP parameters, of this configuration.** A name the CSP does not have raises and says
+  which switch adds it (`gas_logu` needs `add_neb=True`, `duste_*` needs
+  `add_dust_emission=True`, `diffuse_R_v_cal00` needs `diffuse_law='calzetti'`, the AGN keys
+  need `agn=`, `afe` needs `CSPBasis_afe`). `gas_logz` with `gas_tied=True` raises (fix
+  `logzsol`). Model-level names (`logmass`, `zred`, `eline_scaling`, `frac_obrun`,
+  `spectrum_scaling`, the noise, outlier and GP terms) are refused: fix them with a constant
+  transform. `igm_factor` has its own constructor argument, `CSPBasis(igm_factor=...)`; a
+  transform or prior on `igm_factor` replaces that value per call.
+- **Shapes.** A value must have the parameter's shape: a number for a `(1,)` parameter, an
+  array of `(n_time,)` for `logzsol_hist` or `sfh`; anything else, or a non-finite value,
+  raises.
+- **Ranges.** A fixed value outside the logzsol grid, the CLOUDY `gas_logz` / `gas_logu` axes,
+  the [alpha/Fe] axis or the AGN line-width range raises in `SedModel`, the same check as for a
+  constant transform. The DL07 / THEMIS `duste_qpah` / `duste_umin` axes are NOT checked, for a
+  fixed value, a constant transform or a prior alike: the dust-emission interpolation clamps to
+  the template axes there.
+- **Result files.** `fitSED` records the fixed values in `csp_config["fixed"]` and the
+  transforms as `name <- CSPBasis(fixed=[...])`. `rebuild_model` takes those from the CSP you
+  pass, which must fix the same names to the same values (anything else raises or is reported
+  by `check_model_against_result`).

@@ -10,7 +10,7 @@ This demo shows the three ingredients specific to line fitting:
        CLOUDY grids shipped with FSPS (read from ``$SPS_HOME``, so FSPS's
        data files must be installed; the grid is matched automatically to
        the SSP isochrones recorded in your ssp_data.h5).
-    2. a ``Lines`` observation: line identities are 1-BASED indices into
+    2. a ``Lines`` observation: line identities are 0-based row indices into
        ``$SPS_HOME/data/emlines_info.dat`` (``line_ind``); the names are just
        human-readable labels.
     3. the slit-loss nuisance parameter ``eline_scaling``: spectroscopic
@@ -80,8 +80,9 @@ def main() -> None:
     if SSP_FILE.is_file():
         ssp = SSPData.load(str(SSP_FILE))
     else:
-        print("[grid] building SSP grid with FSPS (a few minutes) ...")
-        ssp = SSPData.from_fsps(imf_type=1, save_to=str(SSP_FILE))
+        from ceridwen.ssps import fetch_grid             # the published grid (Zenodo, cached)
+        print("[grid] no examples/ssp_data.h5: using the published grid mist_miles_chab")
+        ssp = SSPData.load(str(fetch_grid("mist_miles_chab")))
 
     # add_neb=True: nebular continuum in the SED and emission lines for the
     # Lines observation. The CLOUDY grid is selected to match the isochrone
@@ -105,7 +106,7 @@ def main() -> None:
                 "diffuse_tau_kc": ClippedNormal(mean=0.3, sigma=1.0,
                                                 low=0.0, high=4.0),
                 "diffuse_dust_index": Uniform(low=-1.0, high=0.4),
-                "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=1.0),
+                "logsfr_ratios": StudentT(df=2.0, mean=0.0, scale=0.3),
                 # gas + slit-loss: the line-fitting-specific parameters
                 "gas_logz":       Uniform(low=-1.3, high=0.2),   # inside the CLOUDY axis
                 "gas_logu":       Uniform(low=-4.0, high=-1.0),
@@ -135,10 +136,11 @@ def main() -> None:
     lin_obs = lin + lin_unc * rng.standard_normal(lin.shape)
 
     # ── Observations to fit ───────────────────────────────────────────────
-    # Treat GALEX FUV as a non-detection: report the 1-sigma limiting flux
-    # in `flux` and flag it -- chi^2 then only penalises models ABOVE it.
+    # Treat GALEX FUV as a non-detection: report the limiting flux in `flux`
+    # and flag it -- chi^2 then only penalises models ABOVE it.  A mock limit
+    # must lie above the true flux; here it is the truth + 2 sigma.
     upper = np.zeros(len(FILTERS), dtype=bool); upper[0] = True
-    mag_obs[0] = 3.0 * mag_unc[0]
+    mag_obs[0] = mag[0] + 2.0 * mag_unc[0]
 
     phot = Photometry(filters=FILTERS, flux=mag_obs, uncertainty=mag_unc,
                       upper_limit=upper, name="phot")
@@ -150,7 +152,7 @@ def main() -> None:
     result = fitSED(
         model,
         sampler="ns",
-        sampler_kwargs={"num_live": 300},  # num_delete/logZ_tol: library defaults
+        sampler_kwargs={"num_live": 300, "num_inner_steps": 30},  # num_delete/logZ_tol: library defaults
         rng_key=jax.random.PRNGKey(SEED),
         output_dir="./demo_2_output",
     )

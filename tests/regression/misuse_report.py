@@ -29,7 +29,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import numpy as np
 import jax
 import jax.numpy as jnp
-jax.config.update("jax_enable_x64", True)
+import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -85,6 +85,11 @@ WARN_EXPECT = {
     "NaN flux not in the mask": "non-finite flux",
     "Spectrum.mask_lines without zred": "without zred",
     "noll bump under its old name E_bump": "unrecognized theta key(s) ['E_bump']",
+    "typo AGN theta key (fagn_bb) with agn=": "unrecognized theta key(s) ['fagn_bb']",
+    "fagn without agn= (AGN off)": "unrecognized theta key(s) ['fagn']",
+    "old label name f_agn with agn=": "unrecognized theta key(s) ['f_agn']",
+    "agn_tau outside the Nenkova grid [5, 150]": "outside the Nenkova+08 grid",
+    "agn_eline_sigma sampled with photometry only": "agn_eline_sigma is sampled but the data",
 }
 
 
@@ -170,6 +175,16 @@ def _tied_gas_with_prior():
     return _model_with(priors={"gas_logz": TopHat(low=-1.0, high=0.2)}, csp_obj=c)
 
 
+def _old_res_floor_factor():
+    """res_floor_factor= (pixels per sigma, removed in 1.0.14): must raise, naming res_floor_fwhm_px."""
+    if not os.environ.get("SPS_HOME"):
+        raise RuntimeError("SPS_HOME unset: needs the nebular grids (scenario n/a)")
+    from ceridwen import NebularModel
+    return NebularModel(  # deliberate misuse
+        sps_home=os.environ["SPS_HOME"], csp_lambda=np.asarray(_ssp.ssp_wave),
+        isoc_type=_ssp.isoc_type, res_floor_factor=1.0)
+
+
 def _gas_prior_outside_cloudy_axis(transform=False):
     """gas_logz prior U[-2, 0.5] (the CLOUDY axis is [-1.3, 0.3]), or a fixed gas_logz = -1.5."""
     if not os.environ.get("SPS_HOME"):
@@ -180,6 +195,33 @@ def _gas_prior_outside_cloudy_axis(transform=False):
         return SedModel(c, [ph], transforms={"gas_logz": lambda th: jnp.array([-1.5])},
                         zred=0.5)
     return _model_with(priors={"gas_logz": Uniform(low=-2.0, high=0.5)}, csp_obj=c)
+
+
+def _filter_from_data():
+    """A Filter built from arrays: Photometry reloads filters by name, so it cannot be used."""
+    from ceridwen.observation.filters import Filter
+    f = Filter("sdss_g0")
+    return Photometry(filters=[Filter("my_g", data=(np.asarray(f.wavelength),
+                                                    np.asarray(f.transmission)))], name="p")
+
+
+def _shadowed_filter():
+    """A library filter name also present in $CERIDWEN_FILTER_DIR: the user file wins."""
+    import shutil
+    import tempfile
+    from ceridwen.observation.filters import FILTER_DIR_ENV, library_filter_dir
+    d = tempfile.mkdtemp(prefix="misuse_filters_")
+    shutil.copyfile(os.path.join(library_filter_dir(), "sdss_g0.par"), os.path.join(d, "sdss_g0.par"))
+    old = os.environ.get(FILTER_DIR_ENV)
+    os.environ[FILTER_DIR_ENV] = d
+    try:
+        return Photometry(filters=["sdss_g0"], name="p")
+    finally:
+        if old is None:
+            del os.environ[FILTER_DIR_ENV]
+        else:
+            os.environ[FILTER_DIR_ENV] = old
+        shutil.rmtree(d)
 
 
 def _afe_refused_cell():
@@ -215,6 +257,48 @@ def _noll_old_bump_name():
     c = _short_csp(add_dust=True, init_dust_params={"bin_edges": [(-jnp.inf, -1.97)],
                                                     "laws": ["noll"]})
     return c.get_spectrum_components(dict(c.theta_init, E_bump=jnp.array([2.0])))
+
+
+def _agn_csp(**cfg):
+    """A CSP with the AGN on (``ceridwen.agn``; the torus templates live in $SPS_HOME/dust)."""
+    from ceridwen.agn import AGNConfig
+    if not os.environ.get("SPS_HOME"):
+        raise RuntimeError("SPS_HOME unset: the AGN torus templates (scenario n/a)")
+    kw = _kw(**cfg.pop("csp", {}))
+    return CSPBasis(_ssp, theta={"lookback_time": _lb, "sfh": _sfr, "logzsol": jnp.array([-0.15])},
+                    agn=AGNConfig(**cfg), **kw)
+
+
+def _agn_lines_with_marginalisation():
+    from ceridwen.broadening import Instrument as _I
+    from ceridwen.agn import AGNConfig
+    c = CSPBasis(_ssp, theta={"lookback_time": jnp.linspace(0.0, 8.0, 10), "sfh": jnp.ones(10),
+                              "logzsol": jnp.array([-0.15])},
+                 agn=AGNConfig(agn_mode="corrected"), **_kw(add_neb=True))
+    spec = Spectrum(wavelength=jnp.linspace(6000, 9000, 400), flux=jnp.ones(400),
+                    uncertainty=jnp.ones(400), name="s", instrument=_I.R_fwhm(2000.0),
+                    marginalize_elines=True)
+    return SedModel(c, [spec], zred=0.5,
+                    transforms={"gas_logu": lambda th: jnp.array([-2.5]),
+                                "gas_logz": lambda th: jnp.array([0.0])})
+
+
+def _agn_sigma_model(prior):
+    """A corrected-mode AGN SedModel (lines on) on photometry with a prior on agn_eline_sigma."""
+    ph = Photometry(filters=["sdss_g0", "sdss_r0"], flux=[1e-9, 1e-9],
+                    uncertainty=[1e-10, 1e-10], name="p")
+    return SedModel(_agn_csp(agn_mode="corrected"), [ph], zred=0.0,
+                    priors={"agn_eline_sigma": Uniform(low=prior[0], high=prior[1])})
+
+
+def _agn2_prior_model(agn, prior_key, lo, hi, init, **csp_kw):
+    """An AGN2 SedModel with a bounded prior on one tabulated AGN2 key (setup-time check)."""
+    from ceridwen.agn import AGNConfig
+    ph = Photometry(filters=["sdss_g0", "sdss_r0"], flux=[1e-9, 1e-9],
+                    uncertainty=[1e-10, 1e-10], name="p")
+    csp = _short_csp(add_neb=False, agn=AGNConfig(**agn), **csp_kw)
+    return SedModel(csp, [ph], zred=0.5, priors={prior_key: Uniform(low=lo, high=hi)},
+                    free_param_init={prior_key: jnp.array([init])})
 
 
 def run_scenarios():
@@ -279,6 +363,8 @@ def run_scenarios():
                        name="l").predict(csp.get_spectrum(th), csp.wave)),
         ("unknown filter name", {"ERROR"},
          lambda: Photometry(filters=["not_a_filter_xyz"], name="p").setup_for_model(csp.wave)),
+        ("Filter(data=) passed to Photometry", {"ERROR"}, _filter_from_data),
+        ("filter shadowed by $CERIDWEN_FILTER_DIR", {"WARN"}, _shadowed_filter),
         ("all-zero uncertainty", {"ERROR"},
          lambda: (lambda sp: (sp.setup_for_model(csp.wave), sp.chi_sq(sp.predict(csp.get_spectrum(th), csp.wave)))) (
                   Spectrum(wavelength=jnp.linspace(4000, 7000, 40), flux=jnp.ones(40),
@@ -412,6 +498,47 @@ def run_scenarios():
         ("duste_model='THEMIS' without dust emission", {"ERROR"},
          lambda: _short_csp(duste_model="THEMIS")),
         ("noll bump under its old name E_bump", {"WARN"}, _noll_old_bump_name),
+        # ceridwen.agn
+        ("typo AGN theta key (fagn_bb) with agn=", {"WARN"},
+         lambda: (lambda c: c.get_spectrum_components({**c.theta_init,
+                                                       "fagn_bb": jnp.array([0.1])}))(
+             _agn_csp(agn_mode="corrected"))),
+        ("fagn without agn= (AGN off)", {"WARN"},
+         lambda: csp.get_spectrum_components({**th, "fagn": jnp.array([0.3])})),
+        ("old label name f_agn with agn=", {"WARN"},
+         lambda: (lambda c: c.get_spectrum_components({**c.theta_init,
+                                                       "f_agn": jnp.array([0.3])}))(
+             _agn_csp(agn_mode="fsps"))),
+        ("agn_tau outside the Nenkova grid [5, 150]", {"WARN"},
+         lambda: (lambda c: c.check_param_ranges({**c.theta_init,
+                                                  "agn_tau": jnp.array([300.0])}))(
+             _agn_csp(agn_mode="corrected"))),
+        ("AGNConfig(dust4_type=2) (Prospector NotImplemented)", {"ERROR"},
+         lambda: __import__("ceridwen.agn", fromlist=["x"]).AGNConfig(agn_mode="prospector",
+                                                                      dust4_type=2)),
+        ("AGN lines in prospector mode without add_neb", {"ERROR"},
+         lambda: _agn_csp(agn_mode="prospector")),
+        ("marginalize_elines with AGN lines", {"ERROR"}, _agn_lines_with_marginalisation),
+        ("agn_eline_sigma prior reaching 0 km/s", {"ERROR"}, lambda: _agn_sigma_model((0.0, 500.0))),
+        ("agn_eline_sigma prior above 2000 km/s (BLR widths)", {"ERROR"},
+         lambda: _agn_sigma_model((50.0, 3000.0))),
+        ("agn_eline_sigma sampled with photometry only", {"WARN"},
+         lambda: _agn_sigma_model((50.0, 500.0))),
+        ("Feltre NLR prior beyond the grid (nlr_logu to -6)", {"ERROR"},
+         lambda: _agn2_prior_model(dict(torus=False, disk=False, nlr_model="feltre16"),
+                                   "nlr_logu", -6.0, -1.5, -2.5)),
+        ("SKIRTOR prior beyond the grid (skirtor_i to 100)", {"ERROR"},
+         lambda: _agn2_prior_model(dict(torus_model="skirtor16", lines=False),
+                                   "skirtor_i", 0.0, 100.0, 40.0)),
+        ("cigale fagn prior reaching 1 (fracAGN)", {"ERROR"},
+         lambda: _agn2_prior_model(dict(agn_mode="cigale", torus_model="skirtor16",
+                                        lines=False), "fagn", 0.0, 1.0, 0.3,
+                                   add_diffuse_dust=True)),
+        ("Temple disc with SKIRTOR (double disc)", {"ERROR"},
+         lambda: __import__("ceridwen.agn", fromlist=["AGNConfig"]).AGNConfig(
+             torus_model="skirtor16", disk=True)),
+        ("polar dust without SKIRTOR", {"ERROR"},
+         lambda: __import__("ceridwen.agn", fromlist=["AGNConfig"]).AGNConfig(polar_dust=True)),
         ("LogUniform with mini <= 0 (log of 0)", {"ERROR"},
          lambda: LogUniform(mini=0.0, maxi=1.0)),
         ("Instrument LSF scale <= 0", {"ERROR"},
@@ -421,9 +548,18 @@ def run_scenarios():
                                          instrument=Instrument.R_fwhm(1000.0, scale="lsf_scale"))],
                           priors={"lsf_scale": Normal(mean=1.0, sigma=0.1)},
                           free_param_init={"lsf_scale": 1.0}, zred=0.0)),
+        ("NebularModel(res_floor_factor=) (removed: res_floor_fwhm_px)", {"ERROR"},
+         _old_res_floor_factor),
         ("gas_logz prior beyond the CLOUDY axis", {"ERROR"}, _gas_prior_outside_cloudy_axis),
         ("fixed gas_logz outside the CLOUDY axis", {"ERROR"},
          lambda: _gas_prior_outside_cloudy_axis(transform=True)),
+        ("CSPBasis(fixed=) key of a switched-off part (gas_logu, add_neb=False)", {"ERROR"},
+         lambda: _short_csp(fixed={"gas_logu": -2.5})),
+        ("CSPBasis(fixed=) value of the wrong shape", {"ERROR"},
+         lambda: _short_csp(add_dust=True, fixed={"alpha_pow": [-0.7, -0.5]})),
+        ("CSPBasis(fixed=) name also given a prior", {"ERROR"},
+         lambda: _model_with(priors={"alpha_pow": Uniform(low=-2.0, high=0.0)},
+                             csp_obj=_short_csp(add_dust=True, fixed={"alpha_pow": -0.7}))),
         ("sampled LSF scale not in theta", {"ERROR"},
          lambda: SedModel(csp, [Spectrum(wavelength=jnp.linspace(4000, 7000, 400), name="s",
                                          instrument=Instrument.R_fwhm(1000.0, scale="lsf_scale"))],
@@ -433,7 +569,9 @@ def run_scenarios():
     rows = []
     for label, good, fn in scenarios:
         kind, detail = _run(fn, WARN_EXPECT.get(label))
-        ok = kind in good
+        if kind == "ERROR" and "(scenario n/a)" in detail:
+            kind = "N/A"                  # the data this scenario needs is absent (CI)
+        ok = kind in good or kind == "N/A"
         rows.append((label, kind, ok, detail, good))
     return rows
 

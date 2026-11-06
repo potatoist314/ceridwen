@@ -20,7 +20,7 @@ import sys
 
 import numpy as np
 import jax
-jax.config.update("jax_enable_x64", True)
+import ceridwen  # noqa: F401  (sets the precision: float64, or float32 on an Apple GPU)
 import jax.numpy as jnp
 import pytest
 
@@ -30,6 +30,7 @@ from ceridwen.likelihood import (                                          # noq
     DiagonalNoiseModel, DiagonalGaussianLikelihood, DiagonalGaussianLikelihoodWithUpperLimits,
     MultiObservationLikelihood, lnlike_diag_gaussian, lnlike_diag_outlier, outlier_probability,
     lnlike_diag_gaussian_with_upper_limits, lnlike_diag_outlier_with_upper_limits)
+from _f32bounds import B8, lnl_bound, fft_atol   # noqa: E402,F401  (float32 bounds)
 
 REF = pathlib.Path(__file__).resolve().parent / "reference" / "prospector_outlier.npz"
 
@@ -453,7 +454,10 @@ def test_wiring_sampled_spec_only(grid):
         manual += float(lh[k](o.flux, pred[k], o.uncertainty, o.mask, th)[0])
     gauss_spec = float(DiagonalGaussianLikelihood()(m.obs_dict["spec0"].flux, pred["spec0"],
                        m.obs_dict["spec0"].uncertainty, m.obs_dict["spec0"].mask)[0])
-    assert float(lnprob(th)) == pytest.approx(manual + float(m.log_prob(th)), rel=1e-12, abs=0.0)
+    # float32 predictions: jit and eager round them differently (first-order lnL bound;
+    # was rel=1e-12)
+    assert float(lnprob(th)) == pytest.approx(manual + float(m.log_prob(th)), rel=0.0,
+                                              abs=lnl_bound(m, th))
     assert float(lh["spec0"](m.obs_dict["spec0"].flux, pred["spec0"],
                              m.obs_dict["spec0"].uncertainty, m.obs_dict["spec0"].mask,
                              th)[0]) != gauss_spec
@@ -614,7 +618,7 @@ def test_fitsed_logs_the_mixture(grid, tmp_path):
     from ceridwen import fitSED
     from ceridwen.sampler.priors import TopHat, Uniform, StudentT
     m = _model(grid, priors={"f_outlier_spec": TopHat(low=1e-5, high=0.5),
-                             "logsfr_ratios": StudentT(mean=0.0, scale=1.0, df=2.0),
+                             "logsfr_ratios": StudentT(mean=0.0, scale=0.3, df=2.0),
                              "logzsol": Uniform(low=-1.8, high=0.19),
                              "tau_pow": Uniform(low=0.0, high=2.0),
                              "alpha_pow": Uniform(low=-2.0, high=0.0),

@@ -2,7 +2,7 @@
 
 Each cube (``ZAU_<ND|WD>_<isoc>.cont`` / ``.lines``) is interpolated linearly in
 (logZ, log age, logU) against its own axes and scaled by the ionising-photon rate Q of
-each SSP; lines are painted as Gaussians of width max(sigma_smooth, res_floor_factor pixels).
+each SSP; lines are painted as Gaussians of width max(sigma_smooth, a FWHM of res_floor_fwhm_px pixels).
 """
 
 from pathlib import Path
@@ -13,12 +13,15 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from ..precision import float_dtype, is_x64
+
 
 CLIGHT_AA_S    = 2.9979e18     # A/s
 HPLANK_ERG_S   = 6.6261e-27    # erg s
 LSUN_ERG_S     = 3.839e33      # erg/s
 LYMAN_LIMIT_AA = 912.0         # Lyman limit, Angstrom
 SQRT_2PI       = float(np.sqrt(2.0 * np.pi))
+FWHM_PER_SIGMA = 2.355   # FSPS's literal (sps_setup.f90:1001): the floor is res_floor_fwhm_px pixels per FWHM
 TINY           = 1.0e-95       # floor for log10
 
 
@@ -139,7 +142,8 @@ class NebularModel:
     nebnz, nebnage, nebnip : int -- cube dimensions.
     smooth_velocity : bool -- ``sigma_smooth`` in km/s (True) or A.
     sigma_smooth : float -- intrinsic width of the painted lines (0: pixel floor only).
-    res_floor_factor : float -- minimum painted width in local pixels.
+    res_floor_fwhm_px : float -- minimum painted FWHM in local pixels (FSPS: 2 pixels per FWHM,
+        sigma = pixel x 2 / 2.355, ``sps_setup.f90:999-1002``).
 
     Attributes
     ----------
@@ -160,8 +164,9 @@ class NebularModel:
                  nebnz=11, nebnage=10, nebnip=7,
                  smooth_velocity=True,
                  sigma_smooth=0.0,
-                 res_floor_factor=2.0,
-                 nebular_smooth_init=None):
+                 res_floor_fwhm_px=2.0,
+                 nebular_smooth_init=None,
+                 **removed):
         if nebular_smooth_init is not None:
             sigma_smooth = float(nebular_smooth_init)
 
@@ -170,7 +175,17 @@ class NebularModel:
 
         self.smooth_velocity = bool(smooth_velocity)
         self.sigma_smooth    = float(sigma_smooth)
-        self.res_floor_factor = float(res_floor_factor)
+        if "res_floor_factor" in removed:
+            old = float(removed.pop("res_floor_factor"))
+            raise TypeError(
+                "NebularModel(res_floor_factor=) was removed in 1.0.14: it was the minimum line "
+                "SIGMA in model-grid pixels. The floor is now res_floor_fwhm_px, the minimum "
+                "FWHM in pixels (sigma = res_floor_fwhm_px / 2.355, as in FSPS; default 2). "
+                f"The old width is res_floor_fwhm_px={old * FWHM_PER_SIGMA:g} "
+                f"(res_floor_factor x 2.355).")
+        if removed:
+            raise TypeError(f"NebularModel() got unexpected keyword argument(s) {sorted(removed)}")
+        self.res_floor_fwhm_px = float(res_floor_fwhm_px)
 
         self.nebnz   = int(nebnz)
         self.nebnage = int(nebnage)
@@ -372,12 +387,22 @@ class NebularModel:
         self.nebem_logu = self.nebem_line_logu
 
     def compute_log_qq(self, ssp_flux):
-        """log10 Q [photons/s] for every SSP: (L_sun/h) * int_{lambda<912} L_nu / lambda dlambda (float64)."""
+        """log10 Q [photons/s] for every SSP: (L_sun/h) * int_{lambda<912} L_nu / lambda dlambda (the working float dtype, float64 by default)."""
         mask = self.csp_lambda < LYMAN_LIMIT_AA
-        wave_ion = self.csp_lambda[mask].astype(jnp.float64)
-        flux_ion = ssp_flux[..., mask].astype(jnp.float64)
-        qq = jnp.trapezoid(flux_ion / wave_ion, x=wave_ion)
         scale = LSUN_ERG_S / HPLANK_ERG_S
+        if not is_x64():
+            # float32 mode (docs/mac_gpu.md): scale (5.8e59) and TINY (1e-95) are outside float32
+            # (qq * scale overflowed to inf and made every prediction NaN).  The table is a
+            # construction-time constant, so it is computed on the host in float64, as the
+            # float64 path does on the device, and stored in the working dtype.
+            m = np.asarray(mask)
+            wave_ion = np.asarray(self.csp_lambda, dtype=np.float64)[m]
+            flux_ion = np.asarray(ssp_flux, dtype=np.float64)[..., m]
+            qq = np.trapezoid(flux_ion / wave_ion, x=wave_ion)
+            return jnp.asarray(np.log10(np.maximum(qq * scale, TINY)), dtype=float_dtype())
+        wave_ion = self.csp_lambda[mask].astype(float_dtype())
+        flux_ion = ssp_flux[..., mask].astype(float_dtype())
+        qq = jnp.trapezoid(flux_ion / wave_ion, x=wave_ion)
         return jnp.log10(jnp.maximum(qq * scale, TINY))
 
     def _compute_resolution_elements(self):
@@ -394,7 +419,7 @@ class NebularModel:
         """
         pos = np.asarray(self.nebem_line_pos, dtype=np.float64)
         lam = np.asarray(self.csp_lambda, dtype=np.float64)
-        floor = np.asarray(self.neb_res_min, dtype=np.float64) * self.res_floor_factor
+        floor = np.asarray(self.neb_res_min, dtype=np.float64) * self.res_floor_fwhm_px / FWHM_PER_SIGMA
         if self.smooth_velocity:
             base = pos * self.sigma_smooth / CLIGHT_AA_S * 1.0e13
         else:
@@ -411,7 +436,7 @@ class NebularModel:
             dlam = line_pos * self.sigma_smooth / CLIGHT_AA_S * 1.0e13
         else:
             dlam = jnp.full_like(line_pos, self.sigma_smooth)
-        dlam = jnp.maximum(dlam, self.neb_res_min * self.res_floor_factor)
+        dlam = jnp.maximum(dlam, self.neb_res_min * self.res_floor_fwhm_px / FWHM_PER_SIGMA)
 
         lam   = self.csp_lambda[:, None]
         l0    = line_pos[None, :]
@@ -539,13 +564,17 @@ class NebularModel:
         ref   = jnp.where(jnp.isfinite(ref), ref, 0.0)
         scale = jnp.power(10.0, logqq_young - ref[None, :])            # (n_z, n_young)
 
-        base = jnp.power(10.0, log_cont + ref[None, :])                # (nspec, n_young)
+        # the interpolation and 10**(...) in float64 (log values near 50: float32 would overflow
+        # or cost ~1e-5 in 10**x); the profiles and their (n_wave, n_lines) contraction in
+        # float32, the precision csp.py keeps of this result anyway (it casts it to float32
+        # before its own contraction)
+        base = jnp.power(10.0, log_cont + ref[None, :]).astype(jnp.float32)   # (nspec, n_young)
         if include_lines:
             log_line = _interp_cube(self.nebem_line, self.nebem_line_logz,
                                     self.nebem_line_age, self.nebem_line_logu)
             base_full = base + jnp.einsum(
-                'wl,ly->wy', self.gaussnebarr,
-                jnp.power(10.0, log_line + ref[None, :]))
+                'wl,ly->wy', self.gaussnebarr.astype(jnp.float32),
+                jnp.power(10.0, log_line + ref[None, :]).astype(jnp.float32))
             if include_lines == "both":
                 return base.T, base_full.T, scale
             base = base_full
