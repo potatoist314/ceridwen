@@ -29,8 +29,9 @@ class CSPBasis_afe(CSPBasis):
     ``SSPDataAfe`` grid (4-D ``ssp_flux`` with an ``ssp_afe`` axis).  theta["afe"] is
     optional: absent, the plane closest to [alpha/Fe] = 0 is used.  The SFH weights,
     dust, projection, flux factor and cosmology are those of ``CSPBasis``, and so are
-    ``wavelength_support`` (opt-in) and ``agn`` (see ``CSPBasis``; L_bol and the dust-free
-    galaxy spectrum are taken at theta['afe'] like the flux cube).
+    ``wavelength_support`` (on by default here, opt-in on ``CSPBasis``) and ``agn`` (see
+    ``CSPBasis``; L_bol and the dust-free galaxy spectrum are taken at theta['afe'] like the
+    flux cube).
 
     Every step-SFH model on a fixed lookback grid pre-contracts the SSP age axis into a
     per-bin SFH basis at construction (:meth:`_configure_sfh_basis_fastpath`); the
@@ -59,7 +60,7 @@ class CSPBasis_afe(CSPBasis):
         sfh_per_bin=False,
         cosmo=None,
         duste_model="DL07",
-        wavelength_support=False,
+        wavelength_support=True,
         agn=None,
         fixed=None,
         **kwargs,
