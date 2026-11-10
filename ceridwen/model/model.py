@@ -726,6 +726,9 @@ class SedModel:
                 obs.setup_for_model(self.wave, zred=self.zred)
         for cached in ("_predict_jit_fn", "_predict_vmap_fn"):
             self.__dict__.pop(cached, None)
+        response = getattr(self.csp, "abundance_response", None)
+        if response is not None:
+            response.setup_observations(self)
         from ..likelihood.eline_marginal import build_eline_system
         self._eline_system = build_eline_system(self)
         self._check_agn_eline_sigma_resolved()

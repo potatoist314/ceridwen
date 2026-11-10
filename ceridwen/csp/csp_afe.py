@@ -63,6 +63,7 @@ class CSPBasis_afe(CSPBasis):
         wavelength_support=True,
         agn=None,
         fixed=None,
+        abundance_response=None,
         **kwargs,
     ):
         self.verbose = bool(verbose)
@@ -258,6 +259,12 @@ class CSPBasis_afe(CSPBasis):
         self.initialize_model_structure(theta)
         self._set_fixed(fixed)
         self._configure_sfh_basis_fastpath()
+        self.abundance_response = abundance_response
+        if abundance_response is not None:
+            abundance_response.configure(self)
+            self.theta_init.update(cfe=jnp.array([0.0]), nfe=jnp.array([0.0]))
+            self.param_names = list(self.theta_init)
+            self._known_theta_keys |= {'cfe', 'nfe'}
 
         if verbose:
             print("\nCSPBasis (dict theta) — registered parameters:")
@@ -642,8 +649,22 @@ class CSPBasis_afe(CSPBasis):
                 "alpha-enhanced CLOUDY grids), so Lines observations cannot "
                 "be predicted.  Remove the Lines observation(s), or use "
                 "csp.CSPBasis with a solar-scaled grid.")
-        return super()._project_observations(
+        response = self.abundance_response
+        zero = None
+        if response is not None:
+            zero = (jnp.ravel(theta['cfe'])[0] == 0.) & (jnp.ravel(theta['nfe'])[0] == 0.)
+            factor = response.factor(self, theta, 'grid').astype(spectrum_phot.dtype)
+            spectrum_phot = jnp.where(zero, spectrum_phot, spectrum_phot * factor)
+        result = super()._project_observations(
             spectrum_phot, spectrum_slit, observations, theta, **kw)
+        if response is not None:
+            predictions = result[0] if isinstance(result, tuple) else result
+            for obs in observations:
+                if getattr(obs, '_kind', None) == 'spectrum':
+                    original = predictions[obs.name]
+                    factor = response.factor(self, theta, obs.name).astype(original.dtype)
+                    predictions[obs.name] = jnp.where(zero, original, original * factor)
+        return result
 
     def get_line_spec(self, theta):
         """Zeros (no nebular model)."""
