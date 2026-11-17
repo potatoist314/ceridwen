@@ -102,7 +102,7 @@ class AlfCNResponse:
         # The contraction is static. The sampler still sums SFH bins, not SSP ages.
         # Rows are (term, metallicity, SFH bin); columns are (dust group, wavelength).
         table = np.einsum("gnt,rztw->rzngw", self.bin_to_response_age, templates).astype(np.float32)
-        return jnp.asarray(table.reshape(-1, table.shape[3] * table.shape[4]), dtype=float)
+        return jnp.asarray(table.reshape(-1, table.shape[3] * table.shape[4]))
 
     def projected_templates(self, observation, zred, sigma):
         """Broaden base and differential spectra with the same linear projector."""
@@ -190,7 +190,7 @@ class AlfCNResponse:
             jnp.where(term == 0, 1., 0.),
             jnp.where(term == ci, ca, 0.) + jnp.where(term == ni, na, 0.)
             + jnp.where(term == cross, ca * na, 0.)])
-        coefficients = (amplitude[:, :, None, None] * history).reshape(2, -1)
+        coefficients = (amplitude[:, :, None, None] * history).reshape(2, -1).astype(matrix.dtype)
         spectra = (coefficients @ matrix).reshape(2, -1, wave.size)
         if csp._has_age_dependent_dust:
             attn, _ = csp.attenuate_dust(wave.astype(jnp.float32), theta)
