@@ -143,19 +143,26 @@ class AlfCNResponse:
         csp = model.csp
         grid = interp1d(self.wave, self.templates, axis=-1, bounds_error=False,
                         fill_value=0.)(np.asarray(csp.wave))
-        self.tables = {"grid": (self._table(grid), jnp.asarray(csp.wave))}
+        self.tables = {"grid": self._covered(grid, np.asarray(csp.wave))}
         self.minimum_total_sigma = {}
         for obs in model.observations:
             if getattr(obs, "_kind", None) != "spectrum":
                 continue
             projected, minimum = self.projected_templates(obs, model.zred, self.sigma_catalog)
-            self.tables[obs.name] = (self._table(projected),
-                                    jnp.asarray(obs.wavelength) / (1. + model.zred))
+            self.tables[obs.name] = self._covered(
+                projected, np.asarray(obs.wavelength) / (1. + model.zred))
             self.minimum_total_sigma[obs.name] = minimum
+
+    def _covered(self, templates, wave):
+        """Table and wavelengths inside alf's coverage, and the pixels on each side."""
+        inside = np.flatnonzero((wave >= self.wave[0]) & (wave <= self.wave[-1]))
+        low, high = inside[0], inside[-1] + 1
+        return (self._table(templates[..., low:high]), jnp.asarray(wave[low:high]),
+                (low, wave.size - high))
 
     def factor(self, csp, theta, key):
         """Enhanced/base ratio for the current SFH and metallicity history."""
-        table, wave = self.tables[key]
+        table, wave, outside = self.tables[key]
         sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
         sfh_bin = sfh if csp.sfh_per_bin else .5 * (sfh[:-1] + sfh[1:])
         if csp.zh_const:
@@ -167,23 +174,23 @@ class AlfCNResponse:
         hi = jnp.clip(jnp.searchsorted(knots, metallicity), 1, len(knots) - 1)
         lo = hi - 1
         weight = jnp.clip((metallicity - knots[lo]) / (knots[hi] - knots[lo]), 0., 1.)
-        bins = jnp.arange(sfh_bin.size)
-        lower = table[:, lo, :, bins, :].transpose(1, 2, 0, 3)
-        upper = table[:, hi, :, bins, :].transpose(1, 2, 0, 3)
-        basis = lower * (1. - weight[None, None, :, None]) + upper * weight[None, None, :, None]
-        spectra = jnp.einsum("n,rgnw->rgw", sfh_bin, basis)
-        if csp._has_age_dependent_dust:
-            attn, _ = csp.attenuate_dust(wave.astype(jnp.float32), theta)
-            spectra *= csp._dust_group_attenuation(attn, theta)[None, :, :]
-        spectra = spectra.sum(axis=1)
         c = jnp.ravel(theta["cfe"])[0]
         n = jnp.ravel(theta["nfe"])[0]
         ci = jnp.where(c >= 0., 1, 2)
         ni = jnp.where(n >= 0., 3, 4)
         cross = 5 + (ci - 1) * 2 + ni - 3
+        # Only the base and the three terms of this C/N sign pair are read.
+        terms = jnp.stack([jnp.zeros_like(ci), ci, ni, cross])[:, None]
+        bins = jnp.arange(sfh_bin.size)[None, :]
+        lower = table[terms, lo[None, :], :, bins, :].transpose(0, 2, 1, 3)
+        upper = table[terms, hi[None, :], :, bins, :].transpose(0, 2, 1, 3)
+        basis = lower * (1. - weight[None, None, :, None]) + upper * weight[None, None, :, None]
+        spectra = jnp.einsum("n,rgnw->rgw", sfh_bin, basis)
+        if csp._has_age_dependent_dust:
+            attn, _ = csp.attenuate_dust(wave.astype(jnp.float32), theta)
+            spectra *= csp._dust_group_attenuation(attn, theta)[None, :, :]
+        base, carbon, nitrogen, both = spectra.sum(axis=1)
         ca, na = jnp.abs(c) / .15, jnp.abs(n) / .3
-        delta = ca * spectra[ci] + na * spectra[ni] + ca * na * spectra[cross]
-        base = spectra[0]
-        inside = (wave >= self.wave[0]) & (wave <= self.wave[-1])
-        return jnp.where((base > 0.) & inside,
-                         1. + delta / jnp.where(base > 0., base, 1.), 1.)
+        delta = ca * carbon + na * nitrogen + ca * na * both
+        ratio = jnp.where(base > 0., 1. + delta / jnp.where(base > 0., base, 1.), 1.)
+        return jnp.pad(ratio, outside, constant_values=1.)
