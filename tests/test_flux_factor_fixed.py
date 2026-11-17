@@ -46,7 +46,7 @@ def csp():
         ssp,
         theta={
             "lookback_time": LOOKBACK_GYR,
-            "sfh": jnp.ones(8),
+            "sfh": jnp.ones(7),  # one SFR per bin
             "logzsol": jnp.array([-0.8]),
             "afe": jnp.array([0.2]),
         },
