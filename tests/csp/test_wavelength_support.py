@@ -358,10 +358,13 @@ def test_sfh_basis_support_is_bitwise_the_whole_grid(afe_ssp, zh_const):
         assert np.asarray(got_many[name]).tobytes() == np.asarray(want_many[name]).tobytes()
 
 
-def test_basis_matrix_rebuilds_the_basis(afe_ssp):
+def test_basis_table_rows_rebuild_the_basis(afe_ssp):
     csp, _ = _afe_build(afe_ssp, zh_const=False, support=False)
-    basis = np.asarray(csp._sfh_basis).transpose(0, 1, 3, 2, 4)  # (afe, z, bin, group, pixel)
+    basis = np.asarray(csp._sfh_basis)
+    empty = ~np.any(basis != 0, axis=(0, 1, 4))
+    assert empty.any()
     for support in (None, slice(40, 500)):
+        table, rows = csp._sfh_basis_table(support)
+        assert table.shape[2] == (~empty).sum() + 1
         want = basis if support is None else basis[..., support]
-        matrix = np.asarray(csp._sfh_basis_table(support))
-        assert matrix.reshape(want.shape).tobytes() == want.tobytes()
+        assert np.asarray(table)[:, :, rows].tobytes() == want.tobytes()
