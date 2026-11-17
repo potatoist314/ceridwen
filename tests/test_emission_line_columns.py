@@ -27,6 +27,7 @@ from ceridwen.likelihood import (
     PolynomialCalibration,
 )
 from ceridwen.likelihood.calibration import _bvn_upper, log_positive_probability
+from ceridwen.likelihood.likelihood import on_fitted_pixels
 from ceridwen.broadening import FWHM_TO_SIGMA, Instrument
 from ceridwen.observation import Spectrum
 
@@ -294,6 +295,33 @@ def test_photometry_shares_the_line_flux_exactly():
     np.testing.assert_allclose(value, peak + np.log(integral), rtol=0, atol=1e-6)
     with pytest.raises(ValueError, match="MultiObservationLikelihood.loglike"):
         joint.likelihoods[1](y, mu, sigma, mask, {})
+
+
+@pytest.mark.parametrize("sigma_max_kms", [None, 350.0])
+def test_loglike_on_the_fitted_pixels_equals_the_full_loglike(sigma_max_kms):
+    """Masked pixels outside the fitted window carry no term of ln L: cutting them changes
+    only the order of its sums."""
+    mu, y, sigma, mask, _ = _mock(np.array([0.0, 2e-17, 1e-17]), snr=15.0)
+    mask = mask & (WAVE > 6800.0) & (WAVE < 8400.0) & ~((WAVE > 7400.0) & (WAVE < 7450.0))
+    band = np.array([[4e10, 1e10], [1e10, 3e10]])
+    mu_p = np.array([2e-7, 3e-7])
+    data = {"spectrum": (y, sigma, mask, None, None),
+            "photometry": (mu_p + np.array([1e-9, -2e-9]), 0.05 * mu_p, np.ones(2, dtype=bool), None, None)}
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True, prior_sigma=0.1, mask=mask)
+    lines = replace(_lines(REST[1:], False), band_matrix=band, photometry_key="photometry",
+                    sigma_key="sigma_smooth", sigma_max_kms=sigma_max_kms)
+    joint = MultiObservationLikelihood(
+        keys=("photometry", "spectrum"),
+        likelihoods=(DiagonalGaussianLikelihood(),
+                     DiagonalGaussianLikelihood(noise_model=DiagonalNoiseModel(use_fractional=True),
+                                                calibration=cal, emission_lines=lines)))
+    theta = {"sigma_smooth": 210.0, "log_f_calib": np.log(0.03)}
+    fitted, cut, pixels = on_fitted_pixels(joint, data)
+    used = np.flatnonzero(mask)
+    assert pixels == {"photometry": slice(None), "spectrum": slice(used[0], used[-1] + 1)}
+    full = float(joint.loglike(data, {"spectrum": mu, "photometry": mu_p}, theta))
+    part = float(fitted.loglike(cut, {"spectrum": mu[pixels["spectrum"]], "photometry": mu_p}, theta))
+    np.testing.assert_allclose(part, full, rtol=1e-13, atol=0)
 
 
 def test_loglike_without_shared_lines_is_the_per_observation_sum():

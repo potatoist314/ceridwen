@@ -69,7 +69,7 @@ that is then evaluated, and the marginal above is exact for it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Union
 
 import jax
@@ -252,6 +252,11 @@ class PolynomialCalibration:
         safe_sigma = jnp.where(mask, jnp.asarray(sigma), 1.0)
         weight = jnp.where(mask, jnp.asarray(mu) / safe_sigma, 0.0)
         return self.basis * weight[:, None]
+
+    def on_pixels(self, pixels: slice) -> "PolynomialCalibration":
+        """The same polynomial on the pixels ``pixels`` only; ``x`` keeps its scale."""
+        return replace(self, x=self.x[pixels], basis=self.basis[pixels],
+                       moment_basis=self.moment_basis[pixels])
 
     def _weights(self, mu, sigma, mask) -> Array:
         """Masked pixel weights ``w_i = mu_i^2 / sigma_i^2`` (zero outside the mask)."""

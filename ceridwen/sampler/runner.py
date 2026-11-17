@@ -149,7 +149,8 @@ def run_sampler(
     _obs_dict    = model.obs_dict
     _keys        = tuple(likelihood.keys)
     _likelihoods = tuple(likelihood.likelihoods)
-    from ..likelihood.likelihood import observation_data, float32_rescaling, loglike_offset
+    from ..likelihood.likelihood import (observation_data, float32_rescaling, loglike_offset,
+                                         on_fitted_pixels)
     for key in _keys:
         if getattr(_obs_dict[key], "flux", None) is None:
             raise ValueError(f"run_sampler: observation {key!r} has no flux; give it flux= and "
@@ -173,9 +174,13 @@ def run_sampler(
 
         return adapter.run(loglike_fn, logprior_fn, theta_init, rng_key)
 
+    _fitted, _fitted_data, _pixels = on_fitted_pixels(likelihood, _static_data)
+
     @jax.jit
     def loglike_fn(theta: dict[str, Array]) -> Array:
-        return likelihood.loglike(_static_data, model.predict(theta), theta, _rescalings)
+        mu = model.predict(theta)
+        return _fitted.loglike(_fitted_data, {key: mu[key][_pixels[key]] for key in _keys},
+                               theta, _rescalings)
 
     @jax.jit
     def logprior_fn(theta: dict[str, Array]) -> Array:

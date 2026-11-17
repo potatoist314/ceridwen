@@ -178,6 +178,8 @@ class EmissionLineColumns:
         from the spectrum at ``zred`` (a prior 10^6 times wider than the
         flux error).  It keeps the solve finite where a sampled redshift
         moves a line off the unmasked pixels (zero column).
+    pixels : slice, optional
+        :meth:`columns` returns these pixel rows only (:meth:`on_pixels`).
     """
 
     wave_obs: np.ndarray
@@ -194,6 +196,7 @@ class EmissionLineColumns:
     band_matrix: Optional[np.ndarray] = None
     photometry_key: Optional[str] = None
     sigma_max_kms: Optional[float] = None
+    pixels: Optional[slice] = None
 
     @classmethod
     def from_spectrum(
@@ -322,6 +325,10 @@ class EmissionLineColumns:
         tie = np.eye(self.wave_rest.size) if self.tie is None else self.tie
         return replace(self, band_matrix=band @ tie, photometry_key=key)
 
+    def on_pixels(self, pixels: slice) -> "EmissionLineColumns":
+        """The same lines; :meth:`columns` returns the pixel rows ``pixels`` only."""
+        return replace(self, pixels=pixels)
+
     def _window(self) -> Optional[np.ndarray]:
         """(width, n_raw) pixel rows holding every nonzero value of each raw
         profile, or None.  Needs a fixed redshift and a fixed dispersion or
@@ -354,16 +361,17 @@ class EmissionLineColumns:
                             jnp.asarray(self.sigma_inst_kms))
         s = jnp.sqrt(s_gas ** 2 + s_inst ** 2) / _CKMS
         rows = self._window()
+        keep = slice(None) if self.pixels is None else self.pixels
         if rows is None:
-            x = (jnp.asarray(np.log(self.wave_obs))[:, None] - jnp.log(centre)[None, :]) / s[None, :]
+            x = (jnp.asarray(np.log(self.wave_obs)[keep])[:, None] - jnp.log(centre)[None, :]) / s[None, :]
             phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
-            profiles = phi * jnp.asarray(self.wave_obs / _C_AA_S)[:, None]
+            profiles = phi * jnp.asarray((self.wave_obs / _C_AA_S)[keep])[:, None]
         else:
             x = (jnp.asarray(np.log(self.wave_obs)[rows]) - jnp.log(centre)[None, :]) / s[None, :]
             phi = jnp.exp(-0.5 * x * x) / (jnp.sqrt(2.0 * jnp.pi) * s[None, :])
             window = phi * jnp.asarray((self.wave_obs / _C_AA_S)[rows])
             # Each pixel's value in its line's window, or 0 outside it.
-            offset = np.arange(self.wave_obs.size)[:, None] - rows[0][None, :]
+            offset = np.arange(self.wave_obs.size)[keep][:, None] - rows[0][None, :]
             inside = (offset >= 0) & (offset < rows.shape[0])
             profiles = jnp.where(inside, window[np.clip(offset, 0, rows.shape[0] - 1),
                                                 np.arange(self.wave_rest.size)[None, :]], 0.0)

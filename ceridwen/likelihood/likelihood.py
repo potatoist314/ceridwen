@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -168,6 +168,27 @@ def single_observation_data(observations, what: str, upper_limits: bool = False)
             "would treat as detections.  Use DiagonalGaussianLikelihoodWithUpperLimits, or "
             "MultiObservationLikelihood / fitSED, which pick the one-sided kernel")
     return y, sigma, mask, calib, ul
+
+
+def on_fitted_pixels(likelihood, data):
+    """``(likelihood, data, pixels)`` with each spectrum that has an analytic calibration cut to
+    the pixels from its first to its last unmasked one: ``pixels[key]`` is that slice
+    (``slice(None)`` for the other observations), and the likelihood then takes
+    ``mu[key][pixels[key]]``.  The pixels cut away carry no term of ln L; only the order of
+    its sums changes."""
+    pixels, cut, likelihoods = {}, {}, []
+    for key, lhood in zip(likelihood.keys, likelihood.likelihoods):
+        pixels[key], cut[key] = slice(None), data[key]
+        if (type(lhood) is DiagonalGaussianLikelihood and lhood.calibration is not None
+                and lhood.poly_calibration is None):
+            used = np.flatnonzero(np.asarray(data[key][2]))
+            keep = pixels[key] = slice(int(used[0]), int(used[-1]) + 1)
+            cut[key] = tuple(v if v is None or jnp.ndim(v) == 0 else v[keep] for v in data[key])
+            lines = lhood.emission_lines
+            lhood = replace(lhood, calibration=lhood.calibration.on_pixels(keep),
+                            emission_lines=None if lines is None else lines.on_pixels(keep))
+        likelihoods.append(lhood)
+    return replace(likelihood, likelihoods=tuple(likelihoods)), cut, pixels
 
 
 def calibrated_mu(mu, calibration):
