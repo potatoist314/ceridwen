@@ -35,7 +35,7 @@ def build_csp(ssp, *, reference=False, **overrides):
     options = {
         "theta": {
             "lookback_time": LOOKBACK_GYR,
-            "sfh": jnp.ones(8),
+            "sfh": jnp.ones(7),
             "logzsol": jnp.array([-0.8]),
             "afe": jnp.array([0.2]),
         },
@@ -66,7 +66,7 @@ def models(fixed_ssp):
 
 def theta(afe, metallicity, sfh=None):
     if sfh is None:
-        sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
+        sfh = jnp.array([0.65, 0.75, 1.2, 1.35, 1.15, 0.95, 0.6])
     return {
         "afe": jnp.array([afe]),
         "logzsol": jnp.array([metallicity]),
@@ -120,11 +120,11 @@ def test_diffuse_dust_fastpath_matches_reference(fixed_ssp):
 
 
 def test_static_operator_matches_reference_age_weights(models):
-    sfh = jnp.array([0.3, 1.7, 0.2, 0.9, 2.1, 0.5, 1.2, 0.4])
+    sfh = jnp.array([1.0, 0.95, 0.55, 1.5, 1.3, 0.85, 0.8])
     reference_age_weights = models["reference"].calculate_ssp_weights(
         theta(0.13, -0.73, sfh)
     ).sum(axis=0)
-    fast_age_weights = 0.5 * (sfh[:-1] + sfh[1:]) @ models["automatic"]._sfh_bin_to_age
+    fast_age_weights = sfh @ models["automatic"]._sfh_bin_to_age
     np.testing.assert_allclose(
         fast_age_weights,
         reference_age_weights,
@@ -143,8 +143,8 @@ def test_constant_ssp_limit_is_sfh_time_integral_in_years(fixed_ssp):
     data = vars(fixed_ssp).copy()
     data["ssp_flux"] = np.ones_like(fixed_ssp.ssp_flux)
     unit_ssp = SimpleNamespace(**data)
-    sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
-    expected = jnp.trapezoid(sfh, LOOKBACK_GYR * 1e9)
+    sfh = jnp.array([0.65, 0.75, 1.2, 1.35, 1.15, 0.95, 0.6])
+    expected = jnp.sum(sfh * jnp.diff(LOOKBACK_GYR * 1e9))
 
     for reference in (True, False):
         actual = build_csp(unit_ssp, reference=reference).get_spectrum(
@@ -154,7 +154,7 @@ def test_constant_ssp_limit_is_sfh_time_integral_in_years(fixed_ssp):
 
 
 def test_gradients_match_reference(models):
-    sfh = jnp.array([0.2, 1.1, 0.4, 2.0, 0.7, 1.6, 0.3, 0.9])
+    sfh = jnp.array([0.65, 0.75, 1.2, 1.35, 1.15, 0.95, 0.6])
 
     def objective(csp, afe, metallicity, sfh_values):
         return jnp.sum(csp.get_spectrum(theta(afe, metallicity, sfh_values)))
@@ -219,13 +219,13 @@ FOURTEEN_BINS_GYR = jnp.array(
 )
 
 
-def model_pair(ssp, lookback, *, per_bin=False, zh_const=True, dust=False):
-    n_sfh = lookback.size - 1 if per_bin else lookback.size
+def model_pair(ssp, lookback, *, zh_const=True, dust=False):
+    n_sfh = lookback.size - 1
     initial = {"lookback_time": lookback, "sfh": jnp.ones(n_sfh), "afe": jnp.array([0.2])}
     if zh_const:
         initial["logzsol"] = jnp.array([-0.8])
     else:
-        initial["logzsol_hist"] = jnp.full(lookback.size, -0.8)
+        initial["logzsol_bins"] = jnp.full(n_sfh, -0.8)
     options = dict(theta=initial, zh_const=zh_const, add_dust=dust, add_diffuse_dust=dust)
     reference = build_csp(ssp, reference=True, **options)
     automatic = build_csp(ssp, **options)
@@ -238,9 +238,7 @@ def model_pair(ssp, lookback, *, per_bin=False, zh_const=True, dust=False):
         inputs["logzsol"] = jnp.array([-0.73])
     else:
         # Off-grid values, both grid edges and values beyond them.
-        inputs["logzsol_hist"] = jnp.linspace(-2.1, 0.5, lookback.size) + 0.07 * jnp.sin(
-            jnp.arange(lookback.size)
-        )
+        inputs["logzsol_bins"] = jnp.linspace(-2.1, 0.5, n_sfh) + 0.07 * jnp.sin(jnp.arange(n_sfh))
     if dust:
         defaults = automatic.dust_attn.get_default_fit_params()
         inputs.update({k: jnp.full_like(jnp.asarray(v, dtype=float), 0.7) for k, v in defaults.items()})
@@ -270,20 +268,14 @@ def test_bins_metallicity_and_birth_cloud_dust_match_reference(fixed_ssp, lookba
         assert_spectra_match(reference, automatic, {**inputs, "frac_obrun": jnp.array([0.3])})
 
 
-@pytest.mark.parametrize("zh_const", [True, False], ids=["const-Z", "evolving-Z"])
-def test_per_bin_sfh_matches_reference(fixed_ssp, zh_const):
-    assert_spectra_match(*model_pair(fixed_ssp, FOURTEEN_BINS_GYR, per_bin=True,
-                                     zh_const=zh_const, dust=True))
-
-
 def test_evolving_metallicity_gradients_match_reference(fixed_ssp):
     reference, automatic, inputs = model_pair(fixed_ssp, FOURTEEN_BINS_GYR, zh_const=False, dust=True)
 
     def objective(csp, zh, sfh):
-        return jnp.sum(csp.get_spectrum({**inputs, "logzsol_hist": zh, "sfh": sfh}))
+        return jnp.sum(csp.get_spectrum({**inputs, "logzsol_bins": zh, "sfh": sfh}))
 
-    expected = jax.grad(objective, argnums=(1, 2))(reference, inputs["logzsol_hist"], inputs["sfh"])
-    actual = jax.grad(objective, argnums=(1, 2))(automatic, inputs["logzsol_hist"], inputs["sfh"])
+    expected = jax.grad(objective, argnums=(1, 2))(reference, inputs["logzsol_bins"], inputs["sfh"])
+    actual = jax.grad(objective, argnums=(1, 2))(automatic, inputs["logzsol_bins"], inputs["sfh"])
     for actual_part, expected_part in zip(actual, expected):
         np.testing.assert_allclose(actual_part, expected_part, rtol=8e-5, atol=3e-2)
 

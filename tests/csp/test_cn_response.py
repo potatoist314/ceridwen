@@ -36,8 +36,8 @@ def response(grid):
 
 def model(grid, cn=None, evolving=False):
     theta = {"lookback_time": jnp.array([0., 1., 3., 8.]),
-             "sfh": jnp.array([1., 2., 3., 1.]), "afe": jnp.array([.1])}
-    theta.update({"logzsol_hist": jnp.array([-.9, -.5, -.1, 0.])} if evolving
+             "sfh": jnp.array([1.5, 2.5, 2.]), "afe": jnp.array([.1])}
+    theta.update({"logzsol_bins": jnp.array([-.7, -.3, -.05])} if evolving
                  else {"logzsol": jnp.array([-.5])})
     csp = CSPBasis_afe(grid, theta=theta, zh_const=not evolving,
                      add_dust=False, add_diffuse_dust=False,

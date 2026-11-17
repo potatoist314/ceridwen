@@ -298,10 +298,10 @@ def afe_ssp():
 
 def _afe_build(ssp, zh_const, support):
     metallicity = ({"logzsol": jnp.array([-0.8])} if zh_const
-                   else {"logzsol_hist": jnp.full(7, -0.8)})
+                   else {"logzsol_bins": jnp.full(7, -0.8)})
     csp = CSPBasis_afe(
         ssp,
-        theta={"lookback_time": AFE_LOOKBACK_GYR, "sfh": jnp.ones(8),
+        theta={"lookback_time": AFE_LOOKBACK_GYR, "sfh": jnp.ones(7),
                "afe": jnp.array([0.2]), **metallicity},
         zh_const=zh_const,
         sfh_interp="step",
@@ -328,12 +328,12 @@ def _afe_thetas(csp, zh_const, n):
     base.update(logmass=jnp.array([10.5]), zred=jnp.array([AFE_ZRED]))
     draws = []
     for _ in range(n):
-        theta = dict(base, sfh=jnp.asarray(rng.uniform(0.1, 2.0, 8)),
+        theta = dict(base, sfh=jnp.asarray(rng.uniform(0.1, 2.0, 7)),
                      afe=jnp.asarray(rng.uniform(-0.2, 0.6, 1)))
         if zh_const:
             theta["logzsol"] = jnp.asarray(rng.uniform(-1.9, 0.3, 1))
         else:
-            theta["logzsol_hist"] = jnp.asarray(rng.uniform(-1.9, 0.3, 7))
+            theta["logzsol_bins"] = jnp.asarray(rng.uniform(-1.9, 0.3, 7))
         draws.append(theta)
     return draws
 

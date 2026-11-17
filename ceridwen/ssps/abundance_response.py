@@ -171,8 +171,7 @@ class AlfCNResponse:
         if csp.zh_const:
             metallicity = jnp.broadcast_to(jnp.ravel(theta["logzsol"])[0], sfh_bin.shape)
         else:
-            history = theta["logzsol_hist"]
-            metallicity = history if csp.zh_per_bin else .5 * (history[:-1] + history[1:])
+            metallicity = jnp.atleast_1d(theta["logzsol_bins"])
         knots = jnp.asarray(self.metallicities)
         # 4 knots: compare with each knot; the default method is a sequential loop.
         hi = jnp.clip(jnp.searchsorted(knots, metallicity, method="compare_all"), 1, len(knots) - 1)

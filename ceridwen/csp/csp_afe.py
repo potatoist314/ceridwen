@@ -3,7 +3,7 @@
 ``ssp_flux`` carries a leading [alpha/Fe] axis, (n_afe, n_z, n_age, n_wave); a scalar
 theta["afe"] selects the plane by linear interpolation.  Lines observations are refused.
 
-theta["logzsol"] (or "logzsol_hist") is [Fe/H] on these grids: every [alpha/Fe] plane shares
+theta["logzsol"] (or "logzsol_bins") is [Fe/H] on these grids: every [alpha/Fe] plane shares
 one [Fe/H] axis (FSPS AFE_FLAG=1).  The total metallicity [Z/H] = logzsol + f([alpha/Fe]) is
 available as :meth:`CSPBasis_afe.logzsol_total` / ``grid_metadata.logzsol_total``.
 """
@@ -16,7 +16,7 @@ import numpy as np
 import jax.numpy as jnp
 import pprint
 
-from ceridwen.csp.csp import (CSPBasis, LOGZSOL_KEYS, REMOVED_METALLICITY_KEYS,
+from ceridwen.csp.csp import (CSPBasis, LOGZSOL_KEYS, REMOVED_METALLICITY_KEYS, _sfh_per_bin,
                               _check_duste_model, _default_logzsol, _per_pixel, _sel,
                               removed_metallicity_key_error, tiny_number)
 from ceridwen.ssps.grid_metadata import logzsol_total as _logzsol_total, refused_cell_bounds
@@ -57,7 +57,7 @@ class CSPBasis_afe(CSPBasis):
         sfh_interp='step',
         track_zred_age=False,
         lookback_time=None,
-        sfh_per_bin=False,
+        sfh_per_bin=None,
         cosmo=None,
         duste_model="DL07",
         wavelength_support=True,
@@ -91,19 +91,19 @@ class CSPBasis_afe(CSPBasis):
             _n = int(_lb.size)
             theta = {
                 'lookback_time': _lb,
-                'sfh': jnp.ones(max(_n - 1, 1) if sfh_per_bin else _n),
+                'sfh': jnp.ones(max(_n - 1, 1) if _sfh_per_bin(sfh_interp, sfh_per_bin) else _n),
             }
             _lz_mid = _default_logzsol(SSPData)
             if zh_const:
                 theta['logzsol'] = jnp.array([_lz_mid])
             else:
-                theta['logzsol_hist'] = jnp.full((_n,), _lz_mid)
+                theta['logzsol_bins'] = jnp.full((max(_n - 1, 1),), _lz_mid)
         if theta is None:
             raise ValueError(
                 "CSPBasis needs the static SFH grid structure. Pass either\n"
                 "  lookback_time=jnp.linspace(0.0, T_oldest, n_nodes)   "
                 "(shortcut; neutral initial values), or\n"
-                "  theta={'lookback_time': ..., 'sfh': ..., 'logzsol' or 'logzsol_hist': ...} "
+                "  theta={'lookback_time': ..., 'sfh': ..., 'logzsol' or 'logzsol_bins': ...} "
                 "(full control).\n"
                 "lookback_time is in Gyr, monotonically increasing, index 0 = "
                 "today, >= 2 nodes."
@@ -389,7 +389,7 @@ class CSPBasis_afe(CSPBasis):
         """Return alpha and metallicity interpolation coordinates.
 
         The metallicity coordinates are scalars for ``theta["logzsol"]`` and one
-        per SFH bin for ``theta["logzsol_hist"]``, with the same bracketing as
+        per SFH bin for ``theta["logzsol_bins"]``, with the same bracketing as
         ``_ssp_weights``.
         """
         if self._n_afe == 1 or "afe" not in theta:
@@ -415,8 +415,7 @@ class CSPBasis_afe(CSPBasis):
             z1 = self.zmet[z_hi]
             z_weight = jnp.clip((target_z - z0) / (z1 - z0), 0.0, 1.0)
         else:
-            zh = theta["logzsol_hist"]
-            zbin = zh if self.zh_per_bin else 0.5 * (zh[:-1] + zh[1:])
+            zbin = jnp.atleast_1d(theta["logzsol_bins"])
             z_lo = jnp.clip(
                 jnp.searchsorted(self.zmet, zbin, method="compare_all") - 1,
                 0,
@@ -500,8 +499,9 @@ class CSPBasis_afe(CSPBasis):
         return msgs
 
     def logzsol_total(self, theta):
-        """[Z/H] = logzsol + f([alpha/Fe]) for this theta (Z/X definition; grid_metadata)."""
-        key = 'logzsol' if self.zh_const else 'logzsol_hist'
+        """[Z/H] = logzsol + f([alpha/Fe]) for this theta (Z/X definition; grid_metadata),
+        elementwise for a per-bin history (``self.zh_key``)."""
+        key = self.zh_key
         afe = jnp.ravel(theta['afe'])[0] if 'afe' in theta else self.afe_grid[self._afe_solar_idx]
         return _logzsol_total(theta[key], afe)
 
@@ -520,7 +520,7 @@ class CSPBasis_afe(CSPBasis):
         cells = self.refused_cells_logzsol()
         if not cells or self._n_afe == 1:
             return
-        key = 'logzsol' if self.zh_const else 'logzsol_hist'
+        key = self.zh_key
         if key not in theta or 'afe' not in theta:
             return
         z = np.asarray(theta[key], dtype=float)

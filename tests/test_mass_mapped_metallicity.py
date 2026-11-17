@@ -114,8 +114,8 @@ def build_csp(ssp, zh, *, reference=False, dust=False):
         ssp,
         theta={
             "lookback_time": jnp.asarray(LOOKBACK_GYR),
-            "sfh": jnp.ones(LOOKBACK_GYR.size),
-            "logzsol_hist": zh,
+            "sfh": jnp.ones(LOOKBACK_GYR.size - 1),
+            "logzsol_bins": zh,
             "afe": jnp.array([0.2]),
         },
         zh_const=False,
@@ -138,26 +138,16 @@ def test_fastpath_matches_general_path(grid_ssp, dust):
     init = jnp.zeros(LOOKBACK_GYR.size - 1)
     reference = build_csp(grid_ssp, init, reference=True, dust=dust)
     automatic = build_csp(grid_ssp, init, dust=dust)
-    assert automatic.sfh_basis_fastpath and automatic.zh_per_bin
+    assert automatic.sfh_basis_fastpath and automatic.sfh_per_bin
     inputs = {k: v for k, v in reference.theta_init.items()}
     if dust:
         defaults = automatic.dust_attn.get_default_fit_params()
         inputs.update({k: jnp.full_like(jnp.asarray(v, dtype=float), 0.7) for k, v in defaults.items()})
     for sfh, logz_mean, beta_unit in zip(sfh_draws(4, 6), (-3.8, -2.4, -1.7, -1.3), (0.2, 1.0, 0.6, 0.9)):
         zh, _ = history(sfh, logz_mean, beta_unit)
-        inputs.update(afe=jnp.array([0.13]), sfh=jnp.asarray(sfh), logzsol_hist=jnp.asarray(zh) - LOGZ_SUN)
+        inputs.update(afe=jnp.array([0.13]), sfh=jnp.asarray(0.5 * (sfh[:-1] + sfh[1:])),
+                      logzsol_bins=jnp.asarray(zh) - LOGZ_SUN)
         np.testing.assert_allclose(
             automatic.get_spectrum(inputs), reference.get_spectrum(inputs), rtol=5e-5, atol=2e-2
         )
 
-
-def test_per_bin_zh_matches_per_node_zh_with_same_bin_values(grid_ssp):
-    node = jnp.linspace(-3.9, -1.3, LOOKBACK_GYR.size) - LOGZ_SUN
-    per_node = build_csp(grid_ssp, node, reference=True)
-    per_bin = build_csp(grid_ssp, 0.5 * (node[:-1] + node[1:]), reference=True)
-    sfh = jnp.asarray(sfh_draws(1, 7)[0])
-    np.testing.assert_allclose(
-        per_bin.get_spectrum({"afe": jnp.array([0.13]), "sfh": sfh, "logzsol_hist": 0.5 * (node[:-1] + node[1:])}),
-        per_node.get_spectrum({"afe": jnp.array([0.13]), "sfh": sfh, "logzsol_hist": node}),
-        rtol=1e-6,
-    )
