@@ -174,7 +174,8 @@ class AlfCNResponse:
             history = theta["logzsol_hist"]
             metallicity = history if csp.zh_per_bin else .5 * (history[:-1] + history[1:])
         knots = jnp.asarray(self.metallicities)
-        hi = jnp.clip(jnp.searchsorted(knots, metallicity), 1, len(knots) - 1)
+        # 4 knots: compare with each knot; the default method is a sequential loop.
+        hi = jnp.clip(jnp.searchsorted(knots, metallicity, method="compare_all"), 1, len(knots) - 1)
         lo = hi - 1
         weight = jnp.clip((metallicity - knots[lo]) / (knots[hi] - knots[lo]), 0., 1.)
         c = jnp.ravel(theta["cfe"])[0]
