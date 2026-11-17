@@ -78,8 +78,10 @@ def test_windowed_columns_equal_the_full_evaluation_bitwise(rest):
     sigmas = {"sigma_smooth": jnp.array([[5.0], [SIGMA_GAS], [350.0]])}
     np.testing.assert_array_equal(np.asarray(jax.jit(jax.vmap(windowed.columns))(sigmas)),
                                   np.asarray(jax.jit(jax.vmap(full.columns))(sigmas)))
-    np.testing.assert_array_equal(np.asarray(jax.jit(fixed.columns)({})),
-                                  np.asarray(jax.jit(full.columns)({"sigma_smooth": jnp.array([SIGMA_GAS])})))
+    # XLA folds the all-constant columns at compile time: last-bit rounding, subnormals kept.
+    np.testing.assert_allclose(np.asarray(jax.jit(fixed.columns)({})),
+                               np.asarray(jax.jit(full.columns)({"sigma_smooth": jnp.array([SIGMA_GAS])})),
+                               rtol=1e-14, atol=1e-300)
 
 
 @pytest.mark.parametrize("sigma_max_kms", [None, 350.0])

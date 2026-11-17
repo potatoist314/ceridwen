@@ -357,10 +357,11 @@ class EmissionLineColumns:
         opz = 1.0 + value(self.zred_key, self.zred)
         s_gas = value(self.sigma_key, self.sigma_gas_kms)
         centre = jnp.asarray(self.wave_rest) * opz
-        if self.zred_key is None:  # constant centres: evaluated once, when traced
-            s_inst = jnp.interp(centre, jnp.asarray(self.wave_obs),
-                                jnp.asarray(self.sigma_inst_kms))
-        else:  # jnp.interp without its binary-search loop (13 sequential steps on 6166 pixels)
+        # jnp.interp lowers to a sequential binary search (13 steps on 6166 pixels) in every call.
+        if self.zred_key is None:  # constant centres, as in _window
+            s_inst = jnp.asarray(np.interp(self.wave_rest * (1.0 + self.zred), self.wave_obs,
+                                           self.sigma_inst_kms))
+        else:
             from ..observation._smoothing import make_static_grid_interp
             s_inst = make_static_grid_interp(self.wave_obs)(centre, jnp.asarray(self.sigma_inst_kms))
         s = jnp.sqrt(s_gas ** 2 + s_inst ** 2) / _CKMS
