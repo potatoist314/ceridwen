@@ -192,9 +192,11 @@ class AlfCNResponse:
         amplitude = (jnp.where(term == ci, ca, 0.) + jnp.where(term == ni, na, 0.)
                      + jnp.where(term == cross, ca * na, 0.))
         dtype = base_matrix.dtype
+        full = jax.lax.Precision.HIGHEST  # the A100's default rounds float32 products to TF32
         spectra = jnp.stack([
-            history.reshape(-1).astype(dtype) @ base_matrix,
-            (amplitude[:, None, None] * history).reshape(-1).astype(dtype) @ delta_matrix,
+            jnp.matmul(history.reshape(-1).astype(dtype), base_matrix, precision=full),
+            jnp.matmul((amplitude[:, None, None] * history).reshape(-1).astype(dtype), delta_matrix,
+                       precision=full),
         ]).reshape(2, -1, wave.size)
         if csp._has_age_dependent_dust:
             attn, _ = csp.attenuate_dust(wave.astype(jnp.float32), theta)
