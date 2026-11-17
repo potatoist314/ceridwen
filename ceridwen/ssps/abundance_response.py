@@ -100,8 +100,9 @@ class AlfCNResponse:
 
     def _table(self, templates):
         # The contraction is static. The sampler still sums SFH bins, not SSP ages.
-        return jnp.asarray(np.einsum("gnt,rztw->rzgnw",
-                                    self.bin_to_response_age, templates), dtype=jnp.float32)
+        # Rows are (term, metallicity, SFH bin); columns are (dust group, wavelength).
+        table = np.einsum("gnt,rztw->rzngw", self.bin_to_response_age, templates).astype(np.float32)
+        return jnp.asarray(table.reshape(-1, table.shape[3] * table.shape[4]), dtype=float)
 
     def projected_templates(self, observation, zred, sigma):
         """Broaden base and differential spectra with the same linear projector."""
@@ -162,7 +163,7 @@ class AlfCNResponse:
 
     def factor(self, csp, theta, key):
         """Enhanced/base ratio for the current SFH and metallicity history."""
-        table, wave, outside = self.tables[key]
+        matrix, wave, outside = self.tables[key]
         sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
         sfh_bin = sfh if csp.sfh_per_bin else .5 * (sfh[:-1] + sfh[1:])
         if csp.zh_const:
@@ -179,18 +180,21 @@ class AlfCNResponse:
         ci = jnp.where(c >= 0., 1, 2)
         ni = jnp.where(n >= 0., 3, 4)
         cross = 5 + (ci - 1) * 2 + ni - 3
-        # Only the base and the three terms of this C/N sign pair are read.
-        terms = jnp.stack([jnp.zeros_like(ci), ci, ni, cross])[:, None]
-        bins = jnp.arange(sfh_bin.size)[None, :]
-        lower = table[terms, lo[None, :], :, bins, :].transpose(0, 2, 1, 3)
-        upper = table[terms, hi[None, :], :, bins, :].transpose(0, 2, 1, 3)
-        basis = lower * (1. - weight[None, None, :, None]) + upper * weight[None, None, :, None]
-        spectra = jnp.einsum("n,rgnw->rgw", sfh_bin, basis)
+        ca, na = jnp.abs(c) / .15, jnp.abs(n) / .3
+        # One matrix product gives the base and the summed C/N differential: each SFH bin
+        # weights its two metallicity knots, and only the terms of this C/N sign pair are non-zero.
+        knot = jnp.arange(len(knots))[:, None]
+        history = sfh_bin * (jnp.where(knot == lo, 1. - weight, 0.) + jnp.where(knot == hi, weight, 0.))
+        term = jnp.arange(9)
+        amplitude = jnp.stack([
+            jnp.where(term == 0, 1., 0.),
+            jnp.where(term == ci, ca, 0.) + jnp.where(term == ni, na, 0.)
+            + jnp.where(term == cross, ca * na, 0.)])
+        coefficients = (amplitude[:, :, None, None] * history).reshape(2, -1)
+        spectra = (coefficients @ matrix).reshape(2, -1, wave.size)
         if csp._has_age_dependent_dust:
             attn, _ = csp.attenuate_dust(wave.astype(jnp.float32), theta)
             spectra *= csp._dust_group_attenuation(attn, theta)[None, :, :]
-        base, carbon, nitrogen, both = spectra.sum(axis=1)
-        ca, na = jnp.abs(c) / .15, jnp.abs(n) / .3
-        delta = ca * carbon + na * nitrogen + ca * na * both
+        base, delta = spectra.sum(axis=1)
         ratio = jnp.where(base > 0., 1. + delta / jnp.where(base > 0., base, 1.), 1.)
         return jnp.pad(ratio, outside, constant_values=1.)
