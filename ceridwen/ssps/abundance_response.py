@@ -101,8 +101,10 @@ class AlfCNResponse:
     def _table(self, templates):
         # The contraction is static. The sampler still sums SFH bins, not SSP ages.
         # Rows are (term, metallicity, SFH bin); columns are (dust group, wavelength).
+        # The base term and the 8 differential terms are separate matrices.
         table = np.einsum("gnt,rztw->rzngw", self.bin_to_response_age, templates).astype(np.float32)
-        return jnp.asarray(table.reshape(-1, table.shape[3] * table.shape[4]))
+        columns = table.shape[3] * table.shape[4]
+        return jnp.asarray(table[0].reshape(-1, columns)), jnp.asarray(table[1:].reshape(-1, columns))
 
     def projected_templates(self, observation, zred, sigma):
         """Broaden base and differential spectra with the same linear projector."""
@@ -163,7 +165,7 @@ class AlfCNResponse:
 
     def factor(self, csp, theta, key):
         """Enhanced/base ratio for the current SFH and metallicity history."""
-        matrix, wave, outside = self.tables[key]
+        (base_matrix, delta_matrix), wave, outside = self.tables[key]
         sfh = jnp.clip(theta["sfh"], 1e-30, None).astype(jnp.float32)
         sfh_bin = sfh if csp.sfh_per_bin else .5 * (sfh[:-1] + sfh[1:])
         if csp.zh_const:
@@ -181,17 +183,18 @@ class AlfCNResponse:
         ni = jnp.where(n >= 0., 3, 4)
         cross = 5 + (ci - 1) * 2 + ni - 3
         ca, na = jnp.abs(c) / .15, jnp.abs(n) / .3
-        # One matrix product gives the base and the summed C/N differential: each SFH bin
+        # One matrix product gives the base, one the summed C/N differential: each SFH bin
         # weights its two metallicity knots, and only the terms of this C/N sign pair are non-zero.
         knot = jnp.arange(len(knots))[:, None]
         history = sfh_bin * (jnp.where(knot == lo, 1. - weight, 0.) + jnp.where(knot == hi, weight, 0.))
-        term = jnp.arange(9)
-        amplitude = jnp.stack([
-            jnp.where(term == 0, 1., 0.),
-            jnp.where(term == ci, ca, 0.) + jnp.where(term == ni, na, 0.)
-            + jnp.where(term == cross, ca * na, 0.)])
-        coefficients = (amplitude[:, :, None, None] * history).reshape(2, -1).astype(matrix.dtype)
-        spectra = (coefficients @ matrix).reshape(2, -1, wave.size)
+        term = jnp.arange(1, 9)
+        amplitude = (jnp.where(term == ci, ca, 0.) + jnp.where(term == ni, na, 0.)
+                     + jnp.where(term == cross, ca * na, 0.))
+        dtype = base_matrix.dtype
+        spectra = jnp.stack([
+            history.reshape(-1).astype(dtype) @ base_matrix,
+            (amplitude[:, None, None] * history).reshape(-1).astype(dtype) @ delta_matrix,
+        ]).reshape(2, -1, wave.size)
         if csp._has_age_dependent_dust:
             attn, _ = csp.attenuate_dust(wave.astype(jnp.float32), theta)
             spectra *= csp._dust_group_attenuation(attn, theta)[None, :, :]
