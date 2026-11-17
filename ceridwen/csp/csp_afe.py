@@ -322,24 +322,15 @@ class CSPBasis_afe(CSPBasis):
 
     def _sfh_basis_table(self, support=None):
         """``_sfh_basis`` on the model pixels ``support`` (a static slice; None = the whole
-        grid) as ``(table, rows)``: ``table[afe, z, rows[g, n]]`` is the basis
-        spectrum of group ``g`` and bin ``n``.  The table holds the nonzero
-        ``(g, n)`` spectra once, plus one zero row that the empty ones share
-        (the birth-cloud group has ages in the first bin only).  Cached per
+        grid) as a matrix: rows are (afe, z, bin), columns are (group, pixel).  Cached per
         slice."""
         key = None if support is None else (support.start, support.stop)
         if key not in self._sfh_basis_tables:
-            basis = _sel(np.asarray(self._sfh_basis), support)
-            nonzero = np.any(basis != 0, axis=(0, 1, 4))
-            group, bin_ = np.nonzero(nonzero)
-            rows = np.full(nonzero.shape, group.size)
-            rows[group, bin_] = np.arange(group.size)
-            table = basis[:, :, group, bin_]
-            if not nonzero.all():
-                table = np.concatenate([table, np.zeros_like(table[:, :, :1])], axis=2)
+            basis = _sel(np.asarray(self._sfh_basis), support).transpose(0, 1, 3, 2, 4)
             # A device array even when the first call is inside a trace.
             with jax.ensure_compile_time_eval():
-                self._sfh_basis_tables[key] = (jnp.asarray(table), rows)
+                self._sfh_basis_tables[key] = jnp.asarray(
+                    basis.reshape(-1, basis.shape[3] * basis.shape[4]))
         return self._sfh_basis_tables[key]
 
     def _make_sfh_bin_to_age_operator(self):
@@ -438,22 +429,16 @@ class CSPBasis_afe(CSPBasis):
         afe_lo, afe_hi, afe_weight, z_lo, z_hi, z_weight = self._sfh_basis_coords(theta)
         afe_weight = afe_weight.astype(jnp.float32)
         z_weight = z_weight.astype(jnp.float32)
-        table, rows = self._sfh_basis_table(support)
-
-        if self.zh_const:
-            def corner(afe, z):
-                return table[afe, z][rows]                          # (g, n, w)
-        else:
-            z_weight = z_weight[:, None]
-
-            def corner(afe, z):
-                # Bin n reads its own metallicity plane z[n].
-                return table[afe][z[None, :], rows]
-
-        lower = (1.0 - z_weight) * corner(afe_lo, z_lo) + z_weight * corner(afe_lo, z_hi)
-        upper = (1.0 - z_weight) * corner(afe_hi, z_lo) + z_weight * corner(afe_hi, z_hi)
-        group_basis = (1.0 - afe_weight) * lower + afe_weight * upper
-        return jnp.einsum("n,gnw->gw", sfh_bin, group_basis)
+        matrix = self._sfh_basis_table(support)
+        # One matrix product: each bin weights its two alpha planes and two metallicity planes.
+        plane = jnp.arange(self._n_afe)[:, None, None]
+        knot = jnp.arange(self._n_z)[None, :, None]
+        afe_part = (jnp.where(plane == afe_lo, 1.0 - afe_weight, 0.0)
+                    + jnp.where(plane == afe_hi, afe_weight, 0.0))
+        z_part = (jnp.where(knot == z_lo, 1.0 - z_weight, 0.0)
+                  + jnp.where(knot == z_hi, z_weight, 0.0))
+        coefficients = (afe_part * z_part * sfh_bin).astype(jnp.float32).reshape(-1)
+        return (coefficients @ matrix).reshape(len(self._dust_group_mix), -1)
 
     def initialize_model_structure(self, theta):
         """``CSPBasis.initialize_model_structure`` plus the optional scalar theta['afe']."""
