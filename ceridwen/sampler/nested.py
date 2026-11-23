@@ -4,6 +4,7 @@ loop with periodic checkpoints (resumable), and evidence/weight extraction."""
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import json
 import os
 import time
@@ -20,6 +21,17 @@ Array = jax.Array
 
 #: inner slice kernels of :class:`BlackJAXNestedSamplerAdapter` (``slice_kernel=``)
 SLICE_KERNELS = ("stock", "carry", "lanes")
+
+
+def _finite_loglike(loglike_fn, theta):
+    """``loglike_fn(theta)`` with NaN replaced by -inf."""
+    lnl = loglike_fn(theta)
+    return jnp.where(jnp.isnan(lnl), -jnp.inf, lnl)
+
+
+def _as_partial(fn):
+    """``fn`` as a ``jax.tree_util.Partial`` (``fn`` itself if it is one), a valid jit argument."""
+    return fn if isinstance(fn, jax.tree_util.Partial) else jax.tree_util.Partial(fn)
 
 
 def stepping_out_carry(rng_key, in_slice, width, max_expansions):
@@ -785,11 +797,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         # a NaN ln L (an overflow in the forward model) would make logZ_live NaN, and the
         # termination test then passes at iteration 0 with no likelihood call: treat it as -inf,
         # a point outside the support (finite values pass through unchanged)
-        _loglike_raw = loglike_fn
-
-        def loglike_fn(theta):
-            lnl = _loglike_raw(theta)
-            return jnp.where(jnp.isnan(lnl), -jnp.inf, lnl)
+        loglike_fn = jax.tree_util.Partial(_finite_loglike, _as_partial(loglike_fn))
 
         n_dims          = self._n_dims(theta_init)
         num_inner_steps = (self._num_inner_steps
@@ -813,10 +821,22 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
         if _resume is None:
             rng_key, prior_key = jax.random.split(rng_key)
 
-        nested_sampler = self._build_nested_sampler(
-            loglike_fn, logprior_fn, num_inner_steps, num_delete)
-        init_fn = jax.jit(nested_sampler.init)
-        step_fn = jax.jit(nested_sampler.step)
+        # the two callables enter init and step as arguments: the arrays they hold (the
+        # leaves of run_sampler's jax.tree_util.Partial) are inputs of the programs, not
+        # constants, so the next fit of the same shapes loads both programs from the cache
+        fns = (loglike_fn, _as_partial(logprior_fn))
+
+        def init_fn(fns, position):
+            return self._build_nested_sampler(
+                *fns, num_inner_steps, num_delete).init(position)
+
+        def kernel(fns, rng_key, state):
+            return self._build_nested_sampler(
+                *fns, num_inner_steps, num_delete).step(rng_key, state)
+
+        kernel = jax.jit(kernel)
+        init_fn = functools.partial(jax.jit(init_fn), fns)
+        step_fn = functools.partial(kernel, fns)
 
         if self.verbose:
             print("  [timing] Calling init_fn (JIT compile + eval) and "
@@ -831,7 +851,7 @@ class BlackJAXNestedSamplerAdapter(SamplerAdapter):
                 init_fn, jax.eval_shape(self._sample_prior, theta_init, prior_key))
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 step_compiled = pool.submit(
-                    lambda: step_fn.lower(rng_key, live_shape).compile())
+                    lambda: kernel.lower(fns, rng_key, live_shape).compile())
                 live = init_fn(self._sample_prior(theta_init, prior_key))
                 step_compiled.result()
         else:

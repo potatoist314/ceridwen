@@ -153,13 +153,20 @@ class AlfCNResponse:
                 continue
             projected, minimum = self.projected_templates(obs, model.zred, self.sigma_catalog)
             self.tables[obs.name] = self._covered(
-                projected, np.asarray(obs.wavelength) / (1. + model.zred))
+                projected, np.asarray(obs.wavelength) / (1. + model.zred), trim=False)
             self.minimum_total_sigma[obs.name] = minimum
 
-    def _covered(self, templates, wave):
-        """Table and wavelengths inside alf's coverage, and the pixels on each side."""
+    def _covered(self, templates, wave, trim=True):
+        """Table and wavelengths inside alf's coverage, and the pixels on each side.  With
+        ``trim=False``: on every pixel, so that spectra of one pixel count give one shape;
+        the differential templates are zero outside the coverage, where the ratio is 1."""
         inside = np.flatnonzero((wave >= self.wave[0]) & (wave <= self.wave[-1]))
         low, high = inside[0], inside[-1] + 1
+        if not trim:
+            templates = templates.copy()
+            templates[1:, ..., :low] = 0.
+            templates[1:, ..., high:] = 0.
+            low, high = 0, wave.size
         return (self._table(templates[..., low:high]), jnp.asarray(wave[low:high]),
                 (low, wave.size - high))
 

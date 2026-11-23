@@ -199,8 +199,20 @@ def _per_pixel(fn):
 
 
 def _sel(x, support):
-    """``x[..., support]`` (a static slice of the wavelength axis), or ``x`` itself for None."""
-    return x if support is None else x[..., support]
+    """``x[..., support]`` (a static slice of the wavelength axis), or ``x`` itself for None.
+    A constant ``x`` is sliced now, so the slice start is no literal in the program."""
+    if support is None:
+        return x
+    with jax.ensure_compile_time_eval():
+        return x[..., support]
+
+
+def _bucketed(support, n):
+    """``support`` widened to the next of 16 log-spaced widths per octave, within ``n`` model
+    pixels, so that observations of similar extent give arrays of one shape."""
+    width = min(int(np.ceil(2 ** (np.ceil(16 * np.log2(support.stop - support.start)) / 16))), n)
+    start = min(support.start, n - width)
+    return slice(start, start + width)
 
 
 def spectrum_model_name(csp, default=None):
@@ -1535,6 +1547,7 @@ class CSPBasis:
         if support is None:
             cont, lines = self._assemble_components(theta, paint_lines)
         else:
+            support = _bucketed(support, int(self.wave.shape[0]))
             self._warn_unknown_theta_keys(theta)
             cont = self.get_spectrum(theta=theta, include_lines=False, support=support)
             lines = None
@@ -1557,11 +1570,16 @@ class CSPBasis:
             cont, lines_s = cont0, lines0
         if support is not None:
             # zeros on the pixels no observation reads, only after every scaling (XLA CPU
-            # returns zeros for a pad inside that fusion)
-            width = (support.start, self.wave.shape[0] - support.stop)
-            cont, cont0 = jnp.pad(cont, width), jnp.pad(cont0, width)
+            # returns zeros for a pad inside that fusion); the start is array data, not a
+            # literal in the program
+            start = jnp.asarray(np.array([support.start]))[0]
+
+            def place(x):
+                return jax.lax.dynamic_update_slice(
+                    jnp.zeros(self.wave.shape[0], x.dtype), x, (start,))
+            cont, cont0 = place(cont), place(cont0)
             if agn_corr is not None:
-                agn_corr = jnp.pad(agn_corr, width)
+                agn_corr = place(agn_corr)
         return self._project_observations(
             cont if lines is None else cont + lines_s, cont,
             observations, theta, paint_lines=paint_lines,

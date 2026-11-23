@@ -175,7 +175,11 @@ class ChainProjector:
         _trim    = ((wm >= float(wo.min()) - _buf) &
                     (wm <= float(wo.max()) + _buf))
         _wm_trim = wm[_trim]
-        _idx = jnp.array(np.where(_trim)[0])
+        # Rows padded, by repeating the last, to the power of two of the FFT
+        # grids, so that every galaxy gives arrays of one shape.
+        _rows = np.flatnonzero(_trim)
+        _n_pad = int(2 ** np.ceil(np.log2(_rows.size))) - _rows.size
+        _idx = jnp.array(np.pad(_rows, (0, _n_pad), mode="edge"))
         self.model_support = (int(_idx.min()), int(_idx.max()) + 1)
 
         # ── Optional LOSVD pre-smoothing stage (sampled sigma_gal) ──────
@@ -184,7 +188,8 @@ class ChainProjector:
             # Output stays on the trimmed model grid when an instrumental
             # stage follows, else goes straight to the observed pixels.
             _losvd_sm = make_vel_smoother(
-                _wm_trim, _wm_trim if has_instr else wo, inres=0.0, **_pad)
+                _wm_trim, np.pad(_wm_trim, (0, _n_pad), mode="edge") if has_instr else wo,
+                inres=0.0, **_pad)
 
             def _apply_losvd_rt(spec_trim, sigma_v, _s=_losvd_sm):
                 return _s(spec_trim, sigma_v)

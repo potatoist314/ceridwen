@@ -180,6 +180,8 @@ class EmissionLineColumns:
         moves a line off the unmasked pixels (zero column).
     pixels : slice, optional
         :meth:`columns` returns these pixel rows only (:meth:`on_pixels`).
+    real : ndarray of bool, shape (n_line,), optional
+        False for the padding fluxes of :meth:`padded`.
     """
 
     wave_obs: np.ndarray
@@ -197,6 +199,7 @@ class EmissionLineColumns:
     photometry_key: Optional[str] = None
     sigma_max_kms: Optional[float] = None
     pixels: Optional[slice] = None
+    real: Optional[np.ndarray] = None
 
     @classmethod
     def from_spectrum(
@@ -325,6 +328,24 @@ class EmissionLineColumns:
         tie = np.eye(self.wave_rest.size) if self.tie is None else self.tie
         return replace(self, band_matrix=band @ tie, photometry_key=key)
 
+    def padded(self, size: int = 8) -> "EmissionLineColumns":
+        """The same lines, with padding fluxes up to a multiple of ``size`` free fluxes and
+        ``pairs`` as an array of half that many slots, empty ones ``(0, 0)``: line sets of
+        up to ``size`` fluxes then give arrays of one shape.  A padding flux has a zero
+        column (:meth:`columns`) and band entry and ridge 1, so it adds exactly 0 to ln L
+        (:attr:`real`)."""
+        from scipy.linalg import block_diag
+        n = self.n_line
+        pad = -n % size
+        tie = np.eye(self.wave_rest.size) if self.tie is None else self.tie
+        band = self.band_matrix
+        return replace(
+            self, wave_rest=np.pad(self.wave_rest, (0, pad), mode="edge"),
+            tie=block_diag(tie, np.eye(pad)), ridge=np.pad(self.ridge, (0, pad), constant_values=1.0),
+            band_matrix=None if band is None else np.pad(band, ((0, 0), (0, pad))),
+            pairs=np.array(list(self.pairs) + [(0, 0)] * ((n + pad) // 2 - len(self.pairs))),
+            real=np.arange(n + pad) < n)
+
     def on_pixels(self, pixels: slice) -> "EmissionLineColumns":
         """The same lines; :meth:`columns` returns the pixel rows ``pixels`` only."""
         return replace(self, pixels=pixels)
@@ -354,9 +375,12 @@ class EmissionLineColumns:
             if key is None:
                 return jnp.asarray(fixed)
             return jnp.ravel(jnp.asarray(params[key]))[0]
-        opz = 1.0 + value(self.zred_key, self.zred)
         s_gas = value(self.sigma_key, self.sigma_gas_kms)
-        centre = jnp.asarray(self.wave_rest) * opz
+        # A fixed redshift enters as array data, not as a literal in the program.
+        if self.zred_key is None:
+            centre = jnp.asarray(self.wave_rest * (1.0 + self.zred))
+        else:
+            centre = jnp.asarray(self.wave_rest) * (1.0 + value(self.zred_key, self.zred))
         # jnp.interp lowers to a sequential binary search (13 steps on 6166 pixels) in every call.
         if self.zred_key is None:  # constant centres, as in _window
             s_inst = jnp.asarray(np.interp(self.wave_rest * (1.0 + self.zred), self.wave_obs,
@@ -389,6 +413,8 @@ class EmissionLineColumns:
             r = np.flatnonzero(self.tie[:, c])
             free = jnp.where(np.arange(free.shape[1]) == c,
                              (profiles[:, r] @ jnp.asarray(self.tie[r, c]))[:, None], free)
+        if self.real is not None:
+            free = jnp.where(self.real, free, 0.0)
         # Without the barrier, XLA fuses the doublet's dot into its consumers
         # and can contract it to an FMA, which rounds differently.
         return jax.lax.optimization_barrier(free)

@@ -405,7 +405,7 @@ class PolynomialCalibration:
         return solution[k:], s[:, None] * (g.T @ g) * s[None, :]
 
     def calibrate_with_lines(self, y, mu, sigma, mask, lines, pairs=(), ridge=None,
-                             photometry=None) -> tuple[Array, Array, Array, Array]:
+                             photometry=None, real=None) -> tuple[Array, Array, Array, Array]:
         """
         :meth:`calibrate` with emission lines added after the polynomial.
 
@@ -423,7 +423,9 @@ class PolynomialCalibration:
         precision to each line flux (:class:`EmissionLineColumns`).
         ``photometry = (B, y_p, mu_p, sigma_p, mask_p)`` adds bands that see
         the same fluxes, ``y_p ~= mu_p + B @ f``; the caller then adds the
-        bands' Gaussian kernel at ``mu_p + B @ fluxes``.
+        bands' Gaussian kernel at ``mu_p + B @ fluxes``.  ``real`` (n_line,)
+        is False for padding lines (:meth:`EmissionLineColumns.padded`),
+        which add nothing.
 
         Returns
         -------
@@ -447,8 +449,9 @@ class PolynomialCalibration:
         ln_extra = self._marginal_terms(coeffs, log_det_normal)
         if self.marginalize:
             mean, cov = self._line_posterior(factor, scale, solution)
-            ln_extra = (ln_extra + 0.5 * lines.shape[1] * _LOG_2PI
-                        + log_positive_probability(mean, cov, pairs))
+            n_line = lines.shape[1] if real is None else jnp.sum(real)
+            ln_extra = (ln_extra + 0.5 * n_line * _LOG_2PI
+                        + log_positive_probability(mean, cov, pairs, real))
         return (self.polynomial(coeffs) * mu + lines @ fluxes, coeffs, fluxes,
                 ln_extra)
 
@@ -588,19 +591,25 @@ def _bvn_upper(h, k, r):
     return jnp.clip(jnp.where(jnp.abs(r) < 0.925, small, big), 0.0, 1.0)
 
 
-def log_positive_probability(mean, cov, pairs=()) -> Array:
+def log_positive_probability(mean, cov, pairs=(), real=None) -> Array:
     """``ln P(f >= 0)`` for ``f ~ N(mean, cov)``: independent lines, times the
     exact bivariate probability of each blended pair in ``pairs``.  Where a
     pair's probability is below 1e-10 (beyond the absolute accuracy of the
-    bivariate formula) the pair keeps the product of its two ``Phi``."""
+    bivariate formula) the pair keeps the product of its two ``Phi``.  Lines
+    where ``real`` is False and pairs ``(i, i)`` add nothing (padding)."""
     sd = jnp.sqrt(jnp.diagonal(cov))
     z = mean / sd
     single = jax.scipy.special.log_ndtr(z)
+    if real is not None:
+        single = jnp.where(real, single, 0.0)
     total = jnp.sum(single)
-    for i, j in pairs:
-        p = _bvn_upper(-z[i], -z[j], cov[i, j] / (sd[i] * sd[j]))
+    if len(pairs):
+        # Indices as array data: every pair is evaluated by one program.
+        i, j = np.asarray(pairs).T
+        p = jax.vmap(_bvn_upper)(-z[i], -z[j], cov[i, j] / (sd[i] * sd[j]))
         product = single[i] + single[j]
-        total = total + jnp.where(p > 1e-10, jnp.log(jnp.maximum(p, 1e-300)), product) - product
+        total = total + jnp.sum(jnp.where((i != j) & (p > 1e-10),
+                                          jnp.log(jnp.maximum(p, 1e-300)) - product, 0.0))
     return total
 
 

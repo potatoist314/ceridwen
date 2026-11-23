@@ -170,21 +170,29 @@ def single_observation_data(observations, what: str, upper_limits: bool = False)
     return y, sigma, mask, calib, ul
 
 
-def on_fitted_pixels(likelihood, data):
+def on_fitted_pixels(likelihood, data, bucket: Optional[int] = None):
     """``(likelihood, data, pixels)`` with each spectrum that has an analytic calibration cut to
     the pixels from its first to its last unmasked one: ``pixels[key]`` is that slice
     (``slice(None)`` for the other observations), and the likelihood then takes
     ``mu[key][pixels[key]]``.  The pixels cut away carry no term of ln L; only the order of
-    its sums changes."""
+    its sums changes.  With ``bucket`` the cut is widened to a multiple of ``bucket`` pixels
+    (moved back from the end of the spectrum where it must) and the emission lines are padded
+    (:meth:`EmissionLineColumns.padded`), so that similar spectra give arrays of one shape."""
     pixels, cut, likelihoods = {}, {}, []
     for key, lhood in zip(likelihood.keys, likelihood.likelihoods):
         pixels[key], cut[key] = slice(None), data[key]
         if (type(lhood) is DiagonalGaussianLikelihood and lhood.calibration is not None
                 and lhood.poly_calibration is None):
             used = np.flatnonzero(np.asarray(data[key][2]))
-            keep = pixels[key] = slice(int(used[0]), int(used[-1]) + 1)
+            start, width = int(used[0]), int(used[-1]) + 1 - int(used[0])
+            if bucket is not None:
+                width = -(-width // bucket) * bucket
+                start = min(start, len(data[key][2]) - width)
+            keep = pixels[key] = slice(start, start + width)
             cut[key] = tuple(v if v is None or jnp.ndim(v) == 0 else v[keep] for v in data[key])
             lines = lhood.emission_lines
+            if lines is not None and bucket is not None:
+                lines = lines.padded()
             lhood = replace(lhood, calibration=lhood.calibration.on_pixels(keep),
                             emission_lines=None if lines is None else lines.on_pixels(keep))
         likelihoods.append(lhood)
@@ -466,7 +474,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
                 mu, _, _, ln_extra = self.calibration.calibrate_with_lines(
                     y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
                     self.emission_lines.columns(params), self.emission_lines.pairs,
-                    self.emission_lines.ridge
+                    self.emission_lines.ridge, real=self.emission_lines.real
                 )
             else:
                 mu, _, ln_extra = self.calibration.calibrate(
@@ -504,6 +512,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
             self.emission_lines.columns(params), self.emission_lines.pairs,
             self.emission_lines.ridge,
             (band, y_p, mu_p, jnp.sqrt(1.0 / noise_p.inv_var), mask_p),
+            self.emission_lines.real,
         )
         lnl, _ = lnlike_diag_gaussian(y, mu_cal, noise_out.inv_var, noise_out.log_det, mask)
         lnl_p, _ = lnlike_diag_gaussian(y_p, mu_p + band @ fluxes, noise_p.inv_var,
@@ -576,7 +585,7 @@ class DiagonalGaussianLikelihood(LikelihoodBase):
                 mu, _, _, ln_extra = calibration.calibrate_with_lines(
                     y, mu, jnp.sqrt(1.0 / noise_out.inv_var), mask,
                     emission_lines.columns(theta), emission_lines.pairs,
-                    emission_lines.ridge
+                    emission_lines.ridge, real=emission_lines.real
                 )
                 lnl = lnl + ln_extra
             elif calibration is not None:

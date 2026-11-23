@@ -10,6 +10,8 @@ from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+from jax._src.interpreters import partial_eval as pe
+import numpy as np
 
 Array = jax.Array
 
@@ -164,32 +166,66 @@ def run_sampler(
     if getattr(model, "_eline_system", None) is not None:
         from ..likelihood.eline_marginal import joint_loglike
 
-        @jax.jit
         def loglike_fn(theta: dict[str, Array]) -> Array:
             return joint_loglike(model, _keys, _likelihoods, _static_data, theta)
 
-        @jax.jit
         def logprior_fn(theta: dict[str, Array]) -> Array:
             return model.ln_prior(theta)
 
-        return adapter.run(loglike_fn, logprior_fn, theta_init, rng_key)
+        return adapter.run(_data_as_arguments(loglike_fn, theta_init),
+                           _data_as_arguments(logprior_fn, theta_init), theta_init, rng_key)
 
-    _fitted, _fitted_data, _pixels = on_fitted_pixels(likelihood, _static_data)
+    _fitted, _fitted_data, _pixels = on_fitted_pixels(likelihood, _static_data, bucket=256)
 
-    @jax.jit
+    def on_pixels(x, pixels):
+        if pixels == slice(None):
+            return x
+        # the start is array data, not a literal in the program
+        return jax.lax.dynamic_slice_in_dim(x, jnp.asarray(np.array([pixels.start]))[0],
+                                            pixels.stop - pixels.start, axis=-1)
+
     def loglike_fn(theta: dict[str, Array]) -> Array:
         mu = model.predict(theta)
-        return _fitted.loglike(_fitted_data, {key: mu[key][_pixels[key]] for key in _keys},
+        return _fitted.loglike(_fitted_data, {key: on_pixels(mu[key], _pixels[key]) for key in _keys},
                                theta, _rescalings)
 
-    @jax.jit
     def logprior_fn(theta: dict[str, Array]) -> Array:
         return model.ln_prior(theta)
 
-    result = adapter.run(loglike_fn, logprior_fn, theta_init, rng_key)
+    result = adapter.run(_data_as_arguments(loglike_fn, theta_init),
+                         _data_as_arguments(logprior_fn, theta_init), theta_init, rng_key)
     if _offset != 0.0:
         result = _with_loglike_offset(result, _offset)
     return result
+
+
+def _data_as_arguments(fn: Callable, theta: dict[str, Array]) -> jax.tree_util.Partial:
+    """JIT ``fn`` as a ``jax.tree_util.Partial`` whose leaves are the arrays ``fn`` closes over
+    (on the device, put there once).  A jitted function that takes it as an argument gets the
+    data as inputs, not as constants of its program: fits of the same array shapes compile the
+    same program, and a later fit loads it from JAX's persistent compile cache.
+
+    The part of ``fn`` that does not depend on ``theta`` is evaluated once, in a program with
+    the arrays as constants, so XLA folds it exactly as it folds it in ``jax.jit(fn)``."""
+    closed = jax.make_jaxpr(fn)(theta)
+    known, unknown, _, _ = pe.partial_eval_jaxpr_nounits(closed, [True] * len(closed.in_avals), True)
+    consts = dict(zip(map(id, known.jaxpr.constvars), known.consts))
+
+    @jax.jit
+    def constants():
+        values = jax.core.eval_jaxpr(known.jaxpr, known.consts)
+        return [x for v, x in zip(known.jaxpr.outvars, values) if id(v) not in consts]
+
+    computed = iter(constants())
+    data = [jnp.asarray(consts[id(v)]) if id(v) in consts else next(computed)
+            for v in known.jaxpr.outvars]
+
+    @jax.jit
+    def evaluate(data, theta):
+        return jax.core.eval_jaxpr(unknown.jaxpr, unknown.consts, *data,
+                                   *jax.tree_util.tree_leaves(theta))[0]
+
+    return jax.tree_util.Partial(evaluate, data)
 
 
 def _with_loglike_offset(result: SamplingResult, offset: float) -> SamplingResult:
