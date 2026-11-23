@@ -261,10 +261,15 @@ def _write_cache(entries: dict) -> None:
         pass
 
 
+# this process's chashes by _cache_key: the file cache cannot be written on a read-only grid volume
+_process_chash: dict = {}
+
+
 def cached_chash(path, extras: tuple = ()) -> Optional[str]:
     """chash of ``path`` from the (path, size, mtime, hashed datasets) cache, or None."""
     try:
-        return _read_cache().get(_cache_key(Path(path), tuple(extras)))
+        key = _cache_key(Path(path), tuple(extras))
+        return _process_chash.get(key) or _read_cache().get(key)
     except OSError:
         return None
 
@@ -272,7 +277,9 @@ def cached_chash(path, extras: tuple = ()) -> Optional[str]:
 def remember_chash(path, chash: str, extras: tuple = ()) -> None:
     """Store ``chash`` for ``path`` at its current (size, mtime) and dataset set."""
     try:
-        _write_cache({_cache_key(Path(path), tuple(extras)): chash})
+        key = _cache_key(Path(path), tuple(extras))
+        _process_chash[key] = chash
+        _write_cache({key: chash})
     except OSError:
         pass
 
