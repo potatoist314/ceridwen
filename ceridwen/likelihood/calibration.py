@@ -439,16 +439,24 @@ class PolynomialCalibration:
             ``ln P(f >= 0)``.
         """
         mu = jnp.asarray(mu)
-        factor, scale, solution = self._joint_factor(y, mu, sigma, mask, lines, ridge,
-                                                     photometry)
-        coeffs, fluxes = solution[:self.n_coeff], solution[self.n_coeff:]
+        k = self.n_coeff
+        normal, rhs = self._joint_system(y, mu, sigma, mask, lines, ridge, photometry)
+        scale = 1.0 / jnp.sqrt(jnp.diagonal(normal))
+        factor = jnp.linalg.cholesky(scale[:, None] * normal * scale[None, :])
+        # One triangular solve for L^{-1} gives the solution and the line covariance.
+        inverse = jsl.solve_triangular(factor, jnp.eye(rhs.shape[0]), lower=True)
+        solution = scale * (inverse.T @ (inverse @ (scale * rhs)))
+        coeffs, fluxes = solution[:k], solution[k:]
         log_det_normal = (2.0 * jnp.sum(jnp.log(jnp.diagonal(factor)))
                           - 2.0 * jnp.sum(jnp.log(scale)))
         ln_extra = self._marginal_terms(coeffs, log_det_normal)
         if self.marginalize:
-            mean, cov = self._line_posterior(factor, scale, solution)
+            # inverse[k:, k:] is the inverse of factor[k:, k:] (_line_posterior).
+            g = inverse[k:, k:]
+            s = scale[k:]
+            cov = s[:, None] * (g.T @ g) * s[None, :]
             ln_extra = (ln_extra + 0.5 * lines.shape[1] * _LOG_2PI
-                        + log_positive_probability(mean, cov, pairs))
+                        + log_positive_probability(fluxes, cov, pairs))
         return (self.polynomial(coeffs) * mu + lines @ fluxes, coeffs, fluxes,
                 ln_extra)
 

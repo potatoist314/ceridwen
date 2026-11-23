@@ -130,6 +130,30 @@ def test_line_posterior_equals_the_full_triangular_solve_bitwise():
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
 
 
+@pytest.mark.parametrize("with_photometry", [False, True])
+def test_calibrate_with_lines_equals_the_three_solve_reference(with_photometry):
+    """The one-solve L^{-1} path equals _joint_factor + _line_posterior to rounding."""
+    mu, y, sigma, mask, L = _mock(np.array([0.0, 2e-17, -1e-17]), seed=6, snr=15.0)
+    L = jnp.asarray(L[:, 1:])
+    mu_p = np.array([2e-7, 3e-7])
+    phot = ((np.array([[4e10, 1e10], [1e10, 3e10]]), mu_p + np.array([1e-9, -2e-9]),
+             mu_p, 0.05 * mu_p, np.ones(2, dtype=bool)) if with_photometry else None)
+    pairs = ((0, 1),)
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True,
+                                                prior_sigma=[0.3, 0.1, 0.1, 0.1])
+    got = cal.calibrate_with_lines(y, mu, sigma, mask, L, pairs, photometry=phot)
+    factor, scale, solution = cal._joint_factor(y, mu, sigma, mask, L, None, phot)
+    mean, cov = cal._line_posterior(factor, scale, solution)
+    coeffs = solution[:cal.n_coeff]
+    log_det = 2.0 * jnp.sum(jnp.log(jnp.diagonal(factor))) - 2.0 * jnp.sum(jnp.log(scale))
+    ln_extra = (cal._marginal_terms(coeffs, log_det) + 0.5 * L.shape[1] * np.log(2 * np.pi)
+                + log_positive_probability(mean, cov, pairs))
+    want = (cal.polynomial(coeffs) * mu + L @ mean, coeffs, mean, ln_extra)
+    assert cal.marginalize
+    for g, w in zip(got, want):
+        np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=1e-9, atol=0)
+
+
 @pytest.mark.parametrize("flux", [3e-17, 2e-18, -1e-17])
 def test_joint_marginal_matches_quadrature_over_one_line_flux(flux):
     """ln of the integral over f >= 0 of the polynomial marginal of y - f L."""
