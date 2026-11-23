@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+import scipy.fft
 from sedpy_jax.smoothing import _lin_grid, _log_grid, _lsf_grid, _lsf_subtract_inres
 
 # Speed of light [km/s] of the chain projector (``observation/base.py`` of the
@@ -210,7 +211,7 @@ def _padded_length(n, sigma_pix):
 
 
 def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64,
-                       sigma_max=None):
+                       sigma_max=None, window=None):
     """Return ``smoother(spec, sigma)``: resample -> padded Gaussian FFT -> resample.
 
     Matches ``jax_interp -> smooth_fft_padded -> jax_interp`` of sedpy_jax.
@@ -218,20 +219,43 @@ def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64,
     bakes the taper and shortens the zero pad to what that width needs; a
     traced ``sigma`` keeps the ``2n`` pad unless ``sigma_max``, an upper
     bound on every traced ``sigma``, gives the pad that bound needs.
+
+    ``window`` (a slice of ``outwave``; needs ``sigma_max``, the bound on every
+    ``sigma`` passed): ``smoother(spec[smoother.reads], sigma)`` is the unwindowed
+    ``smoother(spec, sigma)[window]``.  It transforms only the grid nodes within
+    20 ``sigma_max`` of the window (same nodes and ``dx``), zero-padded by those
+    20 ``sigma_max`` only where they meet a grid end (elsewhere the wrap lands
+    on the 20 sigma of real nodes), at a 5-smooth length that is a multiple of 4.
     """
     n = len(grid)
     dx = float(dx)
-    to_grid = _bake_interp(grid, wave, dtype)
-    to_out = _bake_interp(outwave, grid, dtype)
-    m_traced = 2 * n if sigma_max is None else _padded_length(
-        n, np.sqrt(max(float(sigma_max) ** 2 - float(inres) ** 2, 0.0)) / dx)
+    reads = slice(None)
+    if window is None:
+        to_grid = _bake_interp(grid, wave, dtype)
+        to_out = _bake_interp(outwave, grid, dtype)
+        m_traced = 2 * n if sigma_max is None else _padded_length(
+            n, np.sqrt(max(float(sigma_max) ** 2 - float(inres) ** 2, 0.0)) / dx)
+    else:
+        grid, wave = np.asarray(grid, dtype=np.float64), np.asarray(wave, dtype=np.float64)
+        outwave = np.asarray(outwave, dtype=np.float64)[window]
+        node = np.clip(np.searchsorted(grid, outwave, side="left") - 1, 0, n - 2)
+        pad = int(np.ceil(
+            20.0 * np.sqrt(max(float(sigma_max) ** 2 - float(inres) ** 2, 0.0)) / dx))
+        lo, hi = max(int(node.min()) - pad, 0), min(int(node.max()) + 2 + pad, n)
+        src = np.clip(np.searchsorted(wave, grid[lo:hi], side="left") - 1, 0, len(wave) - 2)
+        reads = slice(int(src.min()), int(src.max()) + 2)
+        to_grid = _bake_interp(grid[lo:hi], wave[reads], dtype)
+        to_out = _bake_interp(outwave, grid[lo:hi], dtype)
+        n_fft = hi - lo + (pad if lo == 0 or hi == n else 0)
+        m_traced = 4 * scipy.fft.next_fast_len(-(-n_fft // 4), real=True)
+        n = hi - lo
     exponent = jnp.asarray(
         -2.0 * np.pi**2 * np.fft.rfftfreq(m_traced, d=dx) ** 2).astype(dtype)
 
     def smoother(spec, sigma):
         if isinstance(sigma, (int, float, np.floating)):
             sigma_eff = np.sqrt(max(float(sigma) ** 2 - float(inres) ** 2, 0.0))
-            m = _padded_length(n, sigma_eff / dx)
+            m = m_traced if window is not None else _padded_length(n, sigma_eff / dx)
             nu = np.fft.rfftfreq(m, d=dx)
             taper = jnp.asarray(
                 np.exp(-2.0 * np.pi**2 * sigma_eff**2 * nu**2)).astype(dtype)
@@ -242,27 +266,38 @@ def _bake_fft_smoother(wave, grid, dx, outwave, inres, dtype=jnp.float64,
         return to_out(jnp.fft.irfft(jnp.fft.rfft(padded) * taper, n=m)[:n])
 
     smoother.traced_fft_length = m_traced
+    smoother.grid_nodes = n
+    smoother.reads = reads
     return smoother
 
 
-def make_vel_smoother(wave, outwave, inres=0.0, sigma_max=None):
-    """Baked ``sedpy_jax.smoothing.make_vel_smoother``: ``smoother(spec, sigma_v)``."""
+def make_vel_smoother(wave, outwave, inres=0.0, sigma_max=None, window=None):
+    """Baked ``sedpy_jax.smoothing.make_vel_smoother``: ``smoother(spec, sigma_v)``.
+    ``window`` / ``sigma_max``: see ``_bake_fft_smoother``."""
     grid, dv = _log_grid(np.asarray(wave))
-    return _bake_fft_smoother(wave, grid, dv, outwave, inres, sigma_max=sigma_max)
+    return _bake_fft_smoother(wave, grid, dv, outwave, inres, sigma_max=sigma_max,
+                              window=window)
 
 
-def make_wave_smoother(wave, outwave, inres=0.0):
-    """Baked ``sedpy_jax.smoothing.make_wave_smoother``: ``smoother(spec, sigma_l)``."""
+def make_wave_smoother(wave, outwave, inres=0.0, sigma_max=None, window=None):
+    """Baked ``sedpy_jax.smoothing.make_wave_smoother``: ``smoother(spec, sigma_l)``.
+    ``window`` / ``sigma_max``: see ``_bake_fft_smoother``."""
     grid, dw = _lin_grid(np.asarray(wave))
-    return _bake_fft_smoother(wave, grid, dw, outwave, inres)
+    return _bake_fft_smoother(wave, grid, dw, outwave, inres, sigma_max=sigma_max,
+                              window=window)
 
 
-def make_lsf_smoother(wave, sigma_lsf, outwave, pix_per_sigma=2, inres=0.0):
-    """Baked ``sedpy_jax.smoothing.make_lsf_smoother``: ``smoother(spec)``."""
+def make_lsf_smoother(wave, sigma_lsf, outwave, pix_per_sigma=2, inres=0.0, window=None):
+    """Baked ``sedpy_jax.smoothing.make_lsf_smoother``: ``smoother(spec)``.
+    ``window``: see ``_bake_fft_smoother`` (the bound is the kernel width ``x_per_sigma``)."""
     sigma_eff = _lsf_subtract_inres(np.asarray(wave), np.asarray(sigma_lsf), inres)
     lam, dx, x_per_sigma = _lsf_grid(np.asarray(wave), sigma_eff, pix_per_sigma)
-    smoother = _bake_fft_smoother(wave, lam, dx, outwave, 0.0)
-    return lambda spec: smoother(spec, x_per_sigma)
+    smoother = _bake_fft_smoother(wave, lam, dx, outwave, 0.0, sigma_max=x_per_sigma,
+                                  window=window)
+    lsf = lambda spec: smoother(spec, x_per_sigma)  # noqa: E731
+    lsf.grid_nodes, lsf.traced_fft_length, lsf.reads = (
+        smoother.grid_nodes, smoother.traced_fft_length, smoother.reads)
+    return lsf
 
 
 def make_static_grid_interp(xp):

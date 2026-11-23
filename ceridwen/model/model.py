@@ -884,14 +884,15 @@ class SedModel:
         return model_theta
 
 
-    def predict(self, theta: dict[str, Array]) -> dict[str, Array]:
+    def predict(self, theta: dict[str, Array], pixels=None) -> dict[str, Array]:
         """Predictions keyed by observation name from the free-parameter dict.
         A fixed zred/lumdist_mpc is injected into the CSP theta here; without a
-        'zred' the CSP applies no flux factor and the outputs are not maggies."""
+        'zred' the CSP applies no flux factor and the outputs are not maggies.
+        ``pixels`` (``{obs.name: slice}``): those predictions on that slice alone."""
         model_theta = self._with_fixed_distance(self.apply_transforms(theta))
         return self.csp.predict(model_theta, self.observations,
                                 kinematics=self.kinematics,
-                                broaden_photometry=self.broaden_photometry)
+                                broaden_photometry=self.broaden_photometry, pixels=pixels)
 
     def _with_fixed_distance(self, model_theta):
         """``model_theta`` plus the fixed zred / lumdist_mpc and, when both are the fixed

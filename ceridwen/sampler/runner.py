@@ -178,8 +178,8 @@ def run_sampler(
 
     @jax.jit
     def loglike_fn(theta: dict[str, Array]) -> Array:
-        mu = model.predict(theta)
-        return _fitted.loglike(_fitted_data, {key: mu[key][_pixels[key]] for key in _keys},
+        mu = model.predict(theta, pixels=_pixels)
+        return _fitted.loglike(_fitted_data, {key: mu[key] for key in _keys},
                                theta, _rescalings)
 
     @jax.jit

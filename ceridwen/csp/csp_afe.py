@@ -662,7 +662,8 @@ class CSPBasis_afe(CSPBasis):
             for obs in observations:
                 if getattr(obs, '_kind', None) == 'spectrum':
                     original = predictions[obs.name]
-                    factor = response.factor(self, theta, obs.name).astype(original.dtype)
+                    factor = response.factor(self, theta, obs.name)[
+                        (kw.get('pixels') or {}).get(obs.name, slice(None))].astype(original.dtype)
                     predictions[obs.name] = jnp.where(zero, original, original * factor)
         return result
 

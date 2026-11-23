@@ -15,6 +15,7 @@ grids, so the model spectrum here is synthetic.
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -23,7 +24,10 @@ jax.config.update("jax_enable_x64", True)
 from ceridwen.observation.spectrum import Spectrum
 from ceridwen.observation._smoothing import (
     combined_sigma_lambda,
+    make_lsf_smoother,
     make_static_smoother,
+    make_vel_smoother,
+    make_wave_smoother,
 )
 from ceridwen.observation._smoothing import _CKMS
 from ceridwen.broadening import Instrument, Kinematics
@@ -230,3 +234,57 @@ def test_losvd_only_spectrum_still_smooths():
     line = _gaussian_line(wm, 7200.0, 40.0)
     got = _measured_sigma_kms(wo, np.asarray(spec.predict(line, wm)), 7200.0, expected)
     assert got == pytest.approx(expected, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Windowed smoothing: the sampler's ln L computes only the fitted pixels
+# ---------------------------------------------------------------------------
+
+WINDOWS = [slice(1500, 3200), slice(0, 400), slice(5600, 6000)]  # interior; clipped at each end
+WINDOW_RTOL = 1e-12   # max |windowed - full[window]| / max |full[window]|
+
+
+def _continuum(wm):
+    rng = np.random.default_rng(1)
+    return 1.0 + 0.3 * np.sin(wm / 37.0) + rng.normal(0.0, 0.05, wm.size)
+
+
+def _assert_window_equal(got, full, window):
+    want = np.asarray(full)[window]
+    assert np.max(np.abs(np.asarray(got) - want)) <= WINDOW_RTOL * np.max(np.abs(want))
+
+
+@pytest.mark.parametrize("window", WINDOWS)
+@pytest.mark.parametrize("kind", ["vel", "wave", "lsf"])
+def test_windowed_smoother_equals_the_full_one_on_the_window(kind, window):
+    """Same grid nodes, pad of 20 sigma_max: the window of the full result, static and traced."""
+    wm, wo = _model_grid(), _observed_grid()
+    x = _continuum(wm)
+    if kind == "lsf":
+        sigma_lsf = 0.8 + 0.2 * (wm - wm[0]) / (wm[-1] - wm[0])          # AA
+        full = make_lsf_smoother(wm, sigma_lsf, wo, inres=0.2)
+        win = make_lsf_smoother(wm, sigma_lsf, wo, inres=0.2, window=window)
+        _assert_window_equal(win(x[win.reads]), full(x), window)
+        return
+    make, kw, sigma = {"vel": (make_vel_smoother, {"inres": 20.0, "sigma_max": 500.0}, 300.0),
+                       "wave": (make_wave_smoother, {"inres": 0.3, "sigma_max": 4.0}, 2.5)}[kind]
+    full, win = make(wm, wo, **kw), make(wm, wo, window=window, **kw)
+    assert win.traced_fft_length < full.traced_fft_length
+    for s in (sigma, jnp.asarray(sigma)):
+        _assert_window_equal(win(x[win.reads], s), full(x, s), window)
+
+
+@pytest.mark.parametrize("window", WINDOWS)
+@pytest.mark.parametrize("instrument", [Instrument.R_fwhm(1000.0), None])
+@pytest.mark.parametrize("sigma_gal", ["sigma_smooth", SIGMA_LOSVD])
+def test_chain_predict_on_pixels_equals_the_full_predict_sliced(sigma_gal, instrument, window):
+    """The chain on a pixel slice (sampled LOSVD: each stage windowed) is the full one, sliced."""
+    wo, wm = _observed_grid(), _model_grid()
+    spec = Spectrum(wavelength=wo, flux=np.ones_like(wo), uncertainty=np.ones_like(wo),
+                    instrument=instrument, subtract_library=False, projector="chain", name="spec")
+    spec.setup_for_model(wm, zred=0.0, kinematics=Kinematics(sigma_gal=sigma_gal))
+    x = _continuum(wm)
+    for s in (150.0, 400.0):
+        theta = {"sigma_smooth": jnp.asarray(s)}
+        got = jax.jit(lambda m, t: spec.predict(m, wm, theta=t, pixels=window))(x, theta)
+        _assert_window_equal(got, spec.predict(x, wm, theta=theta), window)

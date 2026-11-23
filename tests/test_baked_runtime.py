@@ -73,7 +73,9 @@ def _sedpy_factories(monkeypatch):
     monkeypatch.setattr(_smoothing, "make_vel_smoother",
                         lambda wave, outwave, inres=0.0, sigma_max=None:
                         sedpy_smoothing.make_vel_smoother(wave, outwave, inres=inres))
-    monkeypatch.setattr(_smoothing, "make_wave_smoother", sedpy_smoothing.make_wave_smoother)
+    monkeypatch.setattr(_smoothing, "make_wave_smoother",
+                        lambda wave, outwave, inres=0.0, sigma_max=None:
+                        sedpy_smoothing.make_wave_smoother(wave, outwave, inres=inres))
     monkeypatch.setattr(_smoothing, "make_lsf_smoother", sedpy_smoothing.make_lsf_smoother)
 
 
