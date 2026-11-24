@@ -326,6 +326,24 @@ def test_loglike_on_the_fitted_pixels_equals_the_full_loglike(sigma_max_kms):
     np.testing.assert_allclose(part, full, rtol=1e-13, atol=0)
 
 
+def test_bucketed_cut_of_a_span_near_the_spectrum_length_is_the_whole_spectrum():
+    """Widened to a multiple of ``bucket`` beyond the spectrum, the cut stops at its ends."""
+    mu, y, sigma, mask, _ = _mock(np.zeros(3), snr=15.0)
+    mask = mask & (WAVE > 6100.0) & (WAVE < 8900.0)
+    cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True, prior_sigma=0.1, mask=mask)
+    joint = MultiObservationLikelihood(
+        keys=("spectrum",),
+        likelihoods=(DiagonalGaussianLikelihood(noise_model=DiagonalNoiseModel(use_fractional=True),
+                                                calibration=cal),))
+    data = {"spectrum": (y, sigma, mask, None, None)}
+    theta = {"log_f_calib": np.log(0.03)}
+    fitted, cut, pixels = on_fitted_pixels(joint, data, bucket=256)
+    assert pixels == {"spectrum": slice(0, len(WAVE))}
+    full = float(joint.loglike(data, {"spectrum": mu}, theta))
+    part = float(fitted.loglike(cut, {"spectrum": mu[pixels["spectrum"]]}, theta))
+    np.testing.assert_allclose(part, full, rtol=1e-13, atol=0)
+
+
 def test_loglike_without_shared_lines_is_the_per_observation_sum():
     mu, y, sigma, mask, _ = _mock(np.zeros(3))
     cal = PolynomialCalibration.from_wavelength(WAVE, 3, fit_constant=True, prior_sigma=0.1)

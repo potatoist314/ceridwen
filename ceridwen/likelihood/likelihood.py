@@ -176,7 +176,7 @@ def on_fitted_pixels(likelihood, data, bucket: Optional[int] = None):
     (``slice(None)`` for the other observations), and the likelihood then takes
     ``mu[key][pixels[key]]``.  The pixels cut away carry no term of ln L; only the order of
     its sums changes.  With ``bucket`` the cut is widened to a multiple of ``bucket`` pixels
-    (moved back from the end of the spectrum where it must) and the emission lines are padded
+    (moved back from the end of the spectrum where it must, and at most the whole spectrum) and the emission lines are padded
     (:meth:`EmissionLineColumns.padded`), so that similar spectra give arrays of one shape."""
     pixels, cut, likelihoods = {}, {}, []
     for key, lhood in zip(likelihood.keys, likelihood.likelihoods):
@@ -186,7 +186,7 @@ def on_fitted_pixels(likelihood, data, bucket: Optional[int] = None):
             used = np.flatnonzero(np.asarray(data[key][2]))
             start, width = int(used[0]), int(used[-1]) + 1 - int(used[0])
             if bucket is not None:
-                width = -(-width // bucket) * bucket
+                width = min(-(-width // bucket) * bucket, len(data[key][2]))
                 start = min(start, len(data[key][2]) - width)
             keep = pixels[key] = slice(start, start + width)
             cut[key] = tuple(v if v is None or jnp.ndim(v) == 0 else v[keep] for v in data[key])
