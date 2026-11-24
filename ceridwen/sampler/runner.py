@@ -11,7 +11,6 @@ from typing import Any, Callable, Optional
 import jax
 import jax.numpy as jnp
 from jax._src.interpreters import partial_eval as pe
-import numpy as np
 
 Array = jax.Array
 
@@ -177,16 +176,9 @@ def run_sampler(
 
     _fitted, _fitted_data, _pixels = on_fitted_pixels(likelihood, _static_data, bucket=256)
 
-    def on_pixels(x, pixels):
-        if pixels == slice(None):
-            return x
-        # the start is array data, not a literal in the program
-        return jax.lax.dynamic_slice_in_dim(x, jnp.asarray(np.array([pixels.start]))[0],
-                                            pixels.stop - pixels.start, axis=-1)
-
     def loglike_fn(theta: dict[str, Array]) -> Array:
-        mu = model.predict(theta)
-        return _fitted.loglike(_fitted_data, {key: on_pixels(mu[key], _pixels[key]) for key in _keys},
+        mu = model.predict(theta, pixels=_pixels)
+        return _fitted.loglike(_fitted_data, {key: mu[key] for key in _keys},
                                theta, _rescalings)
 
     def logprior_fn(theta: dict[str, Array]) -> Array:

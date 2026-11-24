@@ -18,7 +18,9 @@ Needs ``sedpy_jax`` (its log/linear/LSF grid helpers, via :mod:`._smoothing`).
 from __future__ import annotations
 
 import warnings
+from functools import partial
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -110,6 +112,13 @@ def _warn_floor(name, target, lib, units, wave=None):
             stacklevel=4)
 
 
+def on_pixels(x, pixels):
+    """``x[..., pixels]`` with the start as array data, not a literal in the program."""
+    if pixels == slice(None):
+        return x
+    return jax.lax.dynamic_slice_in_dim(x, jnp.asarray(np.array([pixels.start]))[0],
+                                        pixels.stop - pixels.start, axis=-1)
+
 class ChainProjector:
     """Built once by ``Spectrum.setup_for_model`` (projector="chain").
 
@@ -148,6 +157,9 @@ class ChainProjector:
 
         self._H_factors = (j_lo, j_hi, alpha, n_pix, n_wave)
         self._H_cached = None
+        # predict on a pixel slice (``predict(..., pixels)``), built per slice; ``_stages``
+        # rebuilds the stages of a sampled LOSVD on a window (None: full predict, sliced)
+        self._windows, self._stages = {}, None
 
         make_vel_smoother  = _smoothing.make_vel_smoother
         make_wave_smoother = _smoothing.make_wave_smoother
@@ -187,9 +199,11 @@ class ChainProjector:
             _pad = {"sigma_max": sigma_smooth_max}
             # Output stays on the trimmed model grid when an instrumental
             # stage follows, else goes straight to the observed pixels.
-            _losvd_sm = make_vel_smoother(
-                _wm_trim, np.pad(_wm_trim, (0, _n_pad), mode="edge") if has_instr else wo,
+            _losvd_make = partial(
+                make_vel_smoother, _wm_trim,
+                np.pad(_wm_trim, (0, _n_pad), mode="edge") if has_instr else wo,
                 inres=0.0, **_pad)
+            _losvd_sm = _losvd_make()
 
             def _apply_losvd_rt(spec_trim, sigma_v, _s=_losvd_sm):
                 return _s(spec_trim, sigma_v)
@@ -257,8 +271,9 @@ class ChainProjector:
                     _in = 0.0
                     _sig_tgt_lam = sigma_v_t * _sig_lam
                     _sig_lib_lam = _in * _sig_lam
-                    _instr_sm = make_vel_smoother(
-                        _wm_trim, wo, inres=_in)
+                    _instr_make = partial(make_vel_smoother,
+                                          _wm_trim, wo, inres=_in, sigma_max=sigma_v_t)
+                    _instr_sm = _instr_make()
                     _apply_instr = (lambda spec_trim, _sm=_instr_sm,
                                     _sv=sigma_v_t: _sm(spec_trim, _sv))
                     _warn_floor(name, np.full(1, sigma_v_t),
@@ -267,7 +282,9 @@ class ChainProjector:
                     _in = float(sig_v_lib[np.isfinite(sig_v_lib)][0])
                     _sig_tgt_lam = sigma_v_t * _sig_lam
                     _sig_lib_lam = _in * _sig_lam
-                    _instr_sm = make_vel_smoother(_wm_trim, wo, inres=_in)
+                    _instr_make = partial(make_vel_smoother,
+                                          _wm_trim, wo, inres=_in, sigma_max=sigma_v_t)
+                    _instr_sm = _instr_make()
                     _apply_instr = (lambda spec_trim, _sm=_instr_sm,
                                     _sv=sigma_v_t: _sm(spec_trim, _sv))
                     _warn_floor(name, np.full(1, sigma_v_t),
@@ -279,8 +296,8 @@ class ChainProjector:
                     tgt = sigma_v_t * _sig_lam
                     lib = sig_v_lib * _sig_lam
                     _sig_tgt_lam, _sig_lib_lam = tgt, lib
-                    _instr_sm = make_lsf_smoother(
-                        _wm_trim, tgt, wo, inres=lib)
+                    _instr_make = partial(make_lsf_smoother, _wm_trim, tgt, wo, inres=lib)
+                    _instr_sm = _instr_make()
                     _apply_instr = (lambda spec_trim, _sm=_instr_sm:
                                     _sm(spec_trim))
                     _warn_floor(name, np.full_like(_wm_trim, sigma_v_t),
@@ -292,8 +309,9 @@ class ChainProjector:
                     _in = 0.0
                     _sig_tgt_lam = np.full_like(_wm_trim, sigma_l_t)
                     _sig_lib_lam = np.full_like(_wm_trim, _in)
-                    _instr_sm = make_wave_smoother(
-                        _wm_trim, wo, inres=_in)
+                    _instr_make = partial(make_wave_smoother,
+                                          _wm_trim, wo, inres=_in, sigma_max=sigma_l_t)
+                    _instr_sm = _instr_make()
                     _apply_instr = (lambda spec_trim, _sm=_instr_sm,
                                     _sl=sigma_l_t: _sm(spec_trim, _sl))
                     _warn_floor(name, np.full(1, sigma_l_t),
@@ -304,8 +322,8 @@ class ChainProjector:
                     tgt = np.full_like(_wm_trim, sigma_l_t)
                     lib = sig_v_lib * _sig_lam
                     _sig_tgt_lam, _sig_lib_lam = tgt, lib
-                    _instr_sm = make_lsf_smoother(
-                        _wm_trim, tgt, wo, inres=lib)
+                    _instr_make = partial(make_lsf_smoother, _wm_trim, tgt, wo, inres=lib)
+                    _instr_sm = _instr_make()
                     _apply_instr = (lambda spec_trim, _sm=_instr_sm:
                                     _sm(spec_trim))
                     _warn_floor(name, tgt, lib, "AA", _wm_trim)
@@ -319,17 +337,18 @@ class ChainProjector:
                     lib = 0.0
                     _sig_tgt_lam = sigma_lsf_trim
                     _sig_lib_lam = np.full_like(_wm_trim, lib)
-                    _instr_sm = make_lsf_smoother(
-                        _wm_trim, sigma_lsf_trim, wo, inres=lib)
+                    _instr_make = partial(make_lsf_smoother,
+                                          _wm_trim, sigma_lsf_trim, wo, inres=lib)
                     _warn_floor(name, sigma_lsf_trim,
                                 np.full_like(sigma_lsf_trim, lib),
                                 "AA", _wm_trim)
                 else:
                     lib = sig_v_lib * _sig_lam
                     _sig_tgt_lam, _sig_lib_lam = sigma_lsf_trim, lib
-                    _instr_sm = make_lsf_smoother(
-                        _wm_trim, sigma_lsf_trim, wo, inres=lib)
+                    _instr_make = partial(make_lsf_smoother,
+                                          _wm_trim, sigma_lsf_trim, wo, inres=lib)
                     _warn_floor(name, sigma_lsf_trim, lib, "AA", _wm_trim)
+                _instr_sm = _instr_make()
                 _apply_instr = (lambda spec_trim, _sm=_instr_sm:
                                 _sm(spec_trim))
 
@@ -341,6 +360,7 @@ class ChainProjector:
                     lambda spec, sigma_lo, _A=_apply_instr, _L=_apply_losvd_rt:
                         _A(_L(spec[_idx], sigma_lo))
                 )
+                self._stages = (_idx, _instr_make, _apply_instr, _losvd_make, _apply_losvd_rt)
             else:
                 _S = self._build_static_smoother(
                     _wm_trim, wo, _sig_tgt_lam, _sig_lib_lam, sigma_losvd)
@@ -353,6 +373,7 @@ class ChainProjector:
                     lambda spec, sigma_lo, _L=_apply_losvd_rt:
                         _L(spec[_idx], sigma_lo)
                 )
+                self._stages = (_idx, None, None, _losvd_make, _apply_losvd_rt)
             else:
                 _S = self._build_static_smoother(
                     _wm_trim, wo, None, None, sigma_losvd)
@@ -386,10 +407,35 @@ class ChainProjector:
             self._H_cached = jnp.array(H)
         return self._H_cached
 
-    def predict(self, spectrum, theta):
+    def _window_fn(self, pixels):
+        """``_predict_fn`` on the observed-pixel slice ``pixels`` alone, built once per slice.
+        With a sampled LOSVD the instrument stage computes those pixels only, the LOSVD stage
+        only the trimmed-grid range the instrument stage reads, and the gather only the model
+        points the LOSVD stage reads; otherwise the full prediction, sliced.  Built eagerly
+        (also when first asked inside a jit trace): the cache holds no tracer."""
+        key = pixels.indices(self._H_factors[3])
+        if key in self._windows:
+            return self._windows[key]
+        if self._stages is None:
+            fn = lambda *args: on_pixels(self._predict_fn(*args), pixels)  # noqa: E731
+        else:
+            idx, make_a, A, make_l, L = self._stages
+            with jax.ensure_compile_time_eval():
+                a = None if make_a is None else make_a(window=pixels)
+                l = make_l(window=pixels if a is None else a.reads)  # noqa: E741
+                idx = idx[l.reads]
+            if a is None:
+                fn = lambda spec, sigma: L(spec[idx], sigma, l)  # noqa: E731
+            else:
+                fn = lambda spec, sigma: A(L(spec[idx], sigma, l), a)  # noqa: E731
+        self._windows[key] = fn
+        return fn
+
+    def predict(self, spectrum, theta, pixels=None):
         """The model ``spectrum`` (n_wave,) on the observed pixels; a sampled
-        sigma_gal is ``theta[sigma_key]``."""
+        sigma_gal is ``theta[sigma_key]``.  ``pixels`` (a slice): those pixels only."""
+        fn = self._predict_fn if pixels is None else self._window_fn(pixels)
         if self.fit_lo:
             sv = jnp.asarray(theta[self.sigma_key]).reshape(())
-            return self._predict_fn(spectrum, sv)
-        return self._predict_fn(spectrum)
+            return fn(spectrum, sv)
+        return fn(spectrum)

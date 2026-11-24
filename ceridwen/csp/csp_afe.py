@@ -642,6 +642,7 @@ class CSPBasis_afe(CSPBasis):
 
     def _project_observations(self, spectrum_phot, spectrum_slit,
                               observations, theta, **kw):
+        from ..observation._chain import on_pixels
         from ..observation.lines import Lines as _Lines
         if any(isinstance(o, _Lines) for o in observations):
             raise ValueError(
@@ -662,7 +663,9 @@ class CSPBasis_afe(CSPBasis):
             for obs in observations:
                 if getattr(obs, '_kind', None) == 'spectrum':
                     original = predictions[obs.name]
-                    factor = response.factor(self, theta, obs.name).astype(original.dtype)
+                    factor = on_pixels(response.factor(self, theta, obs.name),
+                                       (kw.get('pixels') or {}).get(obs.name, slice(None))
+                                       ).astype(original.dtype)
                     predictions[obs.name] = jnp.where(zero, original, original * factor)
         return result
 

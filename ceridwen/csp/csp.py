@@ -1523,7 +1523,7 @@ class CSPBasis:
         return continuum, full - continuum
 
     def predict(self, theta: dict, observations: list, *, kinematics=None,
-                broaden_photometry=False, eline_system=None) -> dict:
+                broaden_photometry=False, eline_system=None, pixels=None) -> dict:
         """``{obs.name: prediction}``: Photometry -> maggies (n_filters,), Spectrum -> F_nu [erg/s/cm^2/Hz]
         on the observed pixels, Lines -> integrated fluxes (n_lines,).  Observed-frame only when
         ``theta`` carries ``zred``.
@@ -1538,6 +1538,8 @@ class CSPBasis:
         ``eline_system`` (``ElineSystem`` of ``SedModel``, line marginalisation): returns
         ``(predictions, aux)`` with the fitted lines removed from every prediction and
         ``aux = {"prior_mean": CLOUDY fluxes of the fitted lines, "cols": {obs.name: design}}``.
+
+        ``pixels`` (``{obs.name: slice}`` or None): each named prediction on that slice alone.
         """
         if kinematics is not None:
             self._known_theta_keys |= set(kinematics.free_keys)
@@ -1585,7 +1587,7 @@ class CSPBasis:
             observations, theta, paint_lines=paint_lines,
             line_component=None if lines is None else lines_s,
             kinematics=kinematics, broaden_photometry=broaden_photometry,
-            eline_system=eline_system,
+            eline_system=eline_system, pixels=pixels,
             before_igm=None if trans is None else (cont0, None if lines is None else lines0),
             **({} if agn_corr is None else {"agn_after_igm": agn_corr}),
         )
@@ -1669,7 +1671,7 @@ class CSPBasis:
                               observations, theta, *, paint_lines=True,
                               line_component=None, kinematics=None,
                               broaden_photometry=False, eline_system=None, before_igm=None,
-                              agn_after_igm=None):
+                              agn_after_igm=None, pixels=None):
         """``{obs.name: prediction}`` from the scaled observer-frame spectra: ``spectrum_phot`` is the
         continuum (+ painted lines), ``spectrum_slit`` the continuum alone (Spectrum projector input),
         ``line_component`` the painted lines alone (or None).  ``before_igm``: ``(continuum, lines
@@ -1680,12 +1682,14 @@ class CSPBasis:
         ``spectrum_slit``; the branches that apply the IGM themselves after a kinematic kernel
         (``before_igm``) add it after that kernel: unsmoothed for photometry, through the
         Spectrum's projector (galaxy kernel + LSF, no transmission) for a Spectrum.
+        ``pixels``: see ``predict`` (a Spectrum computes only that slice where its projector can).
         """
         from ..observation.observation import (
             Photometry as _Photometry,
             Spectrum   as _Spectrum,
         )
         from ..observation.lines import Lines as _Lines
+        from ..observation._chain import on_pixels
         from ..broadening import TIED
         _has_lines_obs = any(isinstance(o, _Lines) for o in observations)
         _has_spec_obs = any(isinstance(o, _Spectrum) for o in observations)
@@ -1767,6 +1771,8 @@ class CSPBasis:
                 continue
             if isinstance(obs, _Spectrum):
                 A = None
+                sl = None if pixels is None else pixels.get(obs.name)
+                cut = (lambda a: a) if sl is None else (lambda a: a[sl] if jnp.ndim(a) else a)
                 slit, tr = spectrum_slit, None
                 proj = getattr(obs, "_proj", None)
                 if (igm_at is not None and proj is not None
@@ -1780,17 +1786,20 @@ class CSPBasis:
                 elif "eline_delta_zred" in theta and proj is not None:
                     pred, _ = obs._proj.predict_with_line_basis(
                         slit, _line_fluxes_spec, theta, transmission=tr)
+                    pred = cut(pred)
                 elif tr is not None:
-                    pred = obs.predict(slit, self.wave, _line_fluxes_spec, theta, transmission=tr)
+                    pred = obs.predict(slit, self.wave, _line_fluxes_spec, theta, transmission=tr,
+                                       pixels=sl)
                 else:
-                    pred = obs.predict(slit, self.wave, _line_fluxes_spec, theta)
+                    pred = obs.predict(slit, self.wave, _line_fluxes_spec, theta, pixels=sl)
                 if tr is not None and agn_after_igm is not None:
-                    pred = pred + obs.predict(agn_after_igm, self.wave, None, theta)
+                    pred = pred + obs.predict(agn_after_igm, self.wave, None, theta, pixels=sl)
                 for agn_l in (agn_sets or ()):
-                    pred = pred + self._agn_spectrum_lines(obs, agn_l, theta).astype(pred.dtype)
+                    pred = pred + cut(
+                        self._agn_spectrum_lines(obs, agn_l, theta)).astype(pred.dtype)
                 calib = _spec_calib(obs, theta, dtype=pred.dtype)
                 if calib is not None:
-                    pred = pred * calib
+                    pred = pred * cut(calib)
                     if A is not None:
                         A = A * (calib[:, None] if jnp.ndim(calib) else calib)
                 if A is not None:
@@ -1851,6 +1860,9 @@ class CSPBasis:
             if es is not None and obs.name in es.phot_cols:
                 aux_cols[obs.name] = _eline_phot_cols(es, obs, lp, None, s_gas)
             out[obs.name] = pred
+        if pixels is not None:
+            out.update({o.name: on_pixels(out[o.name], pixels[o.name]) for o in observations
+                        if o.name in pixels and not isinstance(o, _Spectrum)})
         if es is not None:
             return out, {"prior_mean": prior_mean, "cols": aux_cols}
         return out
